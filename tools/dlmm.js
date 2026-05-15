@@ -24,6 +24,8 @@ import {
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
+import { recordRealizedLoss } from "../account-circuit-breaker.js";
+import { getSigningWallet } from "../wallet-loader.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
@@ -72,11 +74,7 @@ async function getDLMM() {
   };
 }
 
-// ─── Lazy wallet/connection init ──────────────────────────────
-// Avoids crashing on import when WALLET_PRIVATE_KEY is not yet set
-// (e.g. during screening-only tests).
 let _connection = null;
-let _wallet = null;
 
 function getConnection() {
   if (!_connection) {
@@ -86,14 +84,7 @@ function getConnection() {
 }
 
 function getWallet() {
-  if (!_wallet) {
-    if (!process.env.WALLET_PRIVATE_KEY) {
-      throw new Error("WALLET_PRIVATE_KEY not set");
-    }
-    _wallet = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
-    log("init", `Wallet: ${_wallet.publicKey.toString()}`);
-  }
-  return _wallet;
+  return getSigningWallet();
 }
 
 function shouldUseLpAgentRelay() {
@@ -398,8 +389,10 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
-setInterval(() => poolCache.clear(), 5 * 60 * 1000);
-setInterval(() => poolMetadataCache.clear(), 15 * 60 * 1000);
+const poolCacheGc = setInterval(() => poolCache.clear(), 5 * 60 * 1000);
+const poolMetadataCacheGc = setInterval(() => poolMetadataCache.clear(), 15 * 60 * 1000);
+poolCacheGc.unref?.();
+poolMetadataCacheGc.unref?.();
 
 async function getPoolMetadata(poolAddress) {
   const key = String(poolAddress);
@@ -1575,6 +1568,14 @@ export async function closePosition({ position_address, reason }) {
           close_reason: reason || "agent decision",
         });
 
+        await recordRealizedLoss({
+          pnl_pct: pnlPct,
+          amount_sol: tracked.amount_sol,
+          pool: poolAddress,
+          pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+          reason: reason || "agent decision",
+        }).catch((e) => log("circuit_warn", `recordRealizedLoss failed (relay close): ${e.message}`));
+
         appendDecision({
           type: "close",
           actor: "MANAGER",
@@ -1849,6 +1850,14 @@ export async function closePosition({ position_address, reason }) {
         minutes_held: minutesHeld,
         close_reason: reason || "agent decision",
       });
+
+      await recordRealizedLoss({
+        pnl_pct: pnlPct,
+        amount_sol: tracked.amount_sol,
+        pool: poolAddress,
+        pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
+        reason: reason || "agent decision",
+      }).catch((e) => log("circuit_warn", `recordRealizedLoss failed: ${e.message}`));
 
       appendDecision({
         type: "close",

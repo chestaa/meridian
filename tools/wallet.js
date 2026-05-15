@@ -8,9 +8,9 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import { getSigningWallet } from "../wallet-loader.js";
 
 let _connection = null;
-let _wallet = null;
 
 function getConnection() {
   if (!_connection) _connection = new Connection(process.env.RPC_URL, "confirmed");
@@ -18,11 +18,7 @@ function getConnection() {
 }
 
 function getWallet() {
-  if (!_wallet) {
-    if (!process.env.WALLET_PRIVATE_KEY) throw new Error("WALLET_PRIVATE_KEY not set");
-    _wallet = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
-  }
-  return _wallet;
+  return getSigningWallet();
 }
 
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";

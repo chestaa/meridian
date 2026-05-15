@@ -23,6 +23,7 @@ import {
   notifyOutOfRange,
   isEnabled as telegramEnabled,
   createLiveMessage,
+  markManualClose,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
@@ -34,6 +35,8 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { recordPaperDeploy, refreshPaperTrades } from "./paper-trades.js";
+import { getCircuitStatus, manualReset as circuitReset } from "./account-circuit-breaker.js";
 
 const isMain = process.argv[1]
   ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
@@ -92,6 +95,14 @@ const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_DROP_CONFIRM_TOLERANCE_PCT = 1.0;
+
+function screeningCooldownMs() {
+  return Math.max(60_000, (config.schedule.screeningIntervalMin || 5) * 60 * 1000);
+}
+
+function shouldTriggerScreening() {
+  return !_screeningBusy && Date.now() - _screeningLastTriggered > screeningCooldownMs();
+}
 
 /** Strip <think>...</think> reasoning blocks that some models leak into output */
 function stripThink(text) {
@@ -203,9 +214,8 @@ export async function runManagementCycle({ silent = false } = {}) {
   let mgmtReport = null;
   let positions = [];
   let liveMessage = null;
-  const screeningCooldownMs = 5 * 60 * 1000;
-
   try {
+    await refreshPaperTrades().catch((error) => log("paper_warn", `Paper trade refresh failed: ${error.message}`));
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
@@ -213,9 +223,14 @@ export async function runManagementCycle({ silent = false } = {}) {
     positions = livePositions?.positions || [];
 
     if (positions.length === 0) {
-      log("cron", "No open positions — triggering screening cycle");
-      mgmtReport = "No open positions. Triggering screening cycle.";
-      runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      if (shouldTriggerScreening()) {
+        log("cron", "No open positions — triggering screening cycle");
+        mgmtReport = "No open positions. Triggering screening cycle.";
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      } else {
+        log("cron", "No open positions — screening already running or cooling down");
+        mgmtReport = "No open positions. Screening already running or cooling down.";
+      }
       return mgmtReport;
     }
 
@@ -351,7 +366,7 @@ After executing, write a brief one-line result per position.
     // Trigger screening after management
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
     const afterCount = afterPositions?.positions?.length ?? 0;
-    if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
+    if (afterCount < config.risk.maxPositions && shouldTriggerScreening()) {
       log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
     }
@@ -367,7 +382,7 @@ After executing, write a brief one-line result per position.
       }
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
+          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range, positionId: p.position || p.pair }).catch(() => { });
         }
       }
     }
@@ -604,9 +619,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
     });
 
     const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
+    const candidateByPool = new Map(passing.map((candidate) => [candidate.pool.pool, candidate]));
 
     let deployAttempted = false;
     let deploySucceeded = false;
+    const deployHeader = process.env.DRY_RUN === "true" ? "SIMULATED DEPLOY" : "DEPLOYED";
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
@@ -616,6 +633,9 @@ PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
 
 STEPS:
+DRY_RUN REPORTING RULE:
+If DRY_RUN is true and deploy_position returns dry_run/would_deploy, write SIMULATED DEPLOY instead of DEPLOYED. Never imply a real on-chain deployment happened during dry-run.
+
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
@@ -687,11 +707,38 @@ IMPORTANT:
           if (name === "deploy_position") {
             deployAttempted = true;
             deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            if (process.env.DRY_RUN === "true" && result?.would_deploy?.pool_address) {
+              const candidate = candidateByPool.get(result.would_deploy.pool_address);
+              const pool = candidate?.pool || {};
+              const ti = candidate?.ti || {};
+              recordPaperDeploy({
+                pool_address: result.would_deploy.pool_address,
+                pool_name: pool.name || result.would_deploy.pool_address,
+                base_mint: pool.base?.mint || ti.mint || null,
+                strategy: result.would_deploy.strategy,
+                amount_sol: result.would_deploy.amount_y ?? result.would_deploy.amount_sol ?? deployAmount,
+                active_bin: pool.active_bin ?? null,
+                bins_below: result.would_deploy.bins_below,
+                bins_above: result.would_deploy.bins_above,
+                entry_price: pool.price ?? null,
+                entry_fee_tvl_ratio: pool.fee_active_tvl_ratio ?? null,
+                entry_volume: pool.volume_window ?? null,
+                entry_tvl: pool.tvl ?? pool.active_tvl ?? null,
+                entry_volatility: pool.volatility ?? null,
+                entry_age_hours: pool.token_age_hours ?? null,
+                entry_top10_pct: ti.audit?.top_holders_pct ?? null,
+                entry_bot_pct: ti.audit?.bot_holders_pct ?? null,
+                entry_bundle_pct: pool.bundle_pct ?? null,
+                entry_sniper_pct: pool.sniper_pct ?? null,
+              });
+            }
           }
           await liveMessage?.toolFinish(name, result, success);
         },
       });
-    screenReport = content;
+    screenReport = process.env.DRY_RUN === "true"
+      ? content.replace(/^[^\n]*DEPLOYED/m, deployHeader)
+      : content;
     if (/⛔\s*NO DEPLOY/i.test(content)) {
       appendDecision({
         type: "no_deploy",
@@ -1233,6 +1280,7 @@ function formatHelpText() {
     "/close <n> — close one position by index",
     "/closeall — close all open positions",
     "/set <n> <note> — set note/instruction on position",
+    "/circuit — circuit breaker status | /circuit reset — re-arm",
     "/config — show important runtime config",
     "/settings — button menu for common config",
     "/setcfg <key> <value> — update persisted config",
@@ -1448,6 +1496,9 @@ async function telegramHandler(msg) {
       const { positions } = await getMyPositions({ force: true });
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
+      // Vega fix #4 — dedupe: mark this position so any downstream notifyClose
+      // (if /close is ever routed through executor) skips its own emit.
+      markManualClose(pos.position);
       await sendMessage(`Closing ${pos.pair}...`);
       const result = await closePosition({ position_address: pos.position });
       if (result.success) {
@@ -1469,6 +1520,8 @@ async function telegramHandler(msg) {
       const results = [];
       for (const pos of positions) {
         try {
+          // Vega fix #4 — mark manual close so notifyClose skips duplicate emit
+          markManualClose(pos.position);
           const result = await closePosition({ position_address: pos.position });
           results.push(`${pos.pair}: ${result.success ? "closed" : `failed (${result.error || "unknown"})`}`);
         } catch (error) {
@@ -1493,6 +1546,27 @@ async function telegramHandler(msg) {
       setPositionInstruction(pos.position, note);
       await sendMessage(`✅ Note set for ${pos.pair}:\n"${note}"`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    return;
+  }
+
+  if (text === "/circuit" || text === "/circuit reset") {
+    try {
+      if (text === "/circuit reset") {
+        const result = circuitReset("Telegram /circuit reset by operator");
+        await sendMessage(`✅ Circuit breaker reset. Deploys re-armed for today.`).catch(() => {});
+      } else {
+        const s = getCircuitStatus();
+        const haltLine = s.halted ? `🔴 HALTED — ${s.halt_reason}` : `🟢 ARMED`;
+        await sendMessage(
+          `🔌 Circuit Breaker — ${s.date}\n` +
+          `Status: ${haltLine}\n` +
+          `Loss today: ${s.realized_loss_sol?.toFixed(4) ?? 0} SOL (${s.realized_loss_pct?.toFixed(1) ?? 0}%)\n` +
+          `Cap: ${s.cap_sol} SOL | ${s.cap_pct}%\n` +
+          `Progress: SOL ${s.pct_to_cap_sol?.toFixed(0) ?? 0}% | PCT ${s.pct_to_cap_pct?.toFixed(0) ?? 0}%\n` +
+          `Closes today: ${s.positions_closed_today} (W:${s.winning_closes_today ?? 0} L:${s.losing_closes_today ?? 0})`
+        ).catch(() => {});
+      }
+    } catch (e) { await sendMessage(`Circuit error: ${e.message}`).catch(() => {}); }
     return;
   }
 

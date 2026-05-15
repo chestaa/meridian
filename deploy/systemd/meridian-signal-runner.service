@@ -1,0 +1,24 @@
+[Unit]
+Description=Meridian signal-first dry-run runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/meridian
+Environment=NODE_ENV=production
+Environment=DRY_RUN=true
+Environment=SIGNAL_DIR=/opt/meridian/signals/inbox
+Environment=SIGNAL_PROCESSED_DIR=/opt/meridian/signals/processed
+Environment=SIGNAL_REJECTED_DIR=/opt/meridian/signals/rejected
+Environment=SIGNAL_RESULTS_FILE=/opt/meridian/signal-results.jsonl
+Environment=SIGNAL_RUNNER_INTERVAL_MS=30000
+EnvironmentFile=-/opt/meridian/.env
+ExecStart=/usr/bin/npm run signal:runner
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -42,7 +42,8 @@ const TIMEFRAME_MINUTES = {
   "24h": 1440,
 };
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifySwap, notifyDeployFailure } from "../telegram.js";
+import { assertCircuitOK, CircuitBreakerError } from "../account-circuit-breaker.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -66,6 +67,10 @@ function poolDetailBinStep(pool) {
 
 function poolDetailFeeActiveTvlRatio(pool) {
   return numberOrNull(pool?.fee_active_tvl_ratio);
+}
+
+function poolDetailFeeTvlRatio(pool) {
+  return numberOrNull(pool?.fee_tvl_ratio);
 }
 
 function poolDetailVolatility(pool) {
@@ -117,15 +122,20 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
+  const feeTvlRatio = poolDetailFeeTvlRatio(detail);
+  const requestedFeeTvlRatio = numberOrNull(args.fee_tvl_ratio);
+  const effectiveFeeTvlRatio = [feeActiveTvlRatio, feeTvlRatio, requestedFeeTvlRatio]
+    .filter((value) => value != null)
+    .reduce((best, value) => Math.max(best, value), -Infinity);
   const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
   if (
     minFeeActiveTvlRatio != null &&
     minFeeActiveTvlRatio > 0 &&
-    (feeActiveTvlRatio == null || feeActiveTvlRatio < minFeeActiveTvlRatio)
+    (!Number.isFinite(effectiveFeeTvlRatio) || effectiveFeeTvlRatio < minFeeActiveTvlRatio)
   ) {
     return {
       pass: false,
-      reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
+      reason: `Pool fee/TVL ratio ${effectiveFeeTvlRatio ?? "unknown"} is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}.`,
     };
   }
 
@@ -589,13 +599,30 @@ export async function executeTool(name, args) {
       success,
     });
 
+    // Vega fix #2 — structured Telegram alert when deploy_position returns failure.
+    // No retry, no state mutation; operator-only signal so manual on-chain verify can happen.
+    if (!success && name === "deploy_position") {
+      try {
+        const balances = await getWalletBalances({}).catch(() => null);
+        const walletSol = balances?.sol != null ? Number(balances.sol).toFixed(4) : null;
+        notifyDeployFailure({
+          pool: {
+            symbol: result?.pool_name || args.pool_name || null,
+            address: args.pool_address || result?.pool || null,
+          },
+          error: { message: result?.error || result?.reason || "deploy_position returned failure" },
+          walletBalance: walletSol,
+        }).catch(() => {});
+      } catch (_e) { /* alert must never escalate */ }
+    }
+
     if (success) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0, positionAddress: args.position_address }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
@@ -644,6 +671,23 @@ export async function executeTool(name, args) {
       success: false,
     });
 
+    // Vega fix #2 — structured Telegram alert when deploy_position throws.
+    // Anti-Pattern #4: no retry, just notify so operator can verify on-chain.
+    if (name === "deploy_position") {
+      try {
+        const balances = await getWalletBalances({}).catch(() => null);
+        const walletSol = balances?.sol != null ? Number(balances.sol).toFixed(4) : null;
+        notifyDeployFailure({
+          pool: {
+            symbol: args.pool_name || null,
+            address: args.pool_address || null,
+          },
+          error,
+          walletBalance: walletSol,
+        }).catch(() => {});
+      } catch (_e) { /* alert must never escalate */ }
+    }
+
     // Return error to LLM so it can decide what to do
     return {
       error: error.message,
@@ -658,6 +702,19 @@ export async function executeTool(name, args) {
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      // Account-level daily loss guard — must be first, before any other validation
+      try {
+        const balForCircuit = process.env.DRY_RUN !== "true"
+          ? (await getWalletBalances().catch(() => null))?.sol ?? null
+          : null;
+        assertCircuitOK(Number.isFinite(balForCircuit) ? balForCircuit : null);
+      } catch (e) {
+        if (e instanceof CircuitBreakerError) {
+          return { pass: false, reason: e.message };
+        }
+        throw e;
+      }
+
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
 

@@ -7,6 +7,14 @@ node_modules/
 !.env.example
 .envrypt
 
+# SSH keys
+vps-key
+vps-key.pub
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
 # User config (contains RPC URL, wallet key, API keys)
 user-config.json
 
@@ -32,6 +40,9 @@ context.md
 CONTEXT.md
 dev-blocklist.json
 docs/
+
+# Circuit breaker runtime state
+circuit-breaker-state.json
 
 # Discord listener queue
 discord-signals.json

@@ -1,6 +1,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { getPerformanceSummary } from "./lessons.js";
+import { getCircuitStatus } from "./account-circuit-breaker.js";
 
 const STATE_FILE = "./state.json";
 const LESSONS_FILE = "./lessons.json";
@@ -54,6 +55,21 @@ export async function generateBriefing() {
     perfSummary
       ? `📊 All-time PnL: $${perfSummary.total_pnl_usd.toFixed(2)} (${perfSummary.win_rate_pct}% win)`
       : "",
+    "",
+    `<b>Circuit Breaker:</b>`,
+    ...(() => {
+      try {
+        const cb = getCircuitStatus();
+        const status = cb.halted ? `🔴 HALTED — ${cb.halt_reason}` : `🟢 Armed`;
+        return [
+          status,
+          `Loss today: ${(cb.realized_loss_sol ?? 0).toFixed(4)} SOL / ${cb.cap_sol} SOL cap`,
+          `Closes: ${cb.positions_closed_today ?? 0} (W:${cb.winning_closes_today ?? 0} L:${cb.losing_closes_today ?? 0})`,
+        ];
+      } catch (e) {
+        return [`⚠️ Circuit status unavailable: ${e.message}`];
+      }
+    })(),
     "────────────────"
   ];
 
@@ -63,7 +79,14 @@ export async function generateBriefing() {
 function loadJson(file) {
   if (!fs.existsSync(file)) return null;
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (file === LESSONS_FILE) {
+      return {
+        lessons: Array.isArray(parsed?.lessons) ? parsed.lessons : [],
+        performance: Array.isArray(parsed?.performance) ? parsed.performance : [],
+      };
+    }
+    return parsed;
   } catch (err) {
     log("briefing_error", `Failed to read ${file}: ${err.message}`);
     return null;

@@ -34,6 +34,7 @@ const strategyDefaultBinsBelow = Math.max(
 // Apply wallet/RPC from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
 if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
+if (u.burnerWalletKey) process.env.BURNER_WALLET_KEY ||= u.burnerWalletKey;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.llmBaseUrl) process.env.LLM_BASE_URL      ||= u.llmBaseUrl;
 if (u.llmApiKey)  process.env.LLM_API_KEY       ||= u.llmApiKey;
@@ -71,6 +72,10 @@ export const config = {
     minHolders:        u.minHolders        ?? 500,
     minMcap:           u.minMcap           ?? 150_000,
     maxMcap:           u.maxMcap           ?? 10_000_000,
+    // Signal-mode mcap band — used by signal-parser.js, NOT pool discovery.
+    // Signals discover earlier-stage opportunities; pool-screen keeps conservative 150k floor.
+    signalMinMcap:     u.signalMinMcap     ?? 5_000,
+    signalMaxMcap:     u.signalMaxMcap     ?? 80_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
     timeframe:         u.timeframe         ?? "5m",
@@ -81,6 +86,7 @@ export const config = {
     avoidPvpSymbols:   u.avoidPvpSymbols   ?? true, // avoid exact-symbol rivals with real active pools
     blockPvpSymbols:   u.blockPvpSymbols   ?? false, // hard-filter PVP rivals before the LLM sees them
     maxBundlePct:      u.maxBundlePct      ?? 30,  // max bundle holding % (OKX advanced-info)
+    maxSniperPct:      u.maxSniperPct      ?? 0.5, // max sniper holding % (OKX advanced-info)
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
     maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
     allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
@@ -167,6 +173,7 @@ export const config = {
 
   // ─── HiveMind ─────────────────────────
   hiveMind: {
+    enabled: u.hiveMindEnabled ?? false,
     url: nonEmptyString(u.hiveMindUrl, DEFAULT_HIVEMIND_URL),
     apiKey: nonEmptyString(u.hiveMindApiKey, process.env.HIVEMIND_API_KEY, DEFAULT_HIVEMIND_API_KEY),
     agentId: u.agentId ?? null,
@@ -249,6 +256,8 @@ export function reloadScreeningThresholds() {
     if (fresh.minHolders     != null) s.minHolders     = fresh.minHolders;
     if (fresh.minMcap        != null) s.minMcap        = fresh.minMcap;
     if (fresh.maxMcap        != null) s.maxMcap        = fresh.maxMcap;
+    if (fresh.signalMinMcap  != null) s.signalMinMcap  = fresh.signalMinMcap;
+    if (fresh.signalMaxMcap  != null) s.signalMaxMcap  = fresh.signalMaxMcap;
     if (fresh.minTvl         != null) s.minTvl         = fresh.minTvl;
     if (fresh.maxTvl         !== undefined) s.maxTvl   = fresh.maxTvl;
     if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
@@ -260,6 +269,7 @@ export function reloadScreeningThresholds() {
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
     if (fresh.athFilterPct      !== undefined) s.athFilterPct     = fresh.athFilterPct;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
+    if (fresh.maxSniperPct      != null) s.maxSniperPct     = fresh.maxSniperPct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;

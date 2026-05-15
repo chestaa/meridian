@@ -1,0 +1,30 @@
+services:
+  meridian:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: meridian
+    restart: unless-stopped
+    env_file:
+      - .env
+    working_dir: /app
+    command: ["npm", "start"]
+    volumes:
+      - ./user-config.json:/app/user-config.json
+      - ./state.json:/app/state.json
+      - ./lessons.json:/app/lessons.json
+      - ./smart-wallets.json:/app/smart-wallets.json
+      - ./pool-memory.json:/app/pool-memory.json
+      - ./token-blacklist.json:/app/token-blacklist.json
+      - ./strategy-library.json:/app/strategy-library.json
+      - ./decision-log.json:/app/decision-log.json
+      - ./paper-trades.json:/app/paper-trades.json
+      - ./llm-usage.json:/app/llm-usage.json
+      - ./signal-results.jsonl:/app/signal-results.jsonl
+      - ./signals:/app/signals
+      - ./signal-weights.json:/app/signal-weights.json
+      - ./hivemind-cache.json:/app/hivemind-cache.json
+    environment:
+      NODE_ENV: production
+    stdin_open: false
+    tty: false

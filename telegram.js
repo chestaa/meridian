@@ -141,7 +141,7 @@ export async function sendHTML(html) {
   return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
 }
 
-async function editMessage(text, messageId) {
+export async function editMessage(text, messageId) {
   if (!TOKEN || !chatId || !messageId) return null;
   return postTelegram("editMessageText", {
     message_id: messageId,
@@ -398,6 +398,40 @@ export function stopPolling() {
   _polling = false;
 }
 
+// ─── HTML escape (Vega fix #3) ───────────────────────────────────
+// Telegram HTML parse mode 400-errors on unescaped <, >, & in user-controlled
+// strings (pair/token names from on-chain metadata can contain anything).
+// Apply to any user-controlled interpolation; leave intentional tags alone.
+export function htmlEscape(value) {
+  if (value == null) return "";
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// ─── OOR cooldown state (Vega fix #4) ────────────────────────────
+// Per-position cooldown so notifyOutOfRange doesn't spam every mgmt tick.
+const OOR_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h
+const _oorLastAlertedAt = new Map(); // positionId -> timestamp
+
+// ─── Manual-close dedupe state (Vega fix #4) ─────────────────────
+// /close handler in index.js already emits an inline "✅ Closed ..." message.
+// If a future refactor routes manual close through executeTool (which calls
+// notifyClose), we'd double-alert. Mark the position as manually closed and
+// have notifyClose skip it for a short window.
+const MANUAL_CLOSE_SKIP_MS = 60 * 1000; // 60s
+const _manualClosedAt = new Map(); // positionAddress -> timestamp
+
+export function markManualClose(positionAddress) {
+  if (!positionAddress) return;
+  _manualClosedAt.set(positionAddress, Date.now());
+}
+
+// ─── Budget alert throttle (Vega fix #1) ─────────────────────────
+const BUDGET_ALERT_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12h
+let _lastBudgetAlertAt = 0;
+
 // ─── Notification helpers ────────────────────────────────────────
 export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee }) {
   if (hasActiveLiveMessage()) return;
@@ -411,21 +445,29 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
     ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
     : "";
   await sendHTML(
-    `✅ <b>Deployed</b> ${pair}\n` +
-    `Amount: ${amountSol} SOL\n` +
+    `✅ <b>Deployed</b> ${htmlEscape(pair)}\n` +
+    `Amount: ${htmlEscape(amountSol)} SOL\n` +
     priceStr +
     coverageStr +
     poolStr +
-    `Position: <code>${position?.slice(0, 8)}...</code>\n` +
-    `Tx: <code>${tx?.slice(0, 16)}...</code>`
+    `Position: <code>${htmlEscape(position?.slice(0, 8))}...</code>\n` +
+    `Tx: <code>${htmlEscape(tx?.slice(0, 16))}...</code>`
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
+export async function notifyClose({ pair, pnlUsd, pnlPct, positionAddress = null }) {
   if (hasActiveLiveMessage()) return;
+  // Skip if the user just closed this manually via /close (inline echo already sent)
+  if (positionAddress) {
+    const t = _manualClosedAt.get(positionAddress);
+    if (t && Date.now() - t < MANUAL_CLOSE_SKIP_MS) {
+      _manualClosedAt.delete(positionAddress);
+      return;
+    }
+  }
   const sign = pnlUsd >= 0 ? "+" : "";
   await sendHTML(
-    `🔒 <b>Closed</b> ${pair}\n` +
+    `🔒 <b>Closed</b> ${htmlEscape(pair)}\n` +
     `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
   );
 }
@@ -433,18 +475,92 @@ export async function notifyClose({ pair, pnlUsd, pnlPct }) {
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
   if (hasActiveLiveMessage()) return;
   await sendHTML(
-    `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
-    `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
-    `Tx: <code>${tx?.slice(0, 16)}...</code>`
+    `🔄 <b>Swapped</b> ${htmlEscape(inputSymbol)} → ${htmlEscape(outputSymbol)}\n` +
+    `In: ${htmlEscape(amountIn ?? "?")} | Out: ${htmlEscape(amountOut ?? "?")}\n` +
+    `Tx: <code>${htmlEscape(tx?.slice(0, 16))}...</code>`
   );
 }
 
-export async function notifyOutOfRange({ pair, minutesOOR }) {
+export async function notifyOutOfRange({ pair, minutesOOR, positionId = null }) {
   if (hasActiveLiveMessage()) return;
+  // Per-position 6h cooldown to avoid mgmt-tick spam
+  const key = positionId || pair;
+  if (key) {
+    const last = _oorLastAlertedAt.get(key) || 0;
+    if (Date.now() - last < OOR_ALERT_COOLDOWN_MS) return;
+    _oorLastAlertedAt.set(key, Date.now());
+  }
   await sendHTML(
-    `⚠️ <b>Out of Range</b> ${pair}\n` +
+    `⚠️ <b>Out of Range</b> ${htmlEscape(pair)}\n` +
     `Been OOR for ${minutesOOR} minutes`
   );
+}
+
+// Structured deploy-failure alert (Vega fix #2). No retry — operator-only signal.
+export async function notifyDeployFailure({ pool, error, walletBalance } = {}) {
+  if (!TOKEN || !chatId) return;
+  const reason = String(error?.message || error || "unknown error").slice(0, 200);
+  const poolLabel = pool?.symbol || pool?.pair || pool?.name || "unknown";
+  const poolAddr = pool?.address || pool?.pool_address || pool?.pool || "";
+  const addrShort = poolAddr ? `${String(poolAddr).slice(0, 8)}...` : "n/a";
+  const balStr = walletBalance != null ? `${walletBalance} SOL` : "unknown";
+  try {
+    await sendHTML(
+      `❌ <b>Deploy FAILED</b>\n` +
+      `Pool: ${htmlEscape(poolLabel)} (<code>${htmlEscape(addrShort)}</code>)\n` +
+      `Reason: ${htmlEscape(reason)}\n` +
+      `Wallet: ${htmlEscape(balStr)}\n` +
+      `Action required: manual on-chain verification before any retry`
+    );
+  } catch (e) {
+    log("telegram_error", `notifyDeployFailure failed: ${e.message}`);
+  }
+}
+
+// Circuit breaker alert. Fires once on halted=false→true; suppressed rest of UTC day.
+export async function notifyCircuitBreaker(state = {}) {
+  if (!TOKEN || !chatId) return;
+  try {
+    const lossSol = Number(state.realized_loss_sol ?? 0).toFixed(4);
+    const lossPct = Number(state.realized_loss_pct ?? 0).toFixed(1);
+    const closed = state.positions_closed_today ?? 0;
+    const reason = htmlEscape(state.halt_reason || "cap reached");
+    await sendHTML(
+      `🚨 <b>CIRCUIT BREAKER TRIPPED</b>\n` +
+      `Reason: ${reason}\n` +
+      `Realized loss today: ${lossSol} SOL (${lossPct}% of starting balance)\n` +
+      `Positions closed today: ${closed}\n` +
+      `New deploys: <b>BLOCKED</b> until UTC midnight\n` +
+      `Manual override: set <code>CIRCUIT_BREAKER_OVERRIDE=true</code> in .env (single-shot)`
+    );
+  } catch (e) {
+    log("telegram_error", `notifyCircuitBreaker failed: ${e.message}`);
+  }
+}
+
+// Budget-cap alert (Vega fix #1). 12h throttle, never escalates failures.
+export async function notifyBudgetExceeded({ status, caller } = {}) {
+  if (!TOKEN || !chatId) return;
+  const now = Date.now();
+  if (now - _lastBudgetAlertAt < BUDGET_ALERT_COOLDOWN_MS) return;
+  _lastBudgetAlertAt = now;
+  try {
+    const daily = status?.daily || {};
+    const weekly = status?.weekly || {};
+    const dSpent = Number(daily.spent ?? 0).toFixed(2);
+    const dCap = Number(daily.cap ?? 0).toFixed(2);
+    const wSpent = Number(weekly.spent ?? 0).toFixed(2);
+    const wCap = Number(weekly.cap ?? 0).toFixed(2);
+    await sendMessage(
+      `🚨 LLM cost cap hit\n` +
+      `Spent today: $${dSpent} / $${dCap}\n` +
+      `This week: $${wSpent} / $${wCap}\n` +
+      `Caller: ${caller || "unknown"}\n` +
+      `Halting LLM calls until reset.`
+    );
+  } catch (e) {
+    log("telegram_error", `notifyBudgetExceeded failed: ${e.message}`);
+  }
 }
 
 function sleep(ms) {

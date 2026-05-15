@@ -1,0 +1,31 @@
+# Meridian Discord Listener (Path A signal source)
+#
+# PRE-REQUISITES (this unit will run without them, but will not move data
+# through to the screener):
+#   1. user-config.json must have `useDiscordSignals: true`
+#   2. discord-listener/index.js must be the Vega-patched version that writes
+#      to /opt/meridian/signals/inbox/ (consumed by signal-runner)
+#
+# Without BOTH conditions, the listener process starts but the screener never
+# sees Discord-sourced signals. See deploy/VPS-SETUP.md "Discord Listener
+# Activation (Phase 0+)" for the full runbook.
+
+[Unit]
+Description=Meridian Discord Listener (Path A signal source)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/meridian
+Environment=NODE_ENV=production
+Environment=SIGNAL_DIR=/opt/meridian/signals/inbox
+EnvironmentFile=-/opt/meridian/.env
+ExecStart=/usr/bin/node /opt/meridian/discord-listener/index.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
