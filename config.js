@@ -160,6 +160,10 @@ export const config = {
     // Sirius — signal enrichment pipeline (fills mcap/vol/tvl from live APIs
     // before Cassiopeia gate). Default ON; toggle false to revert to parse-only.
     enricherEnabled: u.internalAgents?.enricherEnabled ?? true,
+    // Cassiopeia 👁️ — enriched-profile scoring for Telegram/KOL bare-CA signals.
+    // Default ON (Phase 1 unblock). Toggle false for emergency rollback to
+    // Discord-LP-only scoring (vol5m + distributedSol gated path).
+    useEnrichedScoring: u.internalAgents?.useEnrichedScoring ?? true,
   },
 
   // ─── Darwinian Signal Weighting ───────
