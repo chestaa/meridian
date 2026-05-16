@@ -52,3 +52,29 @@ discord-signals.json
 
 # Claude Code runtime lock
 .claude/scheduled_tasks.lock
+
+# Backup files
+*.bak
+*.bak2
+*.bak3
+*.bak4
+*.bak5
+
+# Runtime state files (potentially sensitive)
+signal-results.jsonl
+paper-trades.json
+llm-usage.json
+auto-screener-state.json
+
+# Signal pipeline directories
+signals/inbox/
+signals/processed/
+signals/rejected/
+signals/history/
+
+# Backtest reports
+backtest-reports/
+
+# Agent bundles / archives
+.agent-bundle/
+*.zip

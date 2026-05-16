@@ -440,6 +440,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
 
   const eligible = pools
     .filter((p) => {
+      const tokenAgeHours = Number(p.token_age_hours ?? 0);
+      if (Number.isFinite(tokenAgeHours) && tokenAgeHours > 0 && tokenAgeHours < 8) {
+        pushFilteredReason(filteredOut, p, `token age ${tokenAgeHours}h below live safety floor 8h`);
+        return false;
+      }
       const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
       if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) {
         pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${minTvl}`);
@@ -494,6 +499,76 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     }
   }
 
+  // Enrich with Jupiter audit data (top10/bot holders %) and apply concentration gates.
+  // Audit shape: t.audit.topHoldersPercentage / botHoldersPercentage from /assets/search.
+  // Fail-closed: if a knob is configured and data is missing, reject the pool.
+  if (eligible.length > 0) {
+    const maxBotPctCfg = numeric(config.screening.maxBotHoldersPct);
+    const maxTop10PctCfg = numeric(config.screening.maxTop10Pct);
+    const botGateActive = maxBotPctCfg != null && maxBotPctCfg > 0;
+    const top10GateActive = maxTop10PctCfg != null && maxTop10PctCfg > 0;
+
+    if (botGateActive || top10GateActive) {
+      const auditResults = await Promise.allSettled(
+        eligible.map(async (p) => {
+          if (!p.base?.mint) return { pool: p.pool, audit: null };
+          const res = await fetch(`${DATAPI_JUP}/assets/search?query=${p.base.mint}`);
+          if (!res.ok) return { pool: p.pool, audit: null };
+          const data = await res.json();
+          const arr = Array.isArray(data) ? data : [data];
+          const hit = arr.find((t) => t?.id === p.base.mint) || arr[0] || null;
+          return { pool: p.pool, audit: hit?.audit || null };
+        })
+      );
+      const auditByPool = new Map();
+      for (const r of auditResults) {
+        if (r.status === "fulfilled") auditByPool.set(r.value.pool, r.value.audit);
+        // unfulfilled → no entry → treated as data unavailable below
+      }
+
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        const audit = auditByPool.get(p.pool) || null;
+        const botPct = audit ? numeric(audit.botHoldersPercentage) : null;
+        const top10Pct = audit ? numeric(audit.topHoldersPercentage) : null;
+        // Surface for downstream consumers (LLM prompt, logs)
+        p.audit = audit
+          ? {
+              top_holders_pct: top10Pct,
+              bot_holders_pct: botPct,
+              mint_disabled: audit.mintAuthorityDisabled ?? null,
+              freeze_disabled: audit.freezeAuthorityDisabled ?? null,
+            }
+          : null;
+
+        if (botGateActive) {
+          if (botPct == null) {
+            log("screening", `Risk filter: dropped ${p.name} — bot_holders_data_unavailable`);
+            pushFilteredReason(filteredOut, p, "bot_holders_data_unavailable");
+            return false;
+          }
+          if (botPct > maxBotPctCfg) {
+            log("screening", `Risk filter: dropped ${p.name} — bot_holders ${botPct}% > ${maxBotPctCfg}%`);
+            pushFilteredReason(filteredOut, p, `bot_holders_pct_above_cap (${botPct}% > ${maxBotPctCfg}%)`);
+            return false;
+          }
+        }
+        if (top10GateActive) {
+          if (top10Pct == null) {
+            log("screening", `Risk filter: dropped ${p.name} — top10_data_unavailable`);
+            pushFilteredReason(filteredOut, p, "top10_data_unavailable");
+            return false;
+          }
+          if (top10Pct > maxTop10PctCfg) {
+            log("screening", `Risk filter: dropped ${p.name} — top10 ${top10Pct}% > ${maxTop10PctCfg}%`);
+            pushFilteredReason(filteredOut, p, `top10_pct_above_cap (${top10Pct}% > ${maxTop10PctCfg}%)`);
+            return false;
+          }
+        }
+        return true;
+      }));
+    }
+  }
+
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
   if (eligible.length > 0) {
     const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
@@ -521,9 +596,15 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         };
       })
     );
+    const okxUnavailable = new Set();
     for (let i = 0; i < eligible.length; i++) {
       const r = okxResults[i];
-      if (r.status !== "fulfilled") continue;
+      if (r.status !== "fulfilled") {
+        if (config.screening.maxBundlePct != null) {
+          okxUnavailable.add(eligible[i].pool);
+        }
+        continue;
+      }
       const { adv, price, clusters, risk } = r.value;
       if (adv) {
         eligible[i].risk_level      = adv.risk_level;
@@ -556,6 +637,29 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       if (p.is_wash) {
         log("screening", `Risk filter: dropped ${p.name} — wash trading flagged`);
         pushFilteredReason(filteredOut, p, "wash trading flagged");
+        return false;
+      }
+      return true;
+    }));
+
+    const maxBundlePctCfg = config.screening.maxBundlePct ?? 20;
+    const maxSniperPctCfg = config.screening.maxSniperPct ?? 0.5;
+    eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+      if (okxUnavailable.has(p.pool)) {
+        log("screening", `Risk filter: dropped ${p.name} — okx_risk_data_unavailable`);
+        pushFilteredReason(filteredOut, p, "okx_risk_data_unavailable");
+        return false;
+      }
+      const bundlePct = Number(p.bundle_pct);
+      const sniperPct = Number(p.sniper_pct);
+      if (Number.isFinite(bundlePct) && bundlePct > maxBundlePctCfg) {
+        log("screening", `Risk filter: dropped ${p.name} — bundle ${bundlePct}% > ${maxBundlePctCfg}%`);
+        pushFilteredReason(filteredOut, p, `bundle ${bundlePct}% > ${maxBundlePctCfg}%`);
+        return false;
+      }
+      if (Number.isFinite(sniperPct) && sniperPct > maxSniperPctCfg) {
+        log("screening", `Risk filter: dropped ${p.name} — sniper ${sniperPct}% > ${maxSniperPctCfg}%`);
+        pushFilteredReason(filteredOut, p, `sniper ${sniperPct}% > ${maxSniperPctCfg}%`);
         return false;
       }
       return true;

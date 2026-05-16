@@ -1,6 +1,6 @@
 ---
-name: manager
-description: Position management specialist. Use when reviewing open positions, deciding to claim fees, close positions, or assess PnL.
+name: cli-manager
+description: CLI-driven position management specialist. Use when reviewing open positions via CLI, deciding to claim fees, close positions, or assess PnL. Distinct from cosmic Andromeda (position-manager).
 model: sonnet
 tools: Bash, Read
 ---

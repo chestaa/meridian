@@ -1,8 +1,10 @@
 import fs from "fs";
 import path from "path";
 import { parseSignalMessage, scoreParsedSignal } from "../signal-parser.js";
+import { enrichSignal } from "../signal-enricher.js";
 import { judgeSignalWithLlm, formatSignalJudgment } from "../signal-judge.js";
 import { sendMessage, isEnabled as telegramEnabled } from "../telegram.js";
+import { config } from "../config.js";
 
 const SIGNAL_DIR = process.env.SIGNAL_DIR || "./signals/inbox";
 const PROCESSED_DIR = process.env.SIGNAL_PROCESSED_DIR || "./signals/processed";
@@ -27,7 +29,16 @@ function moveFile(src, destDir) {
 
 async function processFile(filePath) {
   const raw = fs.readFileSync(filePath, "utf8");
-  const signal = parseSignalMessage(raw);
+  const parsed = parseSignalMessage(raw);
+  // Sirius enricher: fill mcap/vol/tvl/holders from live APIs before Cassiopeia.
+  // Flag OFF → fall back to legacy parse-only behavior.
+  const enricherEnabled = config?.internalAgents?.enricherEnabled !== false;
+  const signal = enricherEnabled
+    ? await enrichSignal(parsed).catch((err) => {
+        console.error(`[ENRICH] failed for ${path.basename(filePath)}: ${err.message}`);
+        return parsed;
+      })
+    : parsed;
   const preScore = scoreParsedSignal(signal);
   const shouldJudge = preScore.decision !== "skip";
   const llm = shouldJudge

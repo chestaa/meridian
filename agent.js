@@ -90,6 +90,9 @@ import { config } from "./config.js";
 import { getStateSummary } from "./state.js";
 import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
 import { getDecisionSummary } from "./decision-log.js";
+import { recordLlmUsage } from "./llm-usage.js";
+import { assertWithinBudget, BudgetExceededError, getBudgetStatus } from "./cost-guard.js";
+import { notifyBudgetExceeded } from "./telegram.js";
 
 // Supports OpenRouter (default) or any OpenAI-compatible local server (e.g. LM Studio)
 // To use LM Studio: set LLM_BASE_URL=http://localhost:1234/v1 and LLM_API_KEY=lm-studio in .env
@@ -100,6 +103,24 @@ const client = new OpenAI({
 });
 
 const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
+
+function estimateTokens(messages, tools) {
+  return Math.ceil((JSON.stringify(messages).length + JSON.stringify(tools || []).length) / 3.5);
+}
+
+export function pickModel(agentType, messages, tools, override) {
+  if (override) return { model: override, tier: "override", tokens: null };
+  const roleKey = agentType === "SCREENER" ? "screening"
+                : agentType === "MANAGER"  ? "management" : "general";
+  const tiers = config.llm.routing?.[roleKey];
+  if (!Array.isArray(tiers) || tiers.length === 0) {
+    return { model: config.llm[`${roleKey}Model`] || DEFAULT_MODEL, tier: "default", tokens: null };
+  }
+  const tokens = estimateTokens(messages, tools);
+  const sorted = [...tiers].sort((a, b) => (a.maxInputTokens ?? Infinity) - (b.maxInputTokens ?? Infinity));
+  const chosen = sorted.find(t => tokens <= (t.maxInputTokens ?? Infinity)) || sorted[sorted.length - 1];
+  return { model: chosen.model, tier: chosen.name || chosen.model, tokens };
+}
 
 const MUTATING_TOOL_INTENTS = /\b(deploy|open position|add liquidity|lp into|invest in|close|exit|withdraw|remove liquidity|claim|harvest|collect|swap|convert|sell|exchange|block|unblock|blacklist|add smart wallet|remove smart wallet|add wallet|remove wallet|pin|unpin|clear lesson|add lesson|set active strategy|remove strategy|add strategy|set |change |update |self.?update|pull latest|git pull|update yourself)\b/i;
 const LIVE_DATA_TOOL_INTENTS = /\b(balance|wallet|position|portfolio|pnl|yield|range|show positions|open positions|screen|candidate|find pool|search|research|analyze|check pool|token holders|narrative|study top|top lpers?|lp behavior|who.?s lping|performance|history|stats|report|list smart wallets|list blacklist|list blocked deployers|list lessons)\b/i;
@@ -185,7 +206,10 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
     log("agent", `Step ${step + 1}/${maxSteps}`);
 
     try {
-      const activeModel = model || DEFAULT_MODEL;
+      const roleTools = getToolsForRole(agentType, goal);
+      const picked = pickModel(agentType, messages, roleTools, model);
+      const activeModel = picked.model;
+      log("llm_route", `role=${agentType} tier=${picked.tier} model=${picked.model} tokens=${picked.tokens ?? "n/a"} step=${step + 1}`);
 
       // Retry up to 3 times on transient provider errors (502, 503, 529)
       const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
@@ -197,10 +221,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
+          // Cost guard — hard daily/weekly USD cap. Throws BudgetExceededError if reached.
+          // Caught below at the outer try/catch boundary for graceful cycle abort.
+          assertWithinBudget();
           response = await client.chat.completions.create({
             model: usedModel,
             messages,
-            tools: getToolsForRole(agentType, goal),
+            tools: roleTools,
             tool_choice: toolChoice,
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
@@ -242,6 +269,14 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         throw new Error(`API returned no choices: ${response.error?.message || JSON.stringify(response)}`);
       }
       const msg = response.choices[0].message;
+      recordLlmUsage({
+        agentType,
+        model: usedModel,
+        step: step + 1,
+        finishReason: response.choices[0]?.finish_reason || null,
+        toolCalls: Array.isArray(msg.tool_calls) ? msg.tool_calls.length : 0,
+        usage: response.usage || {},
+      });
       const invalidToolArgErrors = new Map();
       // Keep tool-call history API-valid, but never execute unrecoverable args.
       if (msg.tool_calls) {
@@ -379,6 +414,23 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       messages.push(...toolResults);
     } catch (error) {
+      // Budget guard: abort current cycle gracefully without crashing the cron tick.
+      if (error instanceof BudgetExceededError) {
+        log("error", `Cost guard triggered: ${error.message}`);
+        // Vega fix #1 — loud, dedicated Telegram alert (12h throttled in helper).
+        // Wrapped: alert failure must NOT escalate the budget error.
+        try {
+          await notifyBudgetExceeded({ status: getBudgetStatus(), caller: "agent.js" });
+        } catch (alertErr) {
+          log("telegram_error", `Budget alert dispatch failed: ${alertErr.message}`);
+        }
+        return {
+          content: `LLM budget cap reached (${error.details?.scope || "?"}). Cycle aborted to preserve spend. Reset or raise caps in cost-guard.js to resume.`,
+          userMessage: goal,
+          budgetExceeded: true,
+          budgetDetails: error.details || null,
+        };
+      }
       log("error", `Agent loop error at step ${step}: ${error.message}`);
 
       // If it's a rate limit, wait and retry

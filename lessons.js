@@ -20,6 +20,14 @@ const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
 const MAX_MANUAL_LESSON_LENGTH = 400;
 
+function normalizeLessonsData(raw) {
+  const data = raw && typeof raw === "object" ? raw : {};
+  return {
+    lessons: Array.isArray(data.lessons) ? data.lessons : [],
+    performance: Array.isArray(data.performance) ? data.performance : [],
+  };
+}
+
 function sanitizeLessonText(text, maxLen = MAX_MANUAL_LESSON_LENGTH) {
   if (text == null) return null;
   const cleaned = String(text)
@@ -36,14 +44,14 @@ function load() {
     return { lessons: [], performance: [] };
   }
   try {
-    return JSON.parse(fs.readFileSync(LESSONS_FILE, "utf8"));
+    return normalizeLessonsData(JSON.parse(fs.readFileSync(LESSONS_FILE, "utf8")));
   } catch {
     return { lessons: [], performance: [] };
   }
 }
 
 function save(data) {
-  fs.writeFileSync(LESSONS_FILE, JSON.stringify(data, null, 2));
+  fs.writeFileSync(LESSONS_FILE, JSON.stringify(normalizeLessonsData(data), null, 2));
 }
 
 // ─── Record Position Performance ──────────────────────────────

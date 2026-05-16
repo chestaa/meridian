@@ -13,7 +13,11 @@
     "start": "node index.js",
     "dev": "DRY_RUN=true node index.js",
     "test": "npm run test:syntax",
-    "test:syntax": "find . -path ./node_modules -prune -o -name '*.js' -exec node --check {} \\;",
+    "test:syntax": "node scripts/check-syntax.js",
+    "test:signal": "node scripts/test-signal-parser.js",
+    "benchmark:llm": "node scripts/benchmark-llm.js",
+    "signal:runner": "node scripts/signal-runner.js",
+    "signal:once": "node scripts/signal-runner.js --once",
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "postinstall": "node scripts/patch-anchor.js"
@@ -31,7 +35,8 @@
     "dotenv": "^17.3.1",
     "jsonrepair": "^3.13.3",
     "node-cron": "^3.0.3",
-    "openai": "^4.73.0"
+    "openai": "^4.73.0",
+    "telegram": "^2.26.22"
   },
   "engines": {
     "node": ">=18.0.0"

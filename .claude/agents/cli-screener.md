@@ -1,6 +1,6 @@
 ---
-name: screener
-description: Pool screening specialist. Use when evaluating pool candidates, analysing token risk, or deciding whether to deploy a new position.
+name: cli-screener
+description: CLI-driven pool screening specialist. Use when evaluating pool candidates via CLI, analysing token risk, or deciding whether to deploy a new position. Distinct from cosmic Sirius/Cassiopeia/Orion chain.
 model: sonnet
 tools: Bash, Read
 ---

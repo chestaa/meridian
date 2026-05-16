@@ -1,5 +1,5 @@
 [Unit]
-Description=Meridian Solana DLMM agent
+Description=Meridian Telegram Userbot (MTProto signal listener)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,12 +7,10 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/opt/meridian
-Environment=NODE_ENV=production
-Environment=DRY_RUN=true
-ExecStart=/usr/local/bin/node /opt/meridian/index.js
+ExecStart=/usr/local/bin/node /opt/meridian/telegram-userbot.js
 Restart=on-failure
-RestartSec=15
-TimeoutStopSec=30
+RestartSec=30s
+Environment=NODE_ENV=production
 EnvironmentFile=-/opt/meridian/.env
 
 [Install]

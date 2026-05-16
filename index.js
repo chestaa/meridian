@@ -37,6 +37,8 @@ import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnable
 import { appendDecision } from "./decision-log.js";
 import { recordPaperDeploy, refreshPaperTrades } from "./paper-trades.js";
 import { getCircuitStatus, manualReset as circuitReset } from "./account-circuit-breaker.js";
+import { judgeCandidates, formatOrionVerdicts } from "./agents/orion.js";
+import { formatDeployReport, formatNoDeployReport, andromedaEnabled } from "./agents/andromeda.js";
 
 const isMain = process.argv[1]
   ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
@@ -352,7 +354,7 @@ RULES:
 
 Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.
 After executing, write a brief one-line result per position.
-      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
+      `, config.llm.maxSteps, [], "MANAGER", null, 2048, {
         onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
         onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
       });
@@ -548,6 +550,25 @@ export async function runScreeningCycle({ silent = false } = {}) {
       }
     }
 
+    // ─── Orion-int (LLM Judge) — pre-judgment pass before the fat screener loop ──
+    // Feature-flagged. Disable via user-config.internalAgents.orionEnabled=false.
+    let orionVerdicts = [];
+    let orionBlock = null;
+    const orionEnabled = config.internalAgents?.orionEnabled !== false;
+    if (orionEnabled) {
+      try {
+        orionVerdicts = await judgeCandidates(passing, {
+          portfolio: preBalance,
+          positions: prePositions,
+        });
+        orionBlock = formatOrionVerdicts(orionVerdicts);
+      } catch (e) {
+        log("cron_error", `Orion judge failed (non-fatal): ${e.message}`);
+        orionVerdicts = [];
+        orionBlock = null;
+      }
+    }
+
     // Pre-fetch active_bin for all passing candidates in parallel
     const activeBinResults = await Promise.allSettled(
       passing.map(({ pool }) => getActiveBin({ pool_address: pool.pool }))
@@ -623,16 +644,16 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     let deployAttempted = false;
     let deploySucceeded = false;
+    let lastDeployResult = null;
+    let lastDeployPoolAddress = null;
     const deployHeader = process.env.DRY_RUN === "true" ? "SIMULATED DEPLOY" : "DEPLOYED";
-    const { content } = await agentLoop(`
-SCREENING CYCLE
-${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
+    const andromedaOn = andromedaEnabled(config);
 
-PRE-LOADED CANDIDATES (${passing.length} pools):
-${candidateBlocks.join("\n\n")}
-
-STEPS:
+    // PR 2: when Andromeda is enabled, the LLM no longer renders the Telegram
+    // report — index.js calls formatDeployReport directly after the tool call.
+    // The LLM goal therefore drops the giant template and just demands a
+    // tool-call + a one-line ACK. When disabled, fall through to legacy.
+    const legacyReportSteps = `STEPS:
 DRY_RUN REPORTING RULE:
 If DRY_RUN is true and deploy_position returns dry_run/would_deploy, write SIMULATED DEPLOY instead of DEPLOYED. Never imply a real on-chain deployment happened during dry-run.
 
@@ -697,8 +718,27 @@ If DRY_RUN is true and deploy_position returns dry_run/would_deploy, write SIMUL
    <short flat list of top candidate names and why they were skipped>
 IMPORTANT:
 - Never write "unknown" for OKX. Use real values, omit missing fields, or write exactly "OKX: unavailable".
-- Keep the whole report compact and highly scannable for Telegram.
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
+- Keep the whole report compact and highly scannable for Telegram.`;
+
+    const terseReportSteps = `STEPS (Andromeda renders the Telegram report — do NOT render it yourself):
+1. Decide if any candidate is worth deploying. One surviving candidate is not automatically good enough.
+2. Pick the highest-conviction candidate (narrative + smart wallets + pool metrics + Orion verdict).
+3. Call deploy_position with active_bin pre-fetched. bins_below = round(${config.strategy.minBinsBelow} + (volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}]. Pass deploy_position.volatility = candidate volatility. amount_y only, amount_x=0, bins_above=0.
+4. Reply with ONE LINE only:
+   - On successful tool call:  OK <pool_address>
+   - On skip / no-deploy:       SKIP <pool_address_or_none> <short_reason>
+   Do NOT render the Telegram report — index.js + Andromeda will format the user-facing message from the tool result.`;
+
+    const { content } = await agentLoop(`
+SCREENING CYCLE
+${strategyBlock}
+Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
+
+PRE-LOADED CANDIDATES (${passing.length} pools):
+${candidateBlocks.join("\n\n")}
+${orionBlock ? `\nORION PRE-JUDGMENT (advisory — you may override):\n${orionBlock}\n` : ""}
+${andromedaOn ? terseReportSteps : legacyReportSteps}
+      `, config.llm.maxSteps, [], "SCREENER", null, 2048, {
         onToolStart: async ({ name }) => {
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);
@@ -707,6 +747,10 @@ IMPORTANT:
           if (name === "deploy_position") {
             deployAttempted = true;
             deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            if (deploySucceeded) {
+              lastDeployResult = result;
+              lastDeployPoolAddress = result?.pool || result?.would_deploy?.pool_address || null;
+            }
             if (process.env.DRY_RUN === "true" && result?.would_deploy?.pool_address) {
               const candidate = candidateByPool.get(result.would_deploy.pool_address);
               const pool = candidate?.pool || {};
@@ -736,9 +780,30 @@ IMPORTANT:
           await liveMessage?.toolFinish(name, result, success);
         },
       });
-    screenReport = process.env.DRY_RUN === "true"
-      ? content.replace(/^[^\n]*DEPLOYED/m, deployHeader)
-      : content;
+    if (andromedaOn) {
+      // PR 2: index.js owns the report — Andromeda renders, LLM only signaled.
+      if (deploySucceeded && lastDeployResult) {
+        const candidate = candidateByPool.get(lastDeployPoolAddress);
+        const orionVerdict = Array.isArray(orionVerdicts)
+          ? orionVerdicts.find((v) => v.pool_address === lastDeployPoolAddress) || null
+          : null;
+        screenReport = formatDeployReport({ deployResult: lastDeployResult, candidate, orionVerdict });
+      } else {
+        // No deploy: synthesize a reject list from Orion skips (advisory) +
+        // surviving candidates. LLM ACK content is preserved in decision-log.
+        const verdictByPool = new Map((orionVerdicts || []).map((v) => [v.pool_address, v]));
+        const rejectedCandidates = passing.map((c) => ({
+          pool: c.pool,
+          reason: verdictByPool.get(c.pool?.pool)?.reason || "did not qualify",
+        }));
+        const reason = stripThink(content || "").trim().slice(0, 400) || null;
+        screenReport = formatNoDeployReport({ rejectedCandidates, reason });
+      }
+    } else {
+      screenReport = process.env.DRY_RUN === "true"
+        ? content.replace(/^[^\n]*DEPLOYED/m, deployHeader)
+        : content;
+    }
     if (/⛔\s*NO DEPLOY/i.test(content)) {
       appendDecision({
         type: "no_deploy",
@@ -1684,9 +1749,8 @@ async function telegramHandler(msg) {
     const hasCloseIntent = /\bclose\b|\bsell\b|\bexit\b|\bwithdraw\b/i.test(text);
     const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(text);
     const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
-    const agentModel = agentRole === "SCREENER" ? config.llm.screeningModel : config.llm.generalModel;
     liveMessage = await createLiveMessage("🤖 Live Update", `Request: ${text.slice(0, 240)}`);
-    const { content } = await agentLoop(text, config.llm.maxSteps, sessionHistory, agentRole, agentModel, null, {
+    const { content } = await agentLoop(text, config.llm.maxSteps, sessionHistory, agentRole, null, null, {
       interactive: true,
       onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
       onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
@@ -2030,7 +2094,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
     // ── Free-form chat ───────────────────────
     await runBusy(async () => {
       log("user", input);
-      const { content } = await agentLoop(input, config.llm.maxSteps, sessionHistory, "GENERAL", config.llm.generalModel, null, { interactive: true });
+      const { content } = await agentLoop(input, config.llm.maxSteps, sessionHistory, "GENERAL", null, null, { interactive: true });
       appendHistory(input, content);
       console.log(`\n${content}\n`);
     });

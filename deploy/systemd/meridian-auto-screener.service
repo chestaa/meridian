@@ -1,0 +1,18 @@
+[Unit]
+Description=Meridian Auto-Screener (Meteora API + DeepSeek signal discovery)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/meridian
+ExecStart=/usr/local/bin/node /opt/meridian/scripts/auto-screener.js
+Restart=on-failure
+RestartSec=30s
+Environment=NODE_ENV=production
+Environment=SIGNAL_DIR=/opt/meridian/signals/inbox
+EnvironmentFile=-/opt/meridian/.env
+
+[Install]
+WantedBy=multi-user.target

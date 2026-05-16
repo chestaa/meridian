@@ -78,6 +78,39 @@ function setBaseMintCooldown(db, baseMint, hours, reason) {
   return cooldownUntil;
 }
 
+export function setPoolAndTokenCooldown({ poolAddress, baseMint = null, hours = 12, reason = "manual cooldown" }) {
+  if (!poolAddress) return null;
+  const db = load();
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: poolAddress.slice(0, 8),
+      base_mint: baseMint || null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+      snapshots: [],
+    };
+  }
+
+  const entry = db[poolAddress];
+  if (baseMint && !entry.base_mint) entry.base_mint = baseMint;
+
+  const poolCooldownUntil = setPoolCooldown(entry, hours, reason);
+  const tokenCooldownUntil = setBaseMintCooldown(db, baseMint || entry.base_mint, hours, reason);
+  save(db);
+  log("pool-memory", `Manual cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
+  if (tokenCooldownUntil && (baseMint || entry.base_mint)) {
+    log("pool-memory", `Manual base mint cooldown set for ${(baseMint || entry.base_mint).slice(0, 8)} until ${tokenCooldownUntil} (${reason})`);
+  }
+  return { poolCooldownUntil, tokenCooldownUntil };
+}
+
 // ─── Write ─────────────────────────────────────────────────────
 
 /**

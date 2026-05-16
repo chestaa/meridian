@@ -1,7 +1,9 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "agent": "project-manager",
   "permissions": {
     "allow": [
+      "Bash",
       "Bash(node *)",
       "Bash(npm *)",
       "Bash(onchainos *)",
@@ -10,11 +12,29 @@
       "Bash(git log *)",
       "Bash(git diff *)",
       "Bash(git show *)",
+      "Bash(cargo *)",
+      "Bash(rustc *)",
+      "Bash(winget *)",
+      "Bash(scoop *)",
+      "Bash(rtk *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(ls *)",
+      "Bash(ls)",
+      "Bash(which *)",
+      "Bash(mkdir *)",
+      "Bash(echo *)",
+      "Bash(cat *)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(systemctl *)",
+      "Bash(journalctl *)",
       "Read",
       "Write",
       "Edit",
       "Glob",
-      "Grep"
+      "Grep",
+      "PowerShell"
     ],
     "deny": [
       "Bash(rm -rf *)",
@@ -31,6 +51,16 @@
           {
             "type": "command",
             "command": "input=$(cat); echo \"$input\" | jq -e '.tool_input.run_in_background == true' > /dev/null 2>&1 && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Background execution is disabled in this project\"}}' || echo '{}'",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk hook claude",
             "timeout": 5
           }
         ]

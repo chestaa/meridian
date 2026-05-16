@@ -25,6 +25,27 @@ dotenv.config({ path: path.join(ROOT, ".env") });
 import { runPreChecks } from "./pre-checks.js";
 
 const SIGNALS_FILE = path.join(ROOT, "discord-signals.json");
+const SIGNAL_INBOX_DIR = path.join(ROOT, "signals", "inbox");
+
+function sanitizeSourceName(name) {
+  return String(name || "discord")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40) || "discord";
+}
+
+function writeInboxSignal(rawText, source) {
+  try {
+    fs.mkdirSync(SIGNAL_INBOX_DIR, { recursive: true });
+    const filename = `${Date.now()}-${sanitizeSourceName(source)}.txt`;
+    const dest = path.join(SIGNAL_INBOX_DIR, filename);
+    fs.writeFileSync(dest, rawText, "utf8");
+    console.log(`  [inbox] wrote ${filename}`);
+  } catch (err) {
+    console.error(`  [inbox write failed] ${err.message}`);
+  }
+}
 
 // Solana address regex: base58, 32-44 chars
 const SOL_ADDR_RE = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
@@ -54,7 +75,7 @@ function saveSignal(record) {
   fs.writeFileSync(SIGNALS_FILE, JSON.stringify(signals.slice(0, 100), null, 2));
 }
 
-async function processAddress(address, message) {
+async function processAddress(address, message, rawSignalText) {
   const result = await runPreChecks(address);
   if (!result.pass) return;
 
@@ -76,6 +97,10 @@ async function processAddress(address, message) {
   };
 
   saveSignal(record);
+  // Also mirror normalized signal text to signals/inbox/ for signal-runner pipeline.
+  // Best-effort: failure must not crash listener.
+  const sourceLabel = `${message.channel?.name || "discord"}-${record.base_symbol}`;
+  writeInboxSignal(rawSignalText || "", sourceLabel);
   console.log(`\n[QUEUED] ${record.base_symbol} → ${record.pool_address}`);
   console.log(`  from: @${record.discord_author} in #${record.discord_channel}`);
   console.log(`  → Check with: node ../cli.js discord-signals`);
@@ -141,7 +166,7 @@ client.on("messageCreate", async (message) => {
 
   // Process each address independently (don't await — handle concurrently but logged sequentially)
   for (const addr of unique) {
-    await processAddress(addr, message);
+    await processAddress(addr, message, fullText);
   }
 });
 
