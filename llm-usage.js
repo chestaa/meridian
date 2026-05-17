@@ -11,7 +11,14 @@ export const MODEL_PRICING_USD_PER_1M = {
   "moonshotai/kimi-k2": { input: 0.55, output: 2.20 },
   "deepseek/deepseek-v4-flash": { input: 0.10, output: 0.30 },
   "deepseek/deepseek-chat": { input: 0.10, output: 0.30 },
-  "openrouter/hunter-alpha": { input: 3.00, output: 15.00 },
+  // HOTFIX-1 (2026-05-17): openrouter/hunter-alpha deprecated, replaced by
+  // xiaomi/mimo-v2-pro. Pricing below is a best-effort estimate pending
+  // confirmation from OpenRouter docs — verify and override via env if needed.
+  "xiaomi/mimo-v2-pro": { input: 1.50, output: 5.00 },
+  // HOTFIX-4 (2026-05-17): openrouter/healer-alpha deprecated, replaced by
+  // xiaomi/mimo-v2-omni. Pricing below is a best-effort estimate (same as
+  // mimo-v2-pro) pending confirmation from OpenRouter docs.
+  "xiaomi/mimo-v2-omni": { input: 1.50, output: 5.00 },
   "openrouter/healer-alpha": { input: 3.00, output: 15.00 },
   "stepfun/step-3.5-flash:free": { input: 0, output: 0 },
   // Conservative catch-all for unknown models

@@ -21,7 +21,11 @@ export const ALERT_THRESHOLD_PCT = 0.80;
 // so we'd rather over-estimate burn and trigger the cap early than under-count.
 const RATE_PER_1K_USD = {
   "deepseek/deepseek-v4-flash": 0.00017,
+  // HOTFIX-4 (2026-05-17): openrouter/healer-alpha deprecated, kept for audit
+  // of historical records. Active replacement: xiaomi/mimo-v2-omni.
   "openrouter/healer-alpha": 0.00017,
+  "xiaomi/mimo-v2-omni": 0.000325,
+  "xiaomi/mimo-v2-pro": 0.000325,
   "stepfun/step-3.5-flash:free": 0.0,
   "minimax/minimax-m2.5": 0.000399,
   "minimax/minimax-m2.7": 0.000399,

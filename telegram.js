@@ -107,6 +107,51 @@ export function isBigPnl(pnlPct) {
   return Number.isFinite(v) && Math.abs(v) >= threshold;
 }
 
+// ─── HOTFIX-5: Meaningful cycle report detector (Sirius) ─────────────
+// Executive mode silences cycle-header noise + tool-step echoes but MUST
+// preserve Orion's actual verdict text (DEPLOY/NO DEPLOY analysis with
+// rationale — that's the executive-grade content Bro Dikta wants).
+//
+// Returns true iff text carries Orion-verdict signal worth surfacing.
+// Boilerplate ("no open positions", "screening already running", empty,
+// just-the-header) returns false → stays silent in exec mode.
+export function isMeaningfulReport(text) {
+  if (!text) return false;
+  const s = String(text).trim();
+  if (s.length < 40) return false;
+  // Case-insensitive normalization — actual Telegram messages use capital-N
+  // "No open positions" but boilerplate regex was missing /i in one spot and
+  // any future case-variant (ALL CAPS, TitleCase) would slip the gate.
+  const sLower = s.toLowerCase();
+
+  // Explicit boilerplate from runManagementCycle / runScreeningCycle
+  // Patterns operate on sLower → no /i flag needed.
+  const boilerplate = [
+    /^no open positions\.?\s*(triggering screening cycle|screening already running)/,
+    /^screening (skipped|pre-check failed)/,
+    /^no candidates? (available|found|to evaluate)/,
+    /^management cycle failed:/,
+    /^screening cycle failed:/,
+  ];
+  if (boilerplate.some((re) => re.test(sLower))) return false;
+
+  // Verdict / decision markers — Orion analysis surface
+  const verdictMarkers = [
+    /\bDEPLOY\b/i,        // covers DEPLOY and NO DEPLOY
+    /\bNO[- ]DEPLOY\b/i,
+    /\bBEST LOOKING CANDIDATE\b/i,
+    /\bVERDICT\b/i,
+    /\bRECOMMEND(ATION|ED)?\b/i,
+    /\bRATIONALE\b/i,
+    /\bdev sold\b/i,
+    /\brug\b/i,
+    /\bdump\b/i,
+    /\bclose\b.*\bposition\b/i,   // mgmt close decisions
+    /\bhold\b.*\bposition\b/i,
+  ];
+  return verdictMarkers.some((re) => re.test(s));
+}
+
 async function postTelegram(method, body) {
   if (!TOKEN || !chatId) return null;
   try {

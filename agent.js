@@ -102,7 +102,7 @@ const client = new OpenAI({
   timeout: 5 * 60 * 1000,
 });
 
-const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
+const DEFAULT_MODEL = process.env.LLM_MODEL || "xiaomi/mimo-v2-omni";
 
 function estimateTokens(messages, tools) {
   return Math.ceil((JSON.stringify(messages).length + JSON.stringify(tools || []).length) / 3.5);

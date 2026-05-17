@@ -32,6 +32,7 @@ const {
   notifyCircuitBreaker,
   isExecutiveMode,
   isBigPnl,
+  isMeaningfulReport,
 } = await import("../telegram.js");
 
 const captured = [];
@@ -163,6 +164,121 @@ check("execMode=true + LIVE close + small PnL: notifyClose still fires (no inter
   assert.ok(msg, "live close must fire in exec mode");
   assert.ok(!/SIMULATION/i.test(msg.text), `live close must not say SIMULATION: ${msg.text}`);
   assert.ok(msg.text.includes("Closed"), "Closed header missing");
+});
+
+// ── 9. HOTFIX-5: isMeaningfulReport gate for cycle final reports ─────
+// Exec mode silences cycle headers + tool echoes BUT must let Orion's
+// verdict analysis (DEPLOY / NO DEPLOY / dev-sold/dump narrative) through.
+config.telegram.executiveMode = true;
+
+check("isMeaningfulReport: NO DEPLOY verdict with rationale → fires", () => {
+  const orionVerdict =
+    "NO DEPLOY. Dev sold all 1h ago — token down 44% on the dump. " +
+    "Holder count collapsing, top10 concentration spiked. Hard pass.";
+  assert.equal(isMeaningfulReport(orionVerdict), true);
+});
+
+check("isMeaningfulReport: DEPLOY decision with deploy_args → fires", () => {
+  const orionVerdict =
+    "DEPLOY this pool. Strong organic volume, bundlers low, smart wallets " +
+    "accumulating. Recommend bid_ask, bins_below 50, 0.5 SOL.";
+  assert.equal(isMeaningfulReport(orionVerdict), true);
+});
+
+check("isMeaningfulReport: BEST LOOKING CANDIDATE summary → fires", () => {
+  const orionSummary =
+    "BEST LOOKING CANDIDATE: PEPE-SOL. Volume/TVL ratio 0.42, " +
+    "holders 1200+, no dev concentration. Rationale: organic flow.";
+  assert.equal(isMeaningfulReport(orionSummary), true);
+});
+
+check("isMeaningfulReport: mgmt close-decision rationale → fires", () => {
+  const orionMgmt =
+    "Close position 1 — OOR for 45 minutes, no recovery signal. " +
+    "Hold position 2, still earning fees in active bin.";
+  assert.equal(isMeaningfulReport(orionMgmt), true);
+});
+
+check("isMeaningfulReport: 'no open positions' boilerplate → silent", () => {
+  assert.equal(
+    isMeaningfulReport("No open positions. Triggering screening cycle."),
+    false
+  );
+  assert.equal(
+    isMeaningfulReport("No open positions. Screening already running or cooling down."),
+    false
+  );
+});
+
+check("isMeaningfulReport: empty / just-header text → silent", () => {
+  assert.equal(isMeaningfulReport(""), false);
+  assert.equal(isMeaningfulReport(null), false);
+  assert.equal(isMeaningfulReport(undefined), false);
+  assert.equal(isMeaningfulReport("   "), false);
+  assert.equal(isMeaningfulReport("Evaluating positions..."), false);
+});
+
+check("isMeaningfulReport: cycle failure boilerplate → silent", () => {
+  assert.equal(
+    isMeaningfulReport("Screening pre-check failed: insufficient SOL"),
+    false
+  );
+  assert.equal(
+    isMeaningfulReport("Management cycle failed: RPC timeout"),
+    false
+  );
+  assert.equal(
+    isMeaningfulReport("No candidates available after filtering"),
+    false
+  );
+});
+
+check("isMeaningfulReport: VERDICT marker (case insensitive) → fires", () => {
+  const text =
+    "Verdict: skip. Pool has 80% top10 concentration which violates " +
+    "screener safety thresholds. Will not deploy.";
+  assert.equal(isMeaningfulReport(text), true);
+});
+
+// ── 10. Case-sensitivity hardening — actual TG messages use Title/All caps ──
+// Observed leak: "No open positions. Screening already running" (capital N)
+// slipped through 30-min observation window. Gate must reject ALL case
+// variants of cycle boilerplate.
+check("isMeaningfulReport: TitleCase 'No open positions...' boilerplate → silent", () => {
+  assert.equal(
+    isMeaningfulReport("No open positions. Screening already running or cooling down."),
+    false
+  );
+  assert.equal(
+    isMeaningfulReport("No open positions. Triggering screening cycle."),
+    false
+  );
+});
+
+check("isMeaningfulReport: ALL CAPS 'NO OPEN POSITIONS...' boilerplate → silent", () => {
+  assert.equal(
+    isMeaningfulReport("NO OPEN POSITIONS. SCREENING ALREADY RUNNING OR COOLING DOWN."),
+    false
+  );
+  assert.equal(
+    isMeaningfulReport("NO OPEN POSITIONS. TRIGGERING SCREENING CYCLE."),
+    false
+  );
+});
+
+check("isMeaningfulReport: mixed-case cycle-failure boilerplate → silent", () => {
+  assert.equal(
+    isMeaningfulReport("Management Cycle Failed: RPC timeout after 30s retry"),
+    false
+  );
+  assert.equal(
+    isMeaningfulReport("SCREENING PRE-CHECK FAILED: insufficient SOL balance"),
+    false
+  );
+  assert.equal(
+    isMeaningfulReport("No Candidates Available after filtering current trending list"),
+    false
+  );
 });
 
 // Restore original config + cleanup

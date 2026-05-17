@@ -91,7 +91,7 @@ function approx(a, b, eps = 1e-9) {
   const expected = [
     "moonshotai/kimi-k2",
     "deepseek/deepseek-v4-flash",
-    "openrouter/hunter-alpha",
+    "xiaomi/mimo-v2-pro",
     "openrouter/healer-alpha",
     "stepfun/step-3.5-flash:free",
     "default",

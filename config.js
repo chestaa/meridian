@@ -122,6 +122,12 @@ export const config = {
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    // Andromeda PR-A — max-drawdown-recovery exit (paper-trades.js).
+    // ARM when max_drawdown (peak−trough) >= armPct; FIRE when current pnl
+    // recovers deltaPct above trough. Distinct from trailing TP, which gates
+    // on peak >= trailingTriggerPct. Toggle internalAgents.drawdownRecoveryEnabled.
+    drawdownRecoveryArmPct:  u.drawdownRecoveryArmPct  ?? 10,  // require >= X% drawdown before arming
+    drawdownRecoveryDeltaPct: u.drawdownRecoveryDeltaPct ?? 5, // close after X% recovery from trough
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
@@ -147,9 +153,9 @@ export const config = {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
     maxSteps:    u.maxSteps    ?? 20,
-    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
-    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "xiaomi/mimo-v2-omni",
+    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "xiaomi/mimo-v2-pro",
+    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "xiaomi/mimo-v2-omni",
     routing: u.llmRouting ?? null,
   },
 
@@ -164,6 +170,14 @@ export const config = {
     // Default ON (Phase 1 unblock). Toggle false for emergency rollback to
     // Discord-LP-only scoring (vol5m + distributedSol gated path).
     useEnrichedScoring: u.internalAgents?.useEnrichedScoring ?? true,
+    // PR-B — feed paper-trade closes into lessons.recordPerformance so Phase 0
+    // (DRY_RUN) actually populates the learning loop. Default ON; flip false
+    // for emergency rollback to forensic-only paper closes.
+    paperFeedsLessons: u.internalAgents?.paperFeedsLessons ?? true,
+    // PR-A — Andromeda max-drawdown-recovery exit (paper-trades.js).
+    // Default ON; flip false for silent revert to legacy exit precedence
+    // (SL → TP → TRAILING_TP → OOR, no DRAWDOWN_RECOVERY).
+    drawdownRecoveryEnabled: u.internalAgents?.drawdownRecoveryEnabled ?? true,
   },
 
   // ─── Darwinian Signal Weighting ───────

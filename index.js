@@ -25,6 +25,7 @@ import {
   createLiveMessage,
   markManualClose,
   isExecutiveMode,
+  isMeaningfulReport,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
@@ -219,7 +220,7 @@ export async function runManagementCycle({ silent = false } = {}) {
   let liveMessage = null;
   try {
     await refreshPaperTrades().catch((error) => log("paper_warn", `Paper trade refresh failed: ${error.message}`));
-    if (!silent && telegramEnabled()) {
+    if (!silent && telegramEnabled() && !isExecutiveMode()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
@@ -381,8 +382,15 @@ After executing, write a brief one-line result per position.
     if (!silent && telegramEnabled()) {
       if (mgmtReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
-        // Executive mode silences per-cycle mgmt report (still in journald + boss-report).
-        else if (!isExecutiveMode()) sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
+        // HOTFIX-5: Executive mode silences cycle-header noise + boilerplate,
+        // but ALLOWS Orion verdict text (DEPLOY / NO DEPLOY / close-decision).
+        // Legacy (non-exec) mode: fires every report as before.
+        else {
+          const stripped = stripThink(mgmtReport);
+          if (!isExecutiveMode() || isMeaningfulReport(stripped)) {
+            sendMessage(`🔄 Management Cycle\n\n${stripped}`).catch(() => { });
+          }
+        }
       }
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
@@ -440,7 +448,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     _screeningBusy = false;
     return screenReport;
   }
-  if (!silent && telegramEnabled()) {
+  if (!silent && telegramEnabled() && !isExecutiveMode()) {
     liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
   }
   timers.screeningLastRun = Date.now();
@@ -829,8 +837,15 @@ ${andromedaOn ? terseReportSteps : legacyReportSteps}
     if (!silent && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
-        // Executive mode silences per-cycle screening report (still in journald + boss-report).
-        else if (!isExecutiveMode()) sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
+        // HOTFIX-5: Executive mode silences cycle-header noise + boilerplate,
+        // but ALLOWS Orion verdict text (DEPLOY / NO DEPLOY / BEST CANDIDATE).
+        // Legacy (non-exec) mode: fires every report as before.
+        else {
+          const stripped = stripThink(screenReport);
+          if (!isExecutiveMode() || isMeaningfulReport(stripped)) {
+            sendMessage(`🔍 Screening Cycle\n\n${stripped}`).catch(() => { });
+          }
+        }
       }
     }
   }

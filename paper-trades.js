@@ -5,6 +5,7 @@ import { log } from "./logger.js";
 import { setPoolAndTokenCooldown } from "./pool-memory.js";
 import { config } from "./config.js";
 import { notifyClose, isExecutiveMode, isBigPnl } from "./telegram.js";
+import { recordPerformance } from "./lessons.js";
 
 const PAPER_TRADES_FILE = "./paper-trades.json";
 const MAX_TRADES = 300;
@@ -143,6 +144,13 @@ export function recordPaperDeploy(entry) {
     risk_data_complete: computeRiskDataComplete(entry),
     latest_snapshot: null,
     checkpoints: {},
+    // Andromeda PR-A — max-drawdown-recovery exit fields. Track low-water mark
+    // and running peak-trough so we can lock in a partial recovery from a deep
+    // dip even when peak never reached trailingTriggerPct. Additive — old trades
+    // without these fields still work via `?? 0` fallbacks in evaluatePaperExit.
+    min_pnl_pct: 0,
+    max_drawdown_pct: 0,
+    drawdown_recovery_armed_at: null,
     notes: ["price_proxy_only"],
   };
   data.trades.push(trade);
@@ -214,6 +222,46 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
         };
       }
     }
+
+    // Andromeda PR-A — DRAWDOWN_RECOVERY
+    // Lock in a partial recovery after a deep dip. Distinct from Trailing TP:
+    // Trailing TP requires peak >= trailingTriggerPct (default +3%). Positions
+    // that never made a peak but recovered from a deep underwater move would
+    // otherwise get NOTHING. Per Bro Dikta external-operator insight: "track
+    // behavior from max drawdown — the clue is recovery."
+    //
+    // ARM:  max_drawdown_pct (peak − current low) >= armPct (default 10%)
+    // FIRE: pnlPct − min_pnl_pct >= deltaPct (default 5%)
+    // GUARD: stillBelowPeak — must not be near a new high (-0.5% slack), so
+    //        a full recovery to a new peak is not mistaken for partial recovery.
+    //
+    // Reversibility: config.internalAgents.drawdownRecoveryEnabled=false →
+    // silent revert to legacy behavior. Old trades w/o fields use `?? 0`.
+    trade.min_pnl_pct = Math.min(trade.min_pnl_pct ?? 0, pnlPct);
+    trade.max_drawdown_pct = Math.max(
+      trade.max_drawdown_pct ?? 0,
+      (trade.peak_pnl_pct ?? 0) - pnlPct,
+    );
+
+    if (config.internalAgents?.drawdownRecoveryEnabled !== false) {
+      const armPct = mgmt.drawdownRecoveryArmPct ?? 10;
+      const deltaPct = mgmt.drawdownRecoveryDeltaPct ?? 5;
+
+      const droppedDeepEnough = (trade.max_drawdown_pct ?? 0) >= armPct;
+      const recoveredFromTrough = pnlPct - (trade.min_pnl_pct ?? 0) >= deltaPct;
+      const stillBelowPeak = pnlPct < (trade.peak_pnl_pct ?? 0) - 0.5;
+
+      if (droppedDeepEnough && !trade.drawdown_recovery_armed_at) {
+        trade.drawdown_recovery_armed_at = new Date().toISOString();
+      }
+
+      if (droppedDeepEnough && recoveredFromTrough && stillBelowPeak) {
+        return {
+          action: "DRAWDOWN_RECOVERY",
+          reason: `Drawdown recovery: max_dd=${trade.max_drawdown_pct.toFixed(2)}% recovered to ${pnlPct.toFixed(2)}% from trough ${trade.min_pnl_pct.toFixed(2)}% (delta ${(pnlPct - trade.min_pnl_pct).toFixed(2)}% >= ${deltaPct}%)`,
+        };
+      }
+    }
   }
   // OOR — paper proxy: snapshot.price compared to entry-band derived from bins.
   // We don't have live active_bin reliably in paper, so use price-band proxy:
@@ -239,7 +287,10 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
   return null;
 }
 
-function closePaperTrade(trade, exit, snapshot) {
+// Exported for tests (scripts/test-lessons-from-paper.js) so the lessons
+// feedback path can be exercised without network-bound buildSnapshot calls.
+// In production, only refreshPaperTrades() invokes this.
+export async function closePaperTrade(trade, exit, snapshot) {
   trade.status = "closed";
   trade.closed_at = new Date().toISOString();
   trade.close_reason = exit.reason;
@@ -269,6 +320,51 @@ function closePaperTrade(trade, exit, snapshot) {
     }).catch(() => {});
   }
   log("paper", `Paper trade closed: ${trade.pool_name} — ${exit.action} (${exit.reason})`);
+
+  // PR-B — feed paper close into the lessons learning loop (DRY_RUN closes
+  // were forensic-only before this). Gated by config.internalAgents.paperFeedsLessons
+  // (default true). Reversibility: flip flag false → silent revert to forensic-only.
+  if (config.internalAgents?.paperFeedsLessons !== false) {
+    try {
+      // Shape matches tools/dlmm.js:1551 / 1834 (live close path). Paper trades
+      // operate in SOL, so we synthesize SOL-as-USD numbers (treat 1 USD == 1
+      // unit of amount_sol) — recordPerformance only cares about ratios for
+      // pnl_pct / range_efficiency, both already finite here.
+      const initialValue = Number(trade.amount_sol) || 0;
+      const pnlPct = Number(trade.final_pnl_pct) || 0;
+      const finalValue = initialValue > 0
+        ? Math.max(0, initialValue * (1 + pnlPct / 100))
+        : 0;
+      const feesEarnedSol = Number(trade.fees_claimed_sol) || 0;
+      await recordPerformance({
+        position: trade.id,
+        pool: trade.pool_address,
+        pool_name: trade.pool_name,
+        base_mint: trade.base_mint || null,
+        strategy: trade.strategy,
+        bin_range: {
+          bins_below: trade.bins_below ?? null,
+          bins_above: trade.bins_above ?? null,
+        },
+        bin_step: trade.bin_step ?? null,
+        volatility: trade.entry_volatility ?? null,
+        fee_tvl_ratio: trade.entry_fee_tvl_ratio ?? null,
+        organic_score: trade.entry_organic_score ?? null,
+        amount_sol: initialValue,
+        fees_earned_usd: feesEarnedSol, // paper: SOL units treated as USD-equivalent
+        fees_earned_sol: feesEarnedSol,
+        final_value_usd: finalValue,
+        initial_value_usd: initialValue,
+        minutes_in_range: durationMin ?? 0,
+        minutes_held: durationMin ?? 0,
+        close_reason: exit.reason,
+        deployed_at: trade.opened_at,
+        source: "paper",
+      });
+    } catch (err) {
+      log("paper_warn", `recordPerformance failed for ${trade.pool_name}: ${err.message}`);
+    }
+  }
 }
 
 export async function refreshPaperTrades({ mgmtConfigOverride = null } = {}) {
@@ -296,7 +392,7 @@ export async function refreshPaperTrades({ mgmtConfigOverride = null } = {}) {
     // Andromeda — evaluate close eligibility on every refresh.
     const exit = evaluatePaperExit(trade, snapshot, mgmtConfigOverride);
     if (exit) {
-      closePaperTrade(trade, exit, snapshot);
+      await closePaperTrade(trade, exit, snapshot);
       changed = true;
       continue;
     }
