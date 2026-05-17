@@ -56,23 +56,39 @@ async function sendTelegram(html) {
   } catch (e) { console.error("[telegram]", e.message); }
 }
 
-function saveToInbox(candidates) {
-  fs.mkdirSync(INBOX_DIR, { recursive: true });
+export function saveToInbox(candidates, { fsImpl = fs } = {}) {
+  fsImpl.mkdirSync(INBOX_DIR, { recursive: true });
   const ts = Date.now();
+  let written = 0;
+  let skipped = 0;
   for (const c of candidates) {
+    // Guard: skip candidates with no resolvable token address. These flood
+    // inbox/ and get instantly rejected by pre-score ("no token address").
+    const tokenAddr = c?.base_mint || c?.token_address;
+    if (!tokenAddr || typeof tokenAddr !== "string" || tokenAddr.trim() === "") {
+      skipped++;
+      continue;
+    }
     const filename = `${ts}-screener-${(c.symbol || "unknown").replace(/[^a-z0-9]/gi, "").slice(0, 12)}.txt`;
     const content = [
       `[SCREENER SIGNAL] ${c.symbol || "?"} / ${c.pair || "?"}`,
       `Pool: ${c.pool_address}`,
+      `Token: ${tokenAddr}`,
       `TVL: $${Number(c.tvl || 0).toFixed(0)} | Vol: $${Number(c.volume_window || 0).toFixed(0)}`,
       `Fee/TVL: ${Number(c.fee_active_tvl_ratio || 0).toFixed(4)} | Organic: ${c.organic_score || "?"}`,
       `Bin step: ${c.bin_step || "?"} | Volatility: ${Number(c.volatility || 0).toFixed(2)}`,
       `Source: Meteora auto-screener`,
       `Timestamp: ${new Date().toISOString()}`,
     ].join("\n");
-    fs.writeFileSync(path.join(INBOX_DIR, filename), content);
+    fsImpl.writeFileSync(path.join(INBOX_DIR, filename), content);
+    written++;
   }
-  console.log(`[screener] Saved ${candidates.length} candidates to inbox`);
+  if (skipped > 0) {
+    console.log(`[screener] Saved ${written} candidates to inbox (skipped ${skipped} with no token address)`);
+  } else {
+    console.log(`[screener] Saved ${written} candidates to inbox`);
+  }
+  return { written, skipped };
 }
 
 async function callLlm(prompt) {
@@ -187,6 +203,11 @@ async function runScan() {
 }
 
 // ─── run loop ───────────────────────────────────────────────────
-console.log(`[screener] Auto-screener started. Interval: ${SCAN_INTERVAL_MS / 60000} min | Model: ${MODEL}`);
-await runScan(); // immediate first scan
-setInterval(runScan, SCAN_INTERVAL_MS);
+// Only auto-start when invoked directly (not when imported as a module — e.g. tests).
+const isDirectInvocation = import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}`
+  || process.argv[1]?.endsWith("auto-screener.js");
+if (isDirectInvocation && !process.env.AUTO_SCREENER_NO_AUTOSTART) {
+  console.log(`[screener] Auto-screener started. Interval: ${SCAN_INTERVAL_MS / 60000} min | Model: ${MODEL}`);
+  await runScan(); // immediate first scan
+  setInterval(runScan, SCAN_INTERVAL_MS);
+}

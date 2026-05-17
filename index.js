@@ -41,6 +41,7 @@ import { recordPaperDeploy, refreshPaperTrades } from "./paper-trades.js";
 import { getCircuitStatus, manualReset as circuitReset } from "./account-circuit-breaker.js";
 import { judgeCandidates, formatOrionVerdicts } from "./agents/orion.js";
 import { formatDeployReport, formatNoDeployReport, andromedaEnabled } from "./agents/andromeda.js";
+import { buildDigest } from "./digest.js";
 
 const isMain = process.argv[1]
   ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
@@ -1364,6 +1365,7 @@ function formatHelpText() {
     "/closeall — close all open positions",
     "/set <n> <note> — set note/instruction on position",
     "/circuit — circuit breaker status | /circuit reset — re-arm",
+    "/digest — on-demand instant pulse (paper PnL, Orion, thresholds, cost, circuit)",
     "/config — show important runtime config",
     "/settings — button menu for common config",
     "/setcfg <key> <value> — update persisted config",
@@ -1488,6 +1490,18 @@ async function telegramHandler(msg) {
   }
   if (text === "/settings" || text === "/menu" || text === "/configmenu") {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
+    return;
+  }
+
+  // /digest — on-demand instant pulse. Bypasses busy-queue gate AND
+  // isExecutiveMode (user-initiated, always reply).
+  if (text === "/digest") {
+    try {
+      const { html } = buildDigest({ timers });
+      await sendHTML(html);
+    } catch (e) {
+      await sendMessage(`Digest error: ${e.message}`).catch(() => {});
+    }
     return;
   }
   if (_managementBusy || _screeningBusy || busy) {
