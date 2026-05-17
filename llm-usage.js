@@ -3,6 +3,56 @@ import fs from "fs";
 const LLM_USAGE_FILE = "./llm-usage.json";
 const MAX_RECORDS = 2000;
 
+// Pricing in USD per 1M tokens. Best-effort estimates — verify against
+// OpenRouter docs (https://openrouter.ai/models) periodically. Override via
+// LLM_PRICING_OVERRIDE_JSON env (a JSON object keyed by model name).
+// Fields: { input: number, output: number }
+export const MODEL_PRICING_USD_PER_1M = {
+  "moonshotai/kimi-k2": { input: 0.55, output: 2.20 },
+  "deepseek/deepseek-v4-flash": { input: 0.10, output: 0.30 },
+  "deepseek/deepseek-chat": { input: 0.10, output: 0.30 },
+  "openrouter/hunter-alpha": { input: 3.00, output: 15.00 },
+  "openrouter/healer-alpha": { input: 3.00, output: 15.00 },
+  "stepfun/step-3.5-flash:free": { input: 0, output: 0 },
+  // Conservative catch-all for unknown models
+  default: { input: 1.00, output: 3.00 },
+};
+
+// Apply env override at module load (non-fatal on parse failure)
+try {
+  if (process.env.LLM_PRICING_OVERRIDE_JSON) {
+    const override = JSON.parse(process.env.LLM_PRICING_OVERRIDE_JSON);
+    if (override && typeof override === "object") {
+      for (const [k, v] of Object.entries(override)) {
+        if (v && typeof v === "object" && Number.isFinite(Number(v.input)) && Number.isFinite(Number(v.output))) {
+          MODEL_PRICING_USD_PER_1M[k] = { input: Number(v.input), output: Number(v.output) };
+        }
+      }
+    }
+  }
+} catch {
+  // ignore malformed override
+}
+
+export function priceFor(model) {
+  if (model && typeof model === "string") {
+    if (MODEL_PRICING_USD_PER_1M[model]) return MODEL_PRICING_USD_PER_1M[model];
+    // :free suffix is always zero-cost regardless of base model
+    if (model.endsWith(":free")) return { input: 0, output: 0 };
+  }
+  return MODEL_PRICING_USD_PER_1M.default;
+}
+
+export function computeCost(model, usage) {
+  if (!usage) return 0;
+  const p = priceFor(model);
+  const promptTokens = Number(usage.prompt_tokens) || 0;
+  const completionTokens = Number(usage.completion_tokens) || 0;
+  const inputCost = promptTokens * p.input / 1_000_000;
+  const outputCost = completionTokens * p.output / 1_000_000;
+  return inputCost + outputCost;
+}
+
 function defaultState() {
   return {
     totals: {
@@ -10,6 +60,7 @@ function defaultState() {
       prompt_tokens: 0,
       completion_tokens: 0,
       total_tokens: 0,
+      cost_usd: 0,
     },
     records: [],
   };
@@ -25,6 +76,7 @@ function load() {
         prompt_tokens: Number(parsed?.totals?.prompt_tokens || 0),
         completion_tokens: Number(parsed?.totals?.completion_tokens || 0),
         total_tokens: Number(parsed?.totals?.total_tokens || 0),
+        cost_usd: Number(parsed?.totals?.cost_usd || 0),
       },
       records: Array.isArray(parsed?.records) ? parsed.records : [],
     };
@@ -48,16 +100,20 @@ export function recordLlmUsage(entry) {
   const completionTokens = num(entry?.usage?.completion_tokens);
   const totalTokens = num(entry?.usage?.total_tokens) || promptTokens + completionTokens;
 
+  const model = entry?.model || "unknown";
+  const cost_usd = computeCost(model, { prompt_tokens: promptTokens, completion_tokens: completionTokens });
+
   const record = {
     ts: new Date().toISOString(),
     agent_type: entry?.agentType || "GENERAL",
-    model: entry?.model || "unknown",
+    model,
     step: entry?.step ?? null,
     finish_reason: entry?.finishReason || null,
     tool_calls: num(entry?.toolCalls),
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
     total_tokens: totalTokens,
+    cost_usd,
   };
 
   data.records.push(record);
@@ -66,6 +122,7 @@ export function recordLlmUsage(entry) {
   data.totals.prompt_tokens += promptTokens;
   data.totals.completion_tokens += completionTokens;
   data.totals.total_tokens += totalTokens;
+  data.totals.cost_usd = Number(data.totals.cost_usd || 0) + cost_usd;
   save(data);
   return record;
 }

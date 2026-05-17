@@ -12,6 +12,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import "dotenv/config";
 import "../envcrypt.js";
+import { isExecutiveMode } from "../telegram.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -38,6 +39,9 @@ function saveState(s) {
 
 async function sendTelegram(html) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
+  // Executive mode silences per-scan screener notifs (report + empty-scan + errors).
+  // Boss-report aggregates daily activity; live errors still surface in journald.
+  if (isExecutiveMode()) return;
   try {
     await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
       method: "POST",

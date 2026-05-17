@@ -1,0 +1,3 @@
+- [Deploy 2026-05-17 exec mode + paper sweep](deploy-2026-05-17-exec-sweep.md) — Combined Sirius+Andromeda deploy: 10 files, 33 legacy paper trades swept, executive notification mode live
+- [Paper-trades.json shape](reference-paper-trades-shape.md) — File is object with `trades` key, NOT bare array — survey scripts must handle both
+- [Sweep script Telegram limitation](sweep-script-telegram-limitation.md) — scripts/sweep-paper-trades.js runs standalone; Telegram aggregate skipped if env not loaded in script context

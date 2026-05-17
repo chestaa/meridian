@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -11,8 +12,8 @@ const BASE  = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
 const ALLOWED_USER_IDS = new Set(
   String(process.env.TELEGRAM_ALLOWED_USER_IDS || "")
     .split(",")
-    .map((id) => id.trim())
-    .filter(Boolean)
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n))
 );
 
 let chatId   = process.env.TELEGRAM_CHAT_ID || null;
@@ -50,7 +51,7 @@ loadChatId();
 
 function isAuthorizedIncomingMessage(msg) {
   const incomingChatId = String(msg.chat?.id || "");
-  const senderUserId = msg.from?.id != null ? String(msg.from.id) : null;
+  const senderUserIdNum = msg.from?.id != null ? Number(msg.from.id) : null;
   const chatType = msg.chat?.type || "unknown";
 
   if (!chatId) {
@@ -61,7 +62,10 @@ function isAuthorizedIncomingMessage(msg) {
     return false;
   }
 
-  if (incomingChatId !== chatId) return false;
+  if (incomingChatId !== chatId) {
+    log("telegram_warn", `Rejected incoming msg from unauthorized chat user_id=${senderUserIdNum} chat_id=${incomingChatId}`);
+    return false;
+  }
 
   if (chatType !== "private" && ALLOWED_USER_IDS.size === 0) {
     if (!_warnedMissingAllowedUsers) {
@@ -72,7 +76,10 @@ function isAuthorizedIncomingMessage(msg) {
   }
 
   if (ALLOWED_USER_IDS.size > 0) {
-    if (!senderUserId || !ALLOWED_USER_IDS.has(senderUserId)) return false;
+    if (senderUserIdNum == null || !Number.isFinite(senderUserIdNum) || !ALLOWED_USER_IDS.has(senderUserIdNum)) {
+      log("telegram_warn", `Rejected incoming msg from unauthorized user_id=${senderUserIdNum} chat_id=${incomingChatId}`);
+      return false;
+    }
   }
 
   return true;
@@ -81,6 +88,23 @@ function isAuthorizedIncomingMessage(msg) {
 // ─── Core send ───────────────────────────────────────────────────
 export function isEnabled() {
   return !!TOKEN;
+}
+
+// ─── Executive Notification Mode (Sirius) ────────────────────────
+// When executiveMode = true, gated call sites stay silent. Surfaces ONLY:
+//   - daily boss-report (boss-report.js)
+//   - morning briefing (briefing.js)
+//   - circuit breaker (notifyCircuitBreaker)
+//   - big PnL paper closes (|PnL| >= bigPnlThresholdPct via isBigPnl)
+//   - live (non-paper) deploys/closes
+// Flip flag false → all legacy notifs return immediately. No code removal.
+export function isExecutiveMode() {
+  return config?.telegram?.executiveMode === true;
+}
+export function isBigPnl(pnlPct) {
+  const threshold = config?.telegram?.bigPnlThresholdPct ?? 15;
+  const v = Number(pnlPct);
+  return Number.isFinite(v) && Math.abs(v) >= threshold;
 }
 
 async function postTelegram(method, body) {
@@ -136,7 +160,19 @@ export async function sendMessageWithButtons(text, inlineKeyboard) {
   });
 }
 
+// Test-only capture hook. Production code never sets this; only test scripts do.
+// When set, notify* helpers call this instead of hitting Telegram. Lets us
+// assert formatting/fields without monkey-patching the module.
+let _testSender = null;
+export function __setTestSender(fn) {
+  _testSender = typeof fn === "function" ? fn : null;
+}
+
 export async function sendHTML(html) {
+  if (_testSender) {
+    try { await _testSender({ kind: "html", text: html }); } catch (_) {}
+    return;
+  }
   if (!TOKEN || !chatId) return;
   return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
 }
@@ -433,7 +469,7 @@ const BUDGET_ALERT_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12h
 let _lastBudgetAlertAt = 0;
 
 // ─── Notification helpers ────────────────────────────────────────
-export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee }) {
+export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee, dryRun = false }) {
   if (hasActiveLiveMessage()) return;
   const priceStr = priceRange
     ? `Price range: ${priceRange.min < 0.0001 ? priceRange.min.toExponential(3) : priceRange.min.toFixed(6)} – ${priceRange.max < 0.0001 ? priceRange.max.toExponential(3) : priceRange.max.toFixed(6)}\n`
@@ -444,18 +480,27 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   const poolStr = (binStep || baseFee)
     ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
     : "";
+  // DRY_RUN marker — Bro wants live PnL pulse even in paper mode.
+  // No tx/position in paper deploys, so render those lines conditionally.
+  const header = dryRun ? `🔵 <b>SIMULATION — Paper Deploy</b>` : `✅ <b>Deployed</b>`;
+  const positionLine = position
+    ? `Position: <code>${htmlEscape(String(position).slice(0, 8))}...</code>\n`
+    : (dryRun ? `Position: <i>[PAPER — not on-chain]</i>\n` : "");
+  const txLine = tx
+    ? `Tx: <code>${htmlEscape(String(tx).slice(0, 16))}...</code>`
+    : (dryRun ? `Tx: <i>[PAPER — no transaction]</i>` : "");
   await sendHTML(
-    `✅ <b>Deployed</b> ${htmlEscape(pair)}\n` +
+    `${header} ${htmlEscape(pair)}\n` +
     `Amount: ${htmlEscape(amountSol)} SOL\n` +
     priceStr +
     coverageStr +
     poolStr +
-    `Position: <code>${htmlEscape(position?.slice(0, 8))}...</code>\n` +
-    `Tx: <code>${htmlEscape(tx?.slice(0, 16))}...</code>`
+    positionLine +
+    txLine
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct, positionAddress = null }) {
+export async function notifyClose({ pair, pnlUsd, pnlPct, pnlSol, feesSol, durationMin, feeInclusivePnlPct, positionAddress = null, dryRun = false }) {
   if (hasActiveLiveMessage()) return;
   // Skip if the user just closed this manually via /close (inline echo already sent)
   if (positionAddress) {
@@ -465,11 +510,37 @@ export async function notifyClose({ pair, pnlUsd, pnlPct, positionAddress = null
       return;
     }
   }
-  const sign = pnlUsd >= 0 ? "+" : "";
+  const sign = (pnlUsd ?? 0) >= 0 ? "+" : "";
+  const header = dryRun ? `🔵 <b>SIMULATION — Paper Close</b>` : `🔒 <b>Closed</b>`;
+  const pnlLine = `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`;
+  const pnlSolLine = Number.isFinite(pnlSol)
+    ? `\nPnL SOL: ${pnlSol >= 0 ? "+" : ""}${Number(pnlSol).toFixed(4)} SOL`
+    : "";
+  const feesLine = Number.isFinite(feesSol) && feesSol > 0
+    ? `\nFees collected: ${Number(feesSol).toFixed(4)} SOL`
+    : "";
+  const durationLine = Number.isFinite(durationMin) && durationMin >= 0
+    ? `\nDuration: ${formatDuration(durationMin)}`
+    : "";
+  const feeInclusiveLine = Number.isFinite(feeInclusivePnlPct)
+    ? `\nFee-inclusive PnL: ${feeInclusivePnlPct >= 0 ? "+" : ""}${Number(feeInclusivePnlPct).toFixed(2)}%`
+    : "";
   await sendHTML(
-    `🔒 <b>Closed</b> ${htmlEscape(pair)}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `${header} ${htmlEscape(pair)}\n` +
+    pnlLine +
+    pnlSolLine +
+    feesLine +
+    feeInclusiveLine +
+    durationLine
   );
+}
+
+function formatDuration(mins) {
+  const m = Math.max(0, Math.round(Number(mins) || 0));
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return rem === 0 ? `${h}h` : `${h}h ${rem}m`;
 }
 
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {

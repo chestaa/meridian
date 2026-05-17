@@ -3,7 +3,7 @@ import path from "path";
 import { parseSignalMessage, scoreParsedSignal } from "../signal-parser.js";
 import { enrichSignal } from "../signal-enricher.js";
 import { judgeSignalWithLlm, formatSignalJudgment } from "../signal-judge.js";
-import { sendMessage, isEnabled as telegramEnabled } from "../telegram.js";
+import { sendMessage, isEnabled as telegramEnabled, isExecutiveMode } from "../telegram.js";
 import { config } from "../config.js";
 
 const SIGNAL_DIR = process.env.SIGNAL_DIR || "./signals/inbox";
@@ -65,7 +65,8 @@ async function processFile(filePath) {
   appendJsonl(RESULTS_FILE, result);
   const text = formatSignalJudgment({ signal, preScore, llm });
   console.log(`\n${text}\n`);
-  if (telegramEnabled()) {
+  // Executive mode silences per-signal verdicts — aggregated in daily boss-report.
+  if (telegramEnabled() && !isExecutiveMode()) {
     await sendMessage(`Signal-first dry-run\n\n${text}`).catch(() => null);
   }
 
@@ -91,7 +92,8 @@ async function maybeEmitIdleHeartbeat() {
   const hours = (idleMs / (60 * 60 * 1000)).toFixed(1);
   const line = `[heartbeat] signal-runner idle for ${hours} hours, inbox empty`;
   console.log(line);
-  if (telegramEnabled()) {
+  // Executive mode silences idle heartbeats — log-only is sufficient.
+  if (telegramEnabled() && !isExecutiveMode()) {
     await sendMessage(line).catch(() => null);
   }
   lastIdleAlertAt = now;

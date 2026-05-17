@@ -620,9 +620,34 @@ export async function executeTool(name, args) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
-        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        // Bro wants live pulse for DRY_RUN paper deploys too. DRY result shape:
+        // { dry_run: true, would_deploy: { pool_address, amount_y, bins_below, ... } }
+        const isDry = result?.dry_run === true || process.env.DRY_RUN === "true";
+        const wd = result?.would_deploy || {};
+        notifyDeploy({
+          pair: result.pool_name || args.pool_name || wd.pool_address?.slice(0, 8) || args.pool_address?.slice(0, 8),
+          amountSol: args.amount_y ?? args.amount_sol ?? wd.amount_y ?? wd.amount_sol ?? 0,
+          position: result.position,
+          tx: result.txs?.[0] ?? result.tx,
+          priceRange: result.price_range,
+          rangeCoverage: result.range_coverage,
+          binStep: result.bin_step,
+          baseFee: result.base_fee,
+          dryRun: isDry,
+        }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0, positionAddress: args.position_address }).catch(() => {});
+        const isDry = result?.dry_run === true || process.env.DRY_RUN === "true";
+        notifyClose({
+          pair: result.pool_name || args.pool_name || args.position_address?.slice(0, 8),
+          pnlUsd: result.pnl_usd ?? 0,
+          pnlPct: result.pnl_pct ?? 0,
+          pnlSol: result.pnl_sol,
+          feesSol: result.fees_claimed_sol ?? result.fees_sol,
+          durationMin: result.duration_min,
+          feeInclusivePnlPct: result.fee_inclusive_pnl_pct,
+          positionAddress: args.position_address,
+          dryRun: isDry,
+        }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
@@ -707,7 +732,7 @@ async function runSafetyChecks(name, args) {
         const balForCircuit = process.env.DRY_RUN !== "true"
           ? (await getWalletBalances().catch(() => null))?.sol ?? null
           : null;
-        assertCircuitOK(Number.isFinite(balForCircuit) ? balForCircuit : null);
+        await assertCircuitOK(Number.isFinite(balForCircuit) ? balForCircuit : null);
       } catch (e) {
         if (e instanceof CircuitBreakerError) {
           return { pass: false, reason: e.message };

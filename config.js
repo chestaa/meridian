@@ -211,6 +211,16 @@ export const config = {
     ),
   },
 
+  // ─── Telegram Notification Mode ────────
+  // Executive mode silences per-cycle/per-signal/per-paper-deploy spam.
+  // KEEPS: daily boss-report, morning briefing, circuit breaker, big-PnL paper
+  // closes (|PnL| >= bigPnlThresholdPct). Flip executiveMode=false for legacy
+  // verbose behavior — every gate is a single boolean check, fully reversible.
+  telegram: {
+    executiveMode:        u.telegramExecutiveMode        ?? true,
+    bigPnlThresholdPct:   u.telegramBigPnlThresholdPct   ?? 15,
+  },
+
   indicators: {
     enabled: indicatorUserConfig.enabled ?? false,
     entryPreset: indicatorUserConfig.entryPreset ?? "supertrend_break",

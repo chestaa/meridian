@@ -93,13 +93,54 @@ function getOrInitState(walletBalanceSol) {
   return raw;
 }
 
+// Test-only injection hook: lets test harness mock wallet.getWalletBalances
+// without touching real RPC. Production code never sets this.
+let _walletFetchOverride = null;
+export function __setWalletFetchForTest(fn) { _walletFetchOverride = fn; }
+
+// Async wrapper around getOrInitState that, on day-rollover with a null/non-finite
+// walletBalanceSol, performs ONE internal retry via tools/wallet.js before
+// falling back to the existing fail-safe (null = halt).
+async function getOrInitStateAsync(walletBalanceSol) {
+  // Fast path: caller supplied a usable balance — no retry needed.
+  if (walletBalanceSol != null && Number.isFinite(walletBalanceSol)) {
+    return getOrInitState(walletBalanceSol);
+  }
+  // Only attempt retry if we're actually on the day-rollover branch.
+  const raw = loadState();
+  const today = todayUtc();
+  const onRolloverBranch = raw === "CORRUPT" ? false : (!raw || raw.date !== today);
+  if (!onRolloverBranch) {
+    // Existing day — no balance needed; delegate to sync path.
+    return getOrInitState(walletBalanceSol);
+  }
+  // Day-rollover + null balance → attempt one self-fetch.
+  let fetched = null;
+  try {
+    const fetcher = _walletFetchOverride
+      ? _walletFetchOverride
+      : (await import("./tools/wallet.js")).getWalletBalances;
+    const result = await fetcher();
+    const sol = result?.sol;
+    if (sol != null && Number.isFinite(sol)) {
+      fetched = sol;
+      log("circuit_recover", `Self-fetched balance=${sol} SOL during day-rollover init`);
+    }
+  } catch (e) {
+    log("circuit_warn", `Self-fetch failed during day-rollover init: ${e.message}`);
+  }
+  // Either the retry produced a usable balance (seed state) or it failed
+  // (fall through to existing null fail-safe behavior).
+  return getOrInitState(fetched);
+}
+
 /**
  * Throws CircuitBreakerError if today's realized loss has hit either cap.
  * Call BEFORE deploy_position (inside runSafetyChecks).
  * @param {number} walletBalanceSol - current live SOL balance (used for first-of-day seed)
  */
-export function assertCircuitOK(walletBalanceSol) {
-  const state = getOrInitState(walletBalanceSol);
+export async function assertCircuitOK(walletBalanceSol) {
+  const state = await getOrInitStateAsync(walletBalanceSol);
 
   if (!state) {
     throw new CircuitBreakerError(

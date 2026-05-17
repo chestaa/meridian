@@ -3,6 +3,8 @@ import { getPoolDetail } from "./tools/screening.js";
 import { getTokenInfo } from "./tools/token.js";
 import { log } from "./logger.js";
 import { setPoolAndTokenCooldown } from "./pool-memory.js";
+import { config } from "./config.js";
+import { notifyClose, isExecutiveMode, isBigPnl } from "./telegram.js";
 
 const PAPER_TRADES_FILE = "./paper-trades.json";
 const MAX_TRADES = 300;
@@ -182,7 +184,94 @@ async function buildSnapshot(trade) {
   return snapshot;
 }
 
-export async function refreshPaperTrades() {
+// Andromeda — paper trade exit evaluator. Mirrors state.js updatePnlAndCheckExits,
+// but runs against price_proxy_pnl_pct + active-bin OOR for paper (DRY_RUN) trades.
+// Returns { action, reason } or null.
+export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
+  if (!trade || trade.status !== "open" || !snapshot) return null;
+  const mgmt = mgmtConfigOverride || config.management || {};
+  const pnlPct = Number(snapshot.price_proxy_pnl_pct);
+  if (Number.isFinite(pnlPct)) {
+    // Track peak for trailing TP
+    if (trade.peak_pnl_pct == null || pnlPct > trade.peak_pnl_pct) {
+      trade.peak_pnl_pct = pnlPct;
+    }
+    // Stop loss
+    if (mgmt.stopLossPct != null && pnlPct <= mgmt.stopLossPct) {
+      return { action: "STOP_LOSS", reason: `Stop loss: PnL ${pnlPct.toFixed(2)}% <= ${mgmt.stopLossPct}%` };
+    }
+    // Take profit (basic)
+    if (mgmt.takeProfitPct != null && pnlPct >= mgmt.takeProfitPct) {
+      return { action: "TAKE_PROFIT", reason: `Take profit: PnL ${pnlPct.toFixed(2)}% >= ${mgmt.takeProfitPct}%` };
+    }
+    // Trailing TP
+    if (mgmt.trailingTakeProfit && trade.peak_pnl_pct != null && trade.peak_pnl_pct >= (mgmt.trailingTriggerPct ?? Infinity)) {
+      const dropFromPeak = trade.peak_pnl_pct - pnlPct;
+      if (dropFromPeak >= (mgmt.trailingDropPct ?? Infinity)) {
+        return {
+          action: "TRAILING_TP",
+          reason: `Trailing TP: peak ${trade.peak_pnl_pct.toFixed(2)}% → current ${pnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${mgmt.trailingDropPct}%)`,
+        };
+      }
+    }
+  }
+  // OOR — paper proxy: snapshot.price compared to entry-band derived from bins.
+  // We don't have live active_bin reliably in paper, so use price-band proxy:
+  // OOR when price deviates more than ~25% from entry (conservative paper-only heuristic).
+  const entry = Number(trade.entry_price);
+  const cur = Number(snapshot.price);
+  if (Number.isFinite(entry) && entry > 0 && Number.isFinite(cur) && cur > 0) {
+    const deviationPct = Math.abs((cur - entry) / entry) * 100;
+    const OOR_BAND_PCT = 25;
+    if (deviationPct > OOR_BAND_PCT) {
+      if (!trade.out_of_range_since) trade.out_of_range_since = new Date().toISOString();
+    } else {
+      trade.out_of_range_since = null;
+    }
+    if (trade.out_of_range_since) {
+      const minutesOOR = Math.floor((Date.now() - new Date(trade.out_of_range_since).getTime()) / 60000);
+      const limit = mgmt.outOfRangeWaitMinutes ?? 30;
+      if (minutesOOR >= limit) {
+        return { action: "OUT_OF_RANGE", reason: `Out of range for ${minutesOOR}m (limit: ${limit}m)` };
+      }
+    }
+  }
+  return null;
+}
+
+function closePaperTrade(trade, exit, snapshot) {
+  trade.status = "closed";
+  trade.closed_at = new Date().toISOString();
+  trade.close_reason = exit.reason;
+  trade.close_action = exit.action;
+  trade.final_pnl_pct = snapshot?.price_proxy_pnl_pct ?? null;
+  trade.final_fee_inclusive_pnl_pct = snapshot?.fee_inclusive_pnl_pct ?? null;
+  trade.notes = Array.isArray(trade.notes) ? trade.notes : [];
+  trade.notes.push(`paper_close: ${exit.action} — ${exit.reason}`);
+  const opened = Date.parse(trade.opened_at);
+  const durationMin = Number.isFinite(opened) ? Math.floor((Date.now() - opened) / 60000) : null;
+  // Fire Telegram pulse — DRY_RUN paper close.
+  // Executive mode: only surface notable closes (|PnL| >= bigPnlThresholdPct).
+  // Small-PnL paper closes stay silent and aggregate into daily boss-report.
+  const shouldNotify = !isExecutiveMode() || isBigPnl(trade.final_pnl_pct);
+  if (shouldNotify) {
+    notifyClose({
+      pair: trade.pool_name || trade.pool_address?.slice(0, 8),
+      pnlPct: trade.final_pnl_pct ?? 0,
+      pnlSol: trade.final_pnl_pct != null && trade.amount_sol
+        ? Number(((trade.final_pnl_pct / 100) * trade.amount_sol).toFixed(6))
+        : null,
+      feesSol: trade.fees_claimed_sol ?? 0,
+      durationMin,
+      feeInclusivePnlPct: trade.final_fee_inclusive_pnl_pct,
+      positionAddress: trade.id,
+      dryRun: true,
+    }).catch(() => {});
+  }
+  log("paper", `Paper trade closed: ${trade.pool_name} — ${exit.action} (${exit.reason})`);
+}
+
+export async function refreshPaperTrades({ mgmtConfigOverride = null } = {}) {
   const data = load();
   let changed = false;
 
@@ -203,6 +292,15 @@ export async function refreshPaperTrades() {
         trade.checkpoints[key] = snapshot;
       }
     }
+
+    // Andromeda — evaluate close eligibility on every refresh.
+    const exit = evaluatePaperExit(trade, snapshot, mgmtConfigOverride);
+    if (exit) {
+      closePaperTrade(trade, exit, snapshot);
+      changed = true;
+      continue;
+    }
+
     if (hoursOpen(trade) >= 24) {
       trade.status = "matured";
     }
@@ -212,6 +310,51 @@ export async function refreshPaperTrades() {
 
   if (changed) save(data);
   return data.trades;
+}
+
+// Andromeda — one-shot legacy sweep for matured paper trades stranded by the
+// pre-fix era (status=matured, no closed_at). New exit-eval logic skips them, so
+// this closes them in-place using their last known snapshot PnL. Snapshot-based
+// only — no market re-evaluation. CLI runner: scripts/sweep-paper-trades.js.
+// Destructive: closed status cannot be undone without paper-trades.json backup.
+export function sweepMaturedPaperTrades({ dryRun = false } = {}) {
+  const data = load();
+  const trades = Array.isArray(data.trades) ? data.trades : [];
+  const matured = trades.filter((t) => t.status === "matured" && !t.closed_at);
+  if (matured.length === 0) return { swept: 0, totalPnlPct: 0, results: [] };
+
+  const results = [];
+  for (const trade of matured) {
+    // Defensive fallback chain — real schema uses `latest_snapshot` (singular),
+    // but spec also tolerates a `snapshots[]` array if ever introduced.
+    const snapArray = Array.isArray(trade.snapshots) ? trade.snapshots : null;
+    const lastSnap = (snapArray && snapArray[snapArray.length - 1]) || trade.latest_snapshot || null;
+    const finalPnlPct = num(lastSnap?.price_proxy_pnl_pct ?? lastSnap?.pnl_pct) ?? num(trade.peak_pnl_pct) ?? 0;
+    const finalFeeInclusivePnlPct = num(lastSnap?.fee_inclusive_pnl_pct) ?? finalPnlPct;
+
+    if (!dryRun) {
+      trade.status = "closed";
+      trade.closed_at = new Date().toISOString();
+      trade.close_reason = "legacy_sweep";
+      trade.close_action = "matured_no_eval";
+      trade.final_pnl_pct = finalPnlPct;
+      trade.final_fee_inclusive_pnl_pct = finalFeeInclusivePnlPct;
+      trade.notes = Array.isArray(trade.notes) ? trade.notes : [];
+      trade.notes.push("paper_close: LEGACY_SWEEP — snapshot-based, not market re-evaluated");
+    }
+    results.push({
+      pool: trade.pool_address,
+      symbol: trade.base_symbol || trade.pool_name || trade.pool_address?.slice(0, 8),
+      pnl_pct: finalPnlPct,
+    });
+  }
+
+  if (!dryRun) save(data);
+
+  const totalPnlPct = results.length
+    ? results.reduce((sum, r) => sum + (r.pnl_pct || 0), 0) / results.length
+    : 0;
+  return { swept: results.length, totalPnlPct, results };
 }
 
 export function getPaperTradeSummary() {
