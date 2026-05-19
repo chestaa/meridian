@@ -30,6 +30,31 @@ function normalizeSymbol(symbol) {
   return String(symbol || "").trim().toUpperCase();
 }
 
+/**
+ * Cassiopeia Option C overlay — apply liveOverrides on top of base screening
+ * thresholds when dryRun === false. In paper/dry-run, returns base thresholds
+ * unchanged. Reversibility: `liveOverrides: null` → legacy behavior.
+ *
+ * Recognized overlay keys (subset of base + extras):
+ *   minOrganic, maxBotHoldersPct, minFeeActiveTvlRatio, maxTop10Pct
+ *   orionMinConfidence  (consumed by agents/orion.js, not screening)
+ *   requireDevNotSoldAll, requireSmartWalletOrHighOrganic (consumed below)
+ */
+export function effectiveScreeningThresholds() {
+  const base = config.screening;
+  const overlay = (config.dryRun === false && config.liveOverrides) ? config.liveOverrides : {};
+  return { ...base, ...overlay };
+}
+
+/**
+ * Returns the overlay block ONLY when live; otherwise null. For consumers that
+ * need to distinguish "live-only rule" vs base behavior (e.g., dev_sold_all
+ * rejection, smart-wallet-or-high-organic rule).
+ */
+export function liveOverlay() {
+  return (config.dryRun === false && config.liveOverrides) ? config.liveOverrides : null;
+}
+
 function scoreCandidate(pool) {
   const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
   const organic = Number(pool.organic_score || 0);
@@ -274,7 +299,7 @@ async function enrichPvpRisk(pools) {
 export async function discoverPools({
   page_size = 50,
 } = {}) {
-  const s = config.screening;
+  const s = effectiveScreeningThresholds();
   const filters = [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
@@ -434,9 +459,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const { positions } = await getMyPositions();
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
-  const minTvl = Number(config.screening.minTvl ?? 0);
-  const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
-  const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
+  const eff = effectiveScreeningThresholds();
+  const overlay = liveOverlay();
+  const minTvl = Number(eff.minTvl ?? 0);
+  const maxTvl = eff.maxTvl == null ? null : Number(eff.maxTvl);
+  const minFeeActiveTvlRatio = Number(eff.minFeeActiveTvlRatio ?? 0);
 
   const eligible = pools
     .filter((p) => {
@@ -503,8 +530,8 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // Audit shape: t.audit.topHoldersPercentage / botHoldersPercentage from /assets/search.
   // Fail-closed: if a knob is configured and data is missing, reject the pool.
   if (eligible.length > 0) {
-    const maxBotPctCfg = numeric(config.screening.maxBotHoldersPct);
-    const maxTop10PctCfg = numeric(config.screening.maxTop10Pct);
+    const maxBotPctCfg = numeric(eff.maxBotHoldersPct);
+    const maxTop10PctCfg = numeric(eff.maxTop10Pct);
     const botGateActive = maxBotPctCfg != null && maxBotPctCfg > 0;
     const top10GateActive = maxTop10PctCfg != null && maxTop10PctCfg > 0;
 
@@ -694,6 +721,40 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     });
     eligible.splice(0, eligible.length, ...filtered);
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
+
+    // Cassiopeia Option C — live-only overlay rejections.
+    // Only fire when liveOverlay() returns non-null (i.e., dryRun===false AND
+    // liveOverrides set). Each rule is individually toggleable.
+    if (overlay) {
+      if (overlay.requireDevNotSoldAll) {
+        const before2 = eligible.length;
+        const kept = eligible.filter((p) => {
+          if (p.dev_sold_all === true) {
+            log("screening", `Live overlay: dropped ${p.name} — dev_sold_all_in_live`);
+            pushFilteredReason(filteredOut, p, "dev_sold_all_in_live");
+            return false;
+          }
+          return true;
+        });
+        eligible.splice(0, eligible.length, ...kept);
+        if (eligible.length < before2) log("screening", `Live overlay removed ${before2 - eligible.length} dev_sold_all pool(s)`);
+      }
+      if (overlay.requireSmartWalletOrHighOrganic) {
+        const before3 = eligible.length;
+        const kept = eligible.filter((p) => {
+          const swCount = Number(p.smart_wallet_count ?? 0);
+          const organic = Number(p.organic_score ?? p.base?.organic ?? 0);
+          if (swCount === 0 && organic < 80) {
+            log("screening", `Live overlay: dropped ${p.name} — no_smart_money_low_organic_in_live (sw=${swCount}, organic=${organic})`);
+            pushFilteredReason(filteredOut, p, "no_smart_money_low_organic_in_live");
+            return false;
+          }
+          return true;
+        });
+        eligible.splice(0, eligible.length, ...kept);
+        if (eligible.length < before3) log("screening", `Live overlay removed ${before3 - eligible.length} no-smart-money pool(s)`);
+      }
+    }
   }
 
   if (config.indicators.enabled && eligible.length > 0) {

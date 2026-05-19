@@ -84,7 +84,7 @@ const watchSignals   = allResults.filter(r => ["watch", "deploy"].includes(r.llm
 // LLM cost
 const weekAgo = new Date(Date.now() - 7 * 86400_000).toISOString();
 const llmRecs = Array.isArray(llmData.records) ? llmData.records : [];
-const costWeek = llmRecs.filter(r => r.timestamp >= weekAgo).reduce((s, r) => s + (r.cost_usd ?? 0), 0);
+const costWeek = llmRecs.filter(r => r.ts >= weekAgo).reduce((s, r) => s + (r.cost_usd ?? 0), 0);
 
 // Wallet balance
 let walletSol = null;

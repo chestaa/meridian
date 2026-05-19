@@ -198,6 +198,27 @@ async function buildSnapshot(trade) {
 export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
   if (!trade || trade.status !== "open" || !snapshot) return null;
   const mgmt = mgmtConfigOverride || config.management || {};
+
+  // Andromeda X2 — Max-hold-time forced exit (HIGHEST PRECEDENCE).
+  // Time-based forced close runs BEFORE SL/TP/Trailing/DD_RECOVERY so a stuck
+  // position cannot dodge the gate via PnL fluctuation. Inserted first because
+  // a paper trade older than maxHoldMinutes is structurally "stale" — Sirius's
+  // entry signal is no longer load-bearing past 12h.
+  // Reversibility: set maxHoldMinutes=0 (or remove from config) → silent revert.
+  const maxHoldMin = mgmt.maxHoldMinutes;
+  if (Number.isFinite(maxHoldMin) && maxHoldMin > 0 && trade.opened_at) {
+    const openedMs = new Date(trade.opened_at).getTime();
+    if (Number.isFinite(openedMs)) {
+      const heldMin = (Date.now() - openedMs) / 60000;
+      if (heldMin >= maxHoldMin) {
+        return {
+          action: "MAX_HOLD_EXPIRED",
+          reason: `held ${heldMin.toFixed(0)}m exceeds maxHold ${maxHoldMin}m — forced close`,
+        };
+      }
+    }
+  }
+
   const pnlPct = Number(snapshot.price_proxy_pnl_pct);
   if (Number.isFinite(pnlPct)) {
     // Track peak for trailing TP

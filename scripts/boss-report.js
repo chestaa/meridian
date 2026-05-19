@@ -249,8 +249,8 @@ async function runBossReport() {
   const llmRecs = Array.isArray(llmData.records) ? llmData.records : [];
   const today   = new Date().toISOString().slice(0, 10);
   const weekAgo = new Date(Date.now() - 7 * 86400_000).toISOString();
-  const costToday = llmRecs.filter(r => r.timestamp?.startsWith(today)).reduce((s, r) => s + (r.cost_usd ?? 0), 0);
-  const costWeek  = llmRecs.filter(r => r.timestamp >= weekAgo).reduce((s, r) => s + (r.cost_usd ?? 0), 0);
+  const costToday = llmRecs.filter(r => r.ts?.startsWith(today)).reduce((s, r) => s + (r.cost_usd ?? 0), 0);
+  const costWeek  = llmRecs.filter(r => r.ts >= weekAgo).reduce((s, r) => s + (r.cost_usd ?? 0), 0);
 
   // ─── circuit breaker ─────────────────────────────────────────────
   const cb         = readJson("circuit-breaker-state.json");

@@ -54,6 +54,21 @@ function nonEmptyString(...values) {
 }
 
 export const config = {
+  // ─── Run Mode ───────────────────────────
+  // dryRun: derived from env DRY_RUN ("true"/"false"); falls back to user-config.json.
+  // Cassiopeia liveOverrides only activate when dryRun === false.
+  dryRun: (process.env.DRY_RUN === "true")
+    ? true
+    : (process.env.DRY_RUN === "false")
+      ? false
+      : (u.dryRun ?? true),
+
+  // ─── Cassiopeia Live Overlay (Option C) ──
+  // Tighter thresholds applied ONLY when dryRun === false. null = legacy behavior.
+  // Surfaces: minOrganic, maxBotHoldersPct, minFeeActiveTvlRatio, maxTop10Pct,
+  // orionMinConfidence, requireDevNotSoldAll, requireSmartWalletOrHighOrganic.
+  liveOverrides: u.liveOverrides ?? null,
+
   // ─── Risk Limits ─────────────────────────
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
@@ -128,6 +143,12 @@ export const config = {
     // on peak >= trailingTriggerPct. Toggle internalAgents.drawdownRecoveryEnabled.
     drawdownRecoveryArmPct:  u.drawdownRecoveryArmPct  ?? 10,  // require >= X% drawdown before arming
     drawdownRecoveryDeltaPct: u.drawdownRecoveryDeltaPct ?? 5, // close after X% recovery from trough
+    // Andromeda X2 — Max-hold-time forced exit (paper-trades.js).
+    // Time-based forced close: a paper trade older than maxHoldMinutes is force-
+    // closed regardless of PnL/OOR. Highest precedence in evaluatePaperExit so
+    // SL/TP/Trailing/DD_RECOVERY cannot delay an exit past the holding window.
+    // Reversibility: set to 0 → silent revert to legacy (no time-based gate).
+    maxHoldMinutes:        u.maxHoldMinutes        ?? 720,    // 12h forced exit default
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
@@ -178,6 +199,28 @@ export const config = {
     // Default ON; flip false for silent revert to legacy exit precedence
     // (SL → TP → TRAILING_TP → OOR, no DRAWDOWN_RECOVERY).
     drawdownRecoveryEnabled: u.internalAgents?.drawdownRecoveryEnabled ?? true,
+    // Vega X1 — Fresh snapshot guard before deploy_position. Re-fetches
+    // pool metrics and aborts on material drift (volume drop >50%, vol≤0,
+    // bot_pct surge, top10>60%, dev_sold_all flip). Default ON; flip false
+    // for emergency rollback. Single boolean, fully reversible.
+    freshSnapshotGuardEnabled: u.internalAgents?.freshSnapshotGuardEnabled ?? true,
+    // Vega PR-3 — Deterministic deploy after Orion ENTER verdict. When ON,
+    // skips the fat SCREENER agentLoop and invokes deploy_position directly
+    // with deterministic params (bins_below formula + computeDeployAmount +
+    // config.strategy). Default OFF — Bro Dikta enables manually after
+    // paper-trade equivalence is confirmed. Toggle false to revert silently
+    // to legacy LLM-driven SCREENER path; no other config change needed.
+    vegaDeterministicDeploy: u.internalAgents?.vegaDeterministicDeploy ?? false,
+    // Andromeda PR-4 — Deterministic manager. When ON, the management cycle
+    // skips the MANAGER agentLoop LLM call entirely and dispatches
+    // close_position / claim_fees directly through executeTool. SL/TP/
+    // Trailing/OOR/DRAWDOWN_RECOVERY/MAX_HOLD logic is unchanged — it
+    // already lives in state.js + paper-trades.js. Default OFF — Bro Dikta
+    // enables manually after live-equivalence is confirmed. Toggle false
+    // to revert silently to legacy LLM-driven MANAGER path. INSTRUCTION-
+    // bearing positions are deferred (logged, not auto-closed) when this
+    // path is active — operator must intervene or re-enable the LLM path.
+    managerDeterministic: u.internalAgents?.managerDeterministic ?? false,
   },
 
   // ─── Darwinian Signal Weighting ───────

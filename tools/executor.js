@@ -87,6 +87,99 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
   return (data?.data || [])[0] ?? null;
 }
 
+/**
+ * Vega X1 — Fresh snapshot guard for deploy_position.
+ * Re-fetches live pool metrics right before deploy and compares vs the
+ * original candidate snapshot the LLM saw. Aborts when material drift
+ * indicates the opportunity has degraded since screening.
+ *
+ * Returns null on fetch failure (caller decides fail-open vs fail-closed).
+ * Timeout: 5s hard cap via AbortController.
+ */
+export async function refreshPoolMetrics(poolAddress, timeframe = config.screening.timeframe || "5m") {
+  const encodedTimeframe = encodeURIComponent(timeframe);
+  const filter = encodeURIComponent(`pool_address=${poolAddress}`);
+  const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const detail = (data?.data || [])[0] ?? null;
+    if (!detail) return null;
+    return {
+      volume24h: numberOrNull(detail.volume24h ?? detail.volume_24h ?? detail.volume),
+      volatility: numberOrNull(detail.volatility),
+      bot_pct: numberOrNull(detail.bot_holders_pct ?? detail.botHoldersPercentage ?? detail.bot_pct),
+      top10_pct: numberOrNull(detail.top10_pct ?? detail.top_10_pct ?? detail.top10HoldersPct),
+      dev_sold_all: Boolean(detail.dev_sold_all ?? detail.devSoldAll ?? false),
+      raw: detail,
+    };
+  } catch (_e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Vega X1 — Compute material drift between original candidate and fresh snapshot.
+ * Returns { materialDrift: bool, reasons: [] }. Each reason describes which
+ * gate tripped so the safety layer can log a specific abort message.
+ *
+ * Drift gates:
+ *   - volume24h drop >50%
+ *   - volatility <= 0 or null
+ *   - bot_pct rose >30% relative OR absolute >+5pp
+ *   - top10_pct > 60%
+ *   - dev_sold_all flipped false -> true
+ */
+export function computeDrift(original, fresh) {
+  const reasons = [];
+  if (!fresh) return { materialDrift: false, reasons };
+
+  const origVol = numberOrNull(original?.volume24h);
+  const freshVol = numberOrNull(fresh.volume24h);
+  if (origVol != null && origVol > 0 && freshVol != null) {
+    const dropPct = (origVol - freshVol) / origVol;
+    if (dropPct > 0.5) {
+      reasons.push(`volume24h dropped ${(dropPct * 100).toFixed(1)}% (${origVol} → ${freshVol})`);
+    }
+  }
+
+  if (fresh.volatility == null || fresh.volatility <= 0) {
+    reasons.push(`volatility ${fresh.volatility ?? "null"} unusable`);
+  }
+
+  const origBot = numberOrNull(original?.bot_pct);
+  const freshBot = numberOrNull(fresh.bot_pct);
+  if (freshBot != null && origBot != null) {
+    const absRise = freshBot - origBot;
+    const relRise = origBot > 0 ? (freshBot - origBot) / origBot : 0;
+    if (relRise > 0.3 || absRise > 5) {
+      reasons.push(`bot_pct rose ${origBot}% → ${freshBot}% (rel +${(relRise * 100).toFixed(1)}%, abs +${absRise.toFixed(1)}pp)`);
+    }
+  }
+
+  if (freshBot != null && origBot == null && freshBot > 5) {
+    reasons.push(`bot_pct now ${freshBot}% (original snapshot lacked baseline)`);
+  }
+
+  const freshTop10 = numberOrNull(fresh.top10_pct);
+  if (freshTop10 != null && freshTop10 > 60) {
+    reasons.push(`top10_pct ${freshTop10}% above 60% concentration cap`);
+  }
+
+  const origDev = Boolean(original?.dev_sold_all);
+  const freshDev = Boolean(fresh.dev_sold_all);
+  if (!origDev && freshDev) {
+    reasons.push(`dev_sold_all flipped false → true since screening`);
+  }
+
+  return { materialDrift: reasons.length > 0, reasons };
+}
+
 async function validateDeployPoolThresholds(args) {
   let detail;
   try {
@@ -742,6 +835,30 @@ async function runSafetyChecks(name, args) {
 
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
+
+      // Vega X1 — Fresh snapshot guard. Re-fetch live metrics and compare to
+      // the candidate snapshot the LLM saw. Aborts on material drift.
+      // Single boolean flip (config.internalAgents.freshSnapshotGuardEnabled)
+      // for emergency reversibility. Fetch failure fails open (refreshPoolMetrics
+      // returns null → computeDrift returns no drift) so we never deadlock on
+      // upstream API hiccups; the prior validateDeployPoolThresholds already
+      // hard-fails closed on volatility/TVL fetch failure.
+      if (config.internalAgents?.freshSnapshotGuardEnabled !== false) {
+        const original = args.candidate_snapshot ?? args.original_snapshot ?? {
+          volume24h: numberOrNull(args.volume24h ?? args.volume_24h),
+          bot_pct: numberOrNull(args.bot_pct ?? args.bot_holders_pct),
+          top10_pct: numberOrNull(args.top10_pct ?? args.top_10_pct),
+          dev_sold_all: Boolean(args.dev_sold_all),
+        };
+        const fresh = await refreshPoolMetrics(args.pool_address);
+        const drift = computeDrift(original, fresh);
+        if (drift.materialDrift) {
+          return {
+            pass: false,
+            reason: `Fresh snapshot guard aborted deploy: ${drift.reasons.join("; ")}`,
+          };
+        }
+      }
 
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;

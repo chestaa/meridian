@@ -177,6 +177,18 @@ async function judgeOne(candidate, context) {
     if (args.recommended_bins_below != null && Number.isFinite(Number(args.recommended_bins_below))) {
       out.recommended_bins_below = Number(args.recommended_bins_below);
     }
+
+    // Cassiopeia Option C — live confidence floor. Only active when dryRun===false
+    // AND liveOverrides.orionMinConfidence is set. Forces low-confidence enters
+    // to skip without changing paper-mode behavior.
+    const liveMinConf = (config.dryRun === false && config.liveOverrides?.orionMinConfidence) ?? 0;
+    if (out.decision === "enter" && out.confidence < liveMinConf) {
+      return {
+        ...out,
+        decision: "skip",
+        reason: `confidence ${out.confidence}% < live floor ${liveMinConf}%; ${out.reason}`,
+      };
+    }
     return out;
   } catch (error) {
     log("agent", `[ORION] judge error for ${pool_address}: ${error.message}`);

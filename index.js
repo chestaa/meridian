@@ -41,6 +41,8 @@ import { recordPaperDeploy, refreshPaperTrades } from "./paper-trades.js";
 import { getCircuitStatus, manualReset as circuitReset } from "./account-circuit-breaker.js";
 import { judgeCandidates, formatOrionVerdicts } from "./agents/orion.js";
 import { formatDeployReport, formatNoDeployReport, andromedaEnabled } from "./agents/andromeda.js";
+import { deployFromOrionVerdict, vegaDeterministicDeployEnabled } from "./agents/vega.js";
+import { runDeterministicManagement, managerDeterministicEnabled } from "./agents/manager.js";
 import { buildDigest } from "./digest.js";
 
 const isMain = process.argv[1]
@@ -329,6 +331,53 @@ export async function runManagementCycle({ silent = false } = {}) {
       return a.action !== "STAY";
     });
 
+    // ─── Andromeda PR-4 — Deterministic manager path (flag-gated, default OFF) ──
+    // When `config.internalAgents.managerDeterministic === true`, skip the
+    // MANAGER agentLoop LLM call entirely and dispatch close_position /
+    // claim_fees directly through executeTool. All safety checks
+    // (runSafetyChecks, account circuit breaker, notifyClose, auto-swap)
+    // fire as normal — only the LLM intermediary is removed.
+    //
+    // INSTRUCTION-bearing positions are deferred (logged, not auto-closed).
+    // Operator must enable LLM path or evaluate manually.
+    //
+    // Note: exitMap (confirmed trailing-TP exits and direct SL/TP/OOR exits
+    // returned by updatePnlAndCheckExits earlier in this cycle) is passed
+    // through unchanged — same precedence as the LLM path.
+    if (managerDeterministicEnabled(config) && actionPositions.length > 0) {
+      log("cron", `Management: ${actionPositions.length} action(s) — deterministic manager (flag ON, no LLM)`);
+      const detResult = await runDeterministicManagement({
+        positions: positionData,
+        exitMap,
+        mgmtConfig: config.management,
+      });
+      if (detResult) {
+        const lines = [];
+        for (const c of detResult.closed) {
+          lines.push(`Closed ${c.pair}: ${c.reason} (rule ${c.rule})`);
+        }
+        for (const c of detResult.claimed) {
+          lines.push(`Claimed fees ${c.pair}`);
+        }
+        for (const d of detResult.deferred) {
+          lines.push(`Deferred ${d.pair}: ${d.reason} (instruction needs LLM — toggle flag OFF or evaluate manually)`);
+        }
+        for (const e of detResult.errors) {
+          lines.push(`ERROR ${e.action} ${e.pair}: ${e.error}`);
+        }
+        if (lines.length > 0) mgmtReport += `\n\n${lines.join("\n")}`;
+        await liveMessage?.note(`Deterministic manager: closed=${detResult.closed.length} claimed=${detResult.claimed.length} deferred=${detResult.deferred.length} errors=${detResult.errors.length}`);
+      }
+      // Post-management screening trigger (mirrors legacy tail)
+      const afterPositions = await getMyPositions({ force: true }).catch(() => null);
+      const afterCount = afterPositions?.positions?.length ?? 0;
+      if (afterCount < config.risk.maxPositions && shouldTriggerScreening()) {
+        log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      }
+      return mgmtReport;
+    }
+
     if (actionPositions.length > 0) {
       log("cron", `Management: ${actionPositions.length} action(s) needed — invoking LLM [model: ${config.llm.managementModel}]`);
 
@@ -578,6 +627,104 @@ export async function runScreeningCycle({ silent = false } = {}) {
         orionVerdicts = [];
         orionBlock = null;
       }
+    }
+
+    // ─── Vega PR-3 — Deterministic deploy path (flag-gated, default OFF) ──
+    // When `config.internalAgents.vegaDeterministicDeploy === true` AND Orion
+    // produced at least one ENTER verdict that clears the live confidence
+    // floor, skip the fat LLM agentLoop entirely and call deploy_position
+    // directly through executeTool (all safety checks still fire).
+    // Falls through to legacy SCREENER agentLoop on:
+    //   - flag off (default)
+    //   - Orion disabled or returned no ENTER verdicts
+    //   - Vega declines (null) due to bad volatility / missing pool
+    if (vegaDeterministicDeployEnabled(config)) {
+      const liveMinConf = (config.dryRun === false && config.liveOverrides?.orionMinConfidence) ?? 0;
+      const enterVerdicts = (orionVerdicts || [])
+        .filter((v) => v.decision === "enter" && Number(v.confidence ?? 0) >= liveMinConf)
+        .sort((a, b) => Number(b.confidence ?? 0) - Number(a.confidence ?? 0));
+      const candidateByPoolVega = new Map(passing.map((c) => [c.pool.pool, c]));
+
+      let vegaDeployResult = null;
+      let vegaDeployedVerdict = null;
+      let vegaDeployedCandidate = null;
+
+      for (const verdict of enterVerdicts) {
+        const candidate = candidateByPoolVega.get(verdict.pool_address);
+        if (!candidate) continue;
+        const outcome = await deployFromOrionVerdict(verdict, candidate, { walletSol: preBalance.sol });
+        if (outcome == null) continue; // Vega declined — try next ENTER (or fall through)
+        if (outcome.deployed) {
+          vegaDeployResult = outcome.result;
+          vegaDeployedVerdict = verdict;
+          vegaDeployedCandidate = candidate;
+          // Paper-trade recording (mirrors legacy onToolFinish path) so DRY_RUN
+          // equivalence holds — paper-trade equivalence is the success criterion
+          // for this PR.
+          if (process.env.DRY_RUN === "true" && outcome.result?.would_deploy?.pool_address) {
+            const pool = candidate?.pool || {};
+            const ti = candidate?.ti || {};
+            recordPaperDeploy({
+              pool_address: outcome.result.would_deploy.pool_address,
+              pool_name: pool.name || outcome.result.would_deploy.pool_address,
+              base_mint: pool.base?.mint || ti.mint || null,
+              strategy: outcome.result.would_deploy.strategy,
+              amount_sol: outcome.result.would_deploy.amount_y ?? outcome.result.would_deploy.amount_sol ?? null,
+              active_bin: pool.active_bin ?? null,
+              bins_below: outcome.result.would_deploy.bins_below,
+              bins_above: outcome.result.would_deploy.bins_above,
+              entry_price: pool.price ?? null,
+              entry_fee_tvl_ratio: pool.fee_active_tvl_ratio ?? null,
+              entry_volume: pool.volume_window ?? null,
+              entry_tvl: pool.tvl ?? pool.active_tvl ?? null,
+              entry_volatility: pool.volatility ?? null,
+              entry_age_hours: pool.token_age_hours ?? null,
+              entry_top10_pct: ti.audit?.top_holders_pct ?? null,
+              entry_bot_pct: ti.audit?.bot_holders_pct ?? null,
+              entry_bundle_pct: pool.bundle_pct ?? null,
+              entry_sniper_pct: pool.sniper_pct ?? null,
+            });
+          }
+          break;
+        }
+        // outcome.deployed === false — safety check blocked or impl failed.
+        // Log + try the next ENTER candidate. Anti-pattern #4: no retry of
+        // the same pool; we move on to the next-best confidence verdict.
+        log(
+          "cron",
+          `[VEGA_DETERMINISTIC] deploy declined for ${verdict.pool_address?.slice(0, 8)}: ${outcome.error}`,
+        );
+      }
+
+      // Vega owns the report path when it ran (regardless of deploy outcome).
+      // If Vega declined every ENTER without dispatching, we still surface a
+      // no-deploy report — the LLM agentLoop is skipped entirely under this flag.
+      if (vegaDeployResult) {
+        screenReport = formatDeployReport({
+          deployResult: vegaDeployResult,
+          candidate: vegaDeployedCandidate,
+          orionVerdict: vegaDeployedVerdict,
+        });
+      } else {
+        const verdictByPool = new Map((orionVerdicts || []).map((v) => [v.pool_address, v]));
+        const rejectedCandidates = passing.map((c) => ({
+          pool: c.pool,
+          reason: verdictByPool.get(c.pool?.pool)?.reason || "did not qualify",
+        }));
+        screenReport = formatNoDeployReport({
+          rejectedCandidates,
+          reason: enterVerdicts.length === 0
+            ? "Orion produced no ENTER verdicts above the live confidence floor."
+            : "Vega declined every ENTER verdict (safety guard or stale snapshot).",
+        });
+        appendDecision({
+          type: "no_deploy",
+          actor: "VEGA",
+          summary: "Vega deterministic path produced no deploy",
+          reason: enterVerdicts.length === 0 ? "no Orion ENTER verdicts" : "Vega declined all ENTERs",
+        });
+      }
+      return screenReport;
     }
 
     // Pre-fetch active_bin for all passing candidates in parallel

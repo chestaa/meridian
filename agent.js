@@ -163,6 +163,58 @@ function isToolChoiceRequiredError(error) {
   return /tool_choice/i.test(message) && /required/i.test(message);
 }
 
+// Vega+Lyra fix #1 — treat OpenRouter 400s as transient (sometimes deepseek/deepseek-v4-flash
+// emits bad-request envelopes that succeed on retry with a fallback model). Detect via both
+// thrown APIError (error.status) and response-body error code shapes.
+function is400Error(error) {
+  if (error?.status === 400) return true;
+  if (error?.error?.code === 400) return true;
+  const message = String(error?.message || error?.error?.message || error || "");
+  // OpenRouter's exact 400 envelope is "400 Provider returned error" — match that too.
+  if (/\b400\b/.test(message) && /provider returned error/i.test(message)) return true;
+  return /\b400\b/.test(message) && /(bad request|invalid_request_error|invalid request)/i.test(message);
+}
+
+// Orion deeper fix (2026-05-19) — provider-diverse 400 fallback ladder.
+// Diagnostic showed 5/5 of 400s in the 48h window all came from deepseek/deepseek-v4-flash
+// via OpenRouter's intermittent upstream routing. Single fallback to a free model is brittle
+// (rate-limited, tool-handling weaker). The ladder tries a sibling paid model first, then a
+// premium model already in routing, and only then the free model as last resort. Each step
+// is provider-diverse so a regional/upstream issue on one route doesn't poison the others.
+//
+// Ordering rule: skip any model that equals the currently-failing one (no self-fallback).
+// Ladder cap = total attempts in the outer for-loop (3) so this can never run forever.
+const FALLBACK_LADDER_400 = [
+  "deepseek/deepseek-chat",      // sibling paid model — different OR upstream
+  "xiaomi/mimo-v2-pro",          // premium tier, distinct provider
+  "stepfun/step-3.5-flash:free", // free last-resort (preserves HOTFIX-6 behavior)
+];
+
+function next400Fallback(currentModel, attemptedFallbacks) {
+  for (const candidate of FALLBACK_LADDER_400) {
+    if (candidate === currentModel) continue;
+    if (attemptedFallbacks.has(candidate)) continue;
+    return candidate;
+  }
+  return null;
+}
+
+// Vega+Lyra fix #2 — extract Orion ENTER verdicts from the screener goal text so the
+// agentLoop can both (a) force tool_choice and (b) detect a stall when ENTER existed
+// but no deploy_position fired. Returns array of { pool, confidence } parsed from
+// lines of the form: "- <pool> (enter, NN%): <reason>".
+function parseOrionEnterVerdicts(goal) {
+  if (!goal || typeof goal !== "string") return [];
+  if (!/ORION PRE-JUDGMENT/i.test(goal)) return [];
+  const out = [];
+  const re = /^\s*-\s+([A-Za-z0-9]{20,})\s+\(enter,\s*(\d+)%\)/gim;
+  let m;
+  while ((m = re.exec(goal)) !== null) {
+    out.push({ pool: m[1], confidence: parseInt(m[2], 10) });
+  }
+  return out;
+}
+
 /**
  * Core ReAct agent loop.
  *
@@ -201,6 +253,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   let sawToolCall = false;
   let noToolRetryCount = 0;
 
+  // Vega+Lyra fix #2/#3 — capture Orion ENTER verdicts referenced in this cycle.
+  // Used to (a) escalate tool_choice on the first SCREENER step when a high-confidence
+  // ENTER exists, and (b) detect SCREENER_STALL when the loop exits without deploy.
+  const orionEnterVerdicts = parseOrionEnterVerdicts(goal);
+  const hasHighConfEnter = orionEnterVerdicts.some((v) => v.confidence >= 70);
+  let deployToolFired = false;
+
   let emptyStreak = 0;
   for (let step = 0; step < maxSteps; step++) {
     log("agent", `Step ${step + 1}/${maxSteps}`);
@@ -215,10 +274,26 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
       let response;
       let usedModel = activeModel;
+      // Orion deeper fix — track which fallback models we've already tried for 400 errors
+      // this step. Combined with FALLBACK_LADDER_400 to give provider-diverse retries.
+      const attempted400Fallbacks = new Set();
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
       let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
 
+      // Vega+Lyra fix #2 — SCREENER escalation: when Orion has emitted at least one
+      // ENTER verdict with confidence >= 70% AND deploy hasn't fired yet, force
+      // tool_choice=required so the model can't end with a free-text "Let me verify..."
+      // Polaris guidance: only at >=70% confidence — too aggressive at lower conf
+      // risks forcing low-quality deploys. MANAGER + GENERAL preserved (auto/intent).
+      if (agentType === "SCREENER" && hasHighConfEnter && !deployToolFired && toolChoice !== "required") {
+        toolChoice = "required";
+        log("agent", `[SCREENER_TOOL_CHOICE_FORCED] orion_enter_high_conf=${orionEnterVerdicts.filter(v => v.confidence >= 70).length} step=${step + 1}`);
+      }
+
+      // Vega+Lyra fix #1 (HOTFIX-6) + Orion deeper fix (2026-05-19) — 400 retry budget.
+      // Capped at 3 total attempts (initial + up to 2 fallback rungs on the ladder).
+      // Resets per-step. Multi-rung tracking is done via attempted400Fallbacks (Set).
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           // Cost guard — hard daily/weekly USD cap. Throws BudgetExceededError if reached.
@@ -245,6 +320,22 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             log("agent", "Provider rejected tool_choice=required — retrying with tool_choice=auto");
             attempt -= 1;
             continue;
+          }
+          // Vega+Lyra fix #1 (HOTFIX-6) + Orion deeper fix (2026-05-19) — OpenRouter
+          // intermittently 400s on deepseek/deepseek-v4-flash via routing variability.
+          // Walk a provider-diverse fallback ladder before giving up. Each rung is a
+          // distinct paid provider so a single upstream regional issue can't poison
+          // the chain. Free model is last resort (preserves HOTFIX-6 behavior).
+          if (is400Error(error)) {
+            attempted400Fallbacks.add(usedModel);
+            const nextModel = next400Fallback(usedModel, attempted400Fallbacks);
+            if (nextModel) {
+              log("agent", `[LLM_400_RETRY] model=${usedModel} 400 → falling back to ${nextModel} (rung ${attempted400Fallbacks.size}/${FALLBACK_LADDER_400.length})`);
+              usedModel = nextModel;
+              attempt -= 1;
+              continue;
+            }
+            log("agent", `[LLM_400_EXHAUSTED] all ladder rungs failed for model=${activeModel}. Ladder=${[...attempted400Fallbacks].join(",")}`);
           }
           throw error;
         }
@@ -313,6 +404,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           messages.pop();
           log("agent", `Rejected no-tool final answer (${noToolRetryCount}/2) for tool-required request`);
           if (noToolRetryCount >= 2) {
+            // Vega+Lyra fix #3 — stall on tool-required exhaustion path too.
+            if (agentType === "SCREENER" && !deployToolFired && orionEnterVerdicts.length > 0) {
+              const enterCount = orionEnterVerdicts.length;
+              const highConfCount = orionEnterVerdicts.filter(v => v.confidence >= 70).length;
+              const snippet = String(msg.content || "").slice(0, 200).replace(/\s+/g, " ");
+              log("screener_stall", `Orion ENTER but tool-required exhausted without deploy. enter_verdicts=${enterCount} high_conf=${highConfCount}. Final text: ${snippet}`);
+            }
             return {
               content: "I couldn't complete that reliably because no tool call was made. Please retry after checking the logs.",
               userMessage: goal,
@@ -328,6 +426,16 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         }
         log("agent", "Final answer reached");
         log("agent", msg.content);
+        // Vega+Lyra fix #3 — SCREENER stall detection. If Orion emitted at least one
+        // ENTER verdict for this cycle but the screener loop exited without ever
+        // calling deploy_position, log loudly. This makes "Good candidate. Let me
+        // verify..." style stalls visible immediately instead of post-hoc.
+        if (agentType === "SCREENER" && !deployToolFired && orionEnterVerdicts.length > 0) {
+          const enterCount = orionEnterVerdicts.length;
+          const highConfCount = orionEnterVerdicts.filter(v => v.confidence >= 70).length;
+          const snippet = String(msg.content || "").slice(0, 200).replace(/\s+/g, " ");
+          log("screener_stall", `Orion ENTER but loop exited without deploy. enter_verdicts=${enterCount} high_conf=${highConfCount}. Final text: ${snippet}`);
+        }
         return { content: msg.content, userMessage: goal };
       }
       sawToolCall = true;
@@ -391,6 +499,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         }
 
         await onToolStart?.({ name: functionName, args: functionArgs, step });
+        if (functionName === "deploy_position") deployToolFired = true;
         const result = await executeTool(functionName, functionArgs);
         await onToolFinish?.({
           name: functionName,
@@ -446,9 +555,25 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   }
 
   log("agent", "Max steps reached without final answer");
+  // Vega+Lyra fix #3 — also fire SCREENER_STALL on max-steps exit (loop ran out
+  // without ever deploying despite Orion ENTER signal).
+  if (agentType === "SCREENER" && !deployToolFired && orionEnterVerdicts.length > 0) {
+    const enterCount = orionEnterVerdicts.length;
+    const highConfCount = orionEnterVerdicts.filter(v => v.confidence >= 70).length;
+    log("screener_stall", `Orion ENTER but max-steps reached without deploy. enter_verdicts=${enterCount} high_conf=${highConfCount}.`);
+  }
   return { content: "Max steps reached. Review logs for partial progress.", userMessage: goal };
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// Test seam — let unit tests stub the OpenAI completions.create call.
+// Production code never calls this; it overwrites the create() method only.
+export function __setCreateForTests(fakeCreate) {
+  client.chat.completions.create = fakeCreate;
+}
+
+// Exposed for unit testing — not part of the public agent API.
+export { is400Error, parseOrionEnterVerdicts, next400Fallback, FALLBACK_LADDER_400 };
