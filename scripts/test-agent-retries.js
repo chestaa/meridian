@@ -45,16 +45,18 @@ check("is400Error rejects generic Error", !is400Error(new Error("network down"))
 // 1b) next400Fallback ladder unit assertions (Orion deeper fix) --------------------
 check("FALLBACK_LADDER_400 is non-empty",
   Array.isArray(FALLBACK_LADDER_400) && FALLBACK_LADDER_400.length > 0);
-check("ladder first rung is deepseek/deepseek-chat (sibling paid, not free)",
-  FALLBACK_LADDER_400[0] === "deepseek/deepseek-chat");
-check("ladder contains premium tier (xiaomi/mimo-v2-pro)",
-  FALLBACK_LADDER_400.includes("xiaomi/mimo-v2-pro"));
+// Pillar A reshape (2026-05-23): ladder is now [mimo-v2-pro, deepseek-v4-pro, stepfun:free]
+// to preserve provider diversity after routing collapsed to deepseek-v4-flash everywhere.
+check("ladder first rung is xiaomi/mimo-v2-pro (distinct provider, not free)",
+  FALLBACK_LADDER_400[0] === "xiaomi/mimo-v2-pro");
+check("ladder contains premium tier sibling (deepseek/deepseek-v4-pro)",
+  FALLBACK_LADDER_400.includes("deepseek/deepseek-v4-pro"));
 check("ladder ends with free model as last resort",
   FALLBACK_LADDER_400[FALLBACK_LADDER_400.length - 1] === "stepfun/step-3.5-flash:free");
 check("next400Fallback skips the failing model (no self-fallback)",
-  next400Fallback("deepseek/deepseek-chat", new Set()) !== "deepseek/deepseek-chat");
+  next400Fallback("xiaomi/mimo-v2-pro", new Set()) !== "xiaomi/mimo-v2-pro");
 check("next400Fallback skips already-attempted rungs",
-  next400Fallback("deepseek/deepseek-v4-flash", new Set(["deepseek/deepseek-chat"])) === "xiaomi/mimo-v2-pro");
+  next400Fallback("deepseek/deepseek-v4-flash", new Set(["xiaomi/mimo-v2-pro"])) === "deepseek/deepseek-v4-pro");
 check("next400Fallback returns null when all rungs exhausted",
   next400Fallback("deepseek/deepseek-v4-flash", new Set(FALLBACK_LADDER_400)) === null);
 
@@ -62,7 +64,8 @@ check("next400Fallback returns null when all rungs exhausted",
 // We avoid the full screener network of imports by driving GENERAL goal with NO tool
 // expectation — the model returns final text in one turn.
 const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
-const EXPECTED_FIRST_RUNG = "deepseek/deepseek-chat";
+// Pillar A reshape (2026-05-23): first rung is now xiaomi/mimo-v2-pro
+const EXPECTED_FIRST_RUNG = "xiaomi/mimo-v2-pro";
 const callLog = [];
 
 let attemptIdx = 0;
@@ -92,7 +95,7 @@ const goal1 = "show me the latest performance history";
 const result1 = await agentLoop(goal1, 5, [], "GENERAL", null, 256);
 check("agentLoop returned final content after 400 fallback", result1?.content === "fallback succeeded");
 check("first attempt used the original (non-fallback) model", callLog[0]?.model && callLog[0].model !== FALLBACK_MODEL);
-check("second attempt used FIRST LADDER RUNG (deepseek-chat, not stepfun free)",
+check("second attempt used FIRST LADDER RUNG (mimo-v2-pro, not stepfun free)",
   callLog[1]?.model === EXPECTED_FIRST_RUNG);
 check("first fallback is NOT the free model (deeper fix prefers paid sibling)",
   callLog[1]?.model !== FALLBACK_MODEL);
@@ -128,9 +131,9 @@ check("3rd attempt used a different model than 1st and 2nd",
   callLog1b.length === 3
     && callLog1b[2].model !== callLog1b[0].model
     && callLog1b[2].model !== callLog1b[1].model);
-check("ladder progression: original → rung1 (deepseek-chat) → rung2 (mimo-v2-pro)",
-  callLog1b[1].model === "deepseek/deepseek-chat"
-    && callLog1b[2].model === "xiaomi/mimo-v2-pro");
+check("ladder progression: original → rung1 (mimo-v2-pro) → rung2 (deepseek-v4-pro)",
+  callLog1b[1].model === "xiaomi/mimo-v2-pro"
+    && callLog1b[2].model === "deepseek/deepseek-v4-pro");
 
 // 3) Persistent 400 across ALL ladder rungs bubbles up (cap respected) -------------
 attemptIdx = 0;

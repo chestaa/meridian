@@ -1,0 +1,20 @@
+# Meridian Service-Down Watchdog (Pillar B Gap #5)
+#
+# Instantiated template unit that fires a Telegram alert when a sibling
+# Meridian service enters the failed state. Wire it up by adding
+# `OnFailure=meridian-notify@%n.service` to each watched service's [Unit].
+#
+# Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in /opt/meridian/.env
+# (same envfile the main bot already loads — see deploy/VPS-SETUP.md).
+#
+# Manual fire test:
+#   systemctl start meridian-notify@meridian.service
+# Should deliver a Telegram alert and exit 0.
+
+[Unit]
+Description=Telegram alert for failed Meridian service %i
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/meridian/.env
+ExecStart=/bin/bash -c '/usr/bin/curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" -d chat_id=$TELEGRAM_CHAT_ID -d text="🔴 SERVICE FAILED: %i at $(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ). Check VPS journalctl -u %i."'

@@ -2,6 +2,7 @@
 Description=Meridian Auto-Screener (Meteora API + DeepSeek signal discovery)
 After=network-online.target
 Wants=network-online.target
+OnFailure=meridian-notify@%n.service
 
 [Service]
 Type=simple

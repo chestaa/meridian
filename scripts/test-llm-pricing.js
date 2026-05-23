@@ -31,10 +31,11 @@ function approx(a, b, eps = 1e-9) {
   assert("kimi-k2 cost = 0.00165", approx(cost, 0.00165), `got ${cost}`);
 }
 
-// 2. deepseek v4 flash: 1000 + 500 → 0.10*1000/1M + 0.30*500/1M = 0.0001 + 0.00015 = 0.00025
+// 2. deepseek v4 flash: 1000 + 500 → 0.10*1000/1M + 0.20*500/1M = 0.0001 + 0.0001 = 0.0002
+// Pillar A (2026-05-23): output rate corrected 0.30 → 0.20.
 {
   const cost = computeCost("deepseek/deepseek-v4-flash", { prompt_tokens: 1000, completion_tokens: 500 });
-  assert("deepseek-v4-flash cost = 0.00025", approx(cost, 0.00025), `got ${cost}`);
+  assert("deepseek-v4-flash cost = 0.0002", approx(cost, 0.0002), `got ${cost}`);
 }
 
 // 3. healer-alpha (premium): 1000 + 500 → 3.0*1000/1M + 15.0*500/1M = 0.003 + 0.0075 = 0.0105

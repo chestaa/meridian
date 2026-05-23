@@ -184,9 +184,14 @@ function is400Error(error) {
 //
 // Ordering rule: skip any model that equals the currently-failing one (no self-fallback).
 // Ladder cap = total attempts in the outer for-loop (3) so this can never run forever.
+// Pillar A reshape (2026-05-23) — provider-diverse ladder after kimi-k2/mimo-v2-pro
+// retirement from routing. Routing now defaults to deepseek/deepseek-v4-flash across
+// all rungs, so the fallback ladder MUST use different providers to recover from
+// upstream/regional OR outages. Order: mimo-v2-pro (xiaomi, distinct provider) →
+// deepseek-v4-pro (sibling paid, different upstream) → stepfun free (last resort).
 const FALLBACK_LADDER_400 = [
-  "deepseek/deepseek-chat",      // sibling paid model — different OR upstream
-  "xiaomi/mimo-v2-pro",          // premium tier, distinct provider
+  "xiaomi/mimo-v2-pro",          // distinct provider (xiaomi) — first defense vs deepseek upstream issues
+  "deepseek/deepseek-v4-pro",    // sibling paid model — different model id, still deepseek but premium tier
   "stepfun/step-3.5-flash:free", // free last-resort (preserves HOTFIX-6 behavior)
 ];
 

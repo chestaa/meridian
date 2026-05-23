@@ -20,7 +20,13 @@ export const ALERT_THRESHOLD_PCT = 0.80;
 // Unknown models fall through to DEFAULT_RATE_PER_1K — set conservatively high
 // so we'd rather over-estimate burn and trigger the cap early than under-count.
 const RATE_PER_1K_USD = {
-  "deepseek/deepseek-v4-flash": 0.00017,
+  // Pillar A (2026-05-23): V4 Flash blended rate recalibrated 0.00017 → 0.00015
+  // after llm-usage.js pricing correction (output 0.30 → 0.20). Blended avg of
+  // (input 0.10 + output 0.20) / 2 = 0.15 per 1M → 0.00015 per 1k.
+  "deepseek/deepseek-v4-flash": 0.00015,
+  // Pillar A (2026-05-23): deepseek-v4-pro added — premium screening rung.
+  // Blended (input 0.27 + output 1.10) / 2 = 0.685 per 1M → 0.000685 per 1k.
+  "deepseek/deepseek-v4-pro": 0.000685,
   // HOTFIX-4 (2026-05-17): openrouter/healer-alpha deprecated, kept for audit
   // of historical records. Active replacement: xiaomi/mimo-v2-omni.
   "openrouter/healer-alpha": 0.00017,

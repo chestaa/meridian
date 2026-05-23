@@ -21,6 +21,7 @@ import {
   editMessageWithButtons,
   answerCallbackQuery,
   notifyOutOfRange,
+  notifyBalanceDrain,
   isEnabled as telegramEnabled,
   createLiveMessage,
   markManualClose,
@@ -96,6 +97,15 @@ let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
+
+// ─── Burner balance-drain monitor (Sirius Pillar B fix #4) ───────
+// Sampled at the start of each management cycle. If sample-to-sample drop
+// exceeds BALANCE_DRAIN_THRESHOLD_PCT (only meaningful when samples are
+// within BALANCE_DRAIN_WINDOW_MS of each other, i.e. ~1h), fire alert.
+// Read-only: uses existing getWalletBalances() — Vega's wallet code untouched.
+const BALANCE_DRAIN_THRESHOLD_PCT = 20; // alert when SOL drops > this %
+const BALANCE_DRAIN_WINDOW_MS = 60 * 60 * 1000; // 1h sample window
+let _lastBalanceSample = null; // { sol: number, at: ms }
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
@@ -222,6 +232,32 @@ export async function runManagementCycle({ silent = false } = {}) {
   let positions = [];
   let liveMessage = null;
   try {
+    // ── Burner balance-drain sample (Sirius Pillar B fix #4) ───────
+    // READ-only: reuses existing getWalletBalances(). Compares to previous
+    // sample taken within BALANCE_DRAIN_WINDOW_MS. Fires Telegram alert if
+    // SOL dropped > BALANCE_DRAIN_THRESHOLD_PCT. Throttled inside the
+    // notify helper (1h cooldown).
+    try {
+      const balSnap = await getWalletBalances();
+      const solNow = Number(balSnap?.sol);
+      if (Number.isFinite(solNow) && solNow >= 0) {
+        const now = Date.now();
+        const prev = _lastBalanceSample;
+        if (prev && Number.isFinite(prev.sol) && prev.sol > 0 && (now - prev.at) <= BALANCE_DRAIN_WINDOW_MS) {
+          const dropPct = ((prev.sol - solNow) / prev.sol) * 100;
+          if (dropPct > BALANCE_DRAIN_THRESHOLD_PCT) {
+            log("balance_drain", `Detected burner drop: ${prev.sol.toFixed(4)} → ${solNow.toFixed(4)} SOL (${dropPct.toFixed(2)}%)`);
+            notifyBalanceDrain(prev.sol, solNow, dropPct).catch((e) =>
+              log("balance_drain_error", `notifyBalanceDrain failed: ${e.message}`)
+            );
+          }
+        }
+        _lastBalanceSample = { sol: solNow, at: now };
+      }
+    } catch (e) {
+      log("balance_drain_warn", `Balance sample failed: ${e.message}`);
+    }
+
     await refreshPaperTrades().catch((error) => log("paper_warn", `Paper trade refresh failed: ${error.message}`));
     if (!silent && telegramEnabled() && !isExecutiveMode()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");

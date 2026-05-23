@@ -9,8 +9,14 @@ const MAX_RECORDS = 2000;
 // Fields: { input: number, output: number }
 export const MODEL_PRICING_USD_PER_1M = {
   "moonshotai/kimi-k2": { input: 0.55, output: 2.20 },
-  "deepseek/deepseek-v4-flash": { input: 0.10, output: 0.30 },
+  // Pillar A (2026-05-23): V4 Flash output corrected 0.30 → 0.20 (stale entry was
+  // overcharging cost-guard's daily projection, biasing budget alerts too early).
+  "deepseek/deepseek-v4-flash": { input: 0.10, output: 0.20 },
   "deepseek/deepseek-chat": { input: 0.10, output: 0.30 },
+  // Pillar A (2026-05-23): deepseek-v4-pro added — premium-tier sibling promoted
+  // into screening routing (replaced mimo-v2-pro). Pricing best-effort pending
+  // verification against OpenRouter docs; override via LLM_PRICING_OVERRIDE_JSON.
+  "deepseek/deepseek-v4-pro": { input: 0.27, output: 1.10 },
   // HOTFIX-1 (2026-05-17): openrouter/hunter-alpha deprecated, replaced by
   // xiaomi/mimo-v2-pro. Pricing below is a best-effort estimate pending
   // confirmation from OpenRouter docs — verify and override via env if needed.

@@ -513,6 +513,13 @@ export function markManualClose(positionAddress) {
 const BUDGET_ALERT_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12h
 let _lastBudgetAlertAt = 0;
 
+// ─── Burner balance-drain alert throttle (Sirius Pillar B fix #4) ─
+// Fires when wallet balance drops >drainThresholdPct (default 20%) within
+// the sampling window. 1h cooldown so a sustained drain doesn't carpet-bomb
+// Telegram. Read-only — does not touch tools/wallet.js (Vega VETO).
+const BALANCE_DRAIN_ALERT_COOLDOWN_MS = 60 * 60 * 1000; // 1h
+let _lastBalanceDrainAlertAt = 0;
+
 // ─── Notification helpers ────────────────────────────────────────
 export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee, dryRun = false }) {
   if (hasActiveLiveMessage()) return;
@@ -676,6 +683,37 @@ export async function notifyBudgetExceeded({ status, caller } = {}) {
     );
   } catch (e) {
     log("telegram_error", `notifyBudgetExceeded failed: ${e.message}`);
+  }
+}
+
+// Burner balance-drain alert (Sirius Pillar B fix #4).
+// Emits a structured Telegram alert when SOL balance drops by >dropPct since
+// the last sample. Operator-only signal — no auto-action taken.
+//   beforeSol — SOL balance at previous sample (last management cycle start)
+//   afterSol  — SOL balance now
+//   dropPct   — observed drop in % (positive number, e.g. 22.5 for 22.5% drop)
+// Throttled by BALANCE_DRAIN_ALERT_COOLDOWN_MS (1h).
+export async function notifyBalanceDrain(beforeSol, afterSol, dropPct) {
+  if (!TOKEN || !chatId) return;
+  const now = Date.now();
+  if (now - _lastBalanceDrainAlertAt < BALANCE_DRAIN_ALERT_COOLDOWN_MS) return;
+  _lastBalanceDrainAlertAt = now;
+  try {
+    const before = Number.isFinite(beforeSol) ? Number(beforeSol).toFixed(4) : "?";
+    const after = Number.isFinite(afterSol) ? Number(afterSol).toFixed(4) : "?";
+    const drop = Number.isFinite(dropPct) ? Number(dropPct).toFixed(2) : "?";
+    const deltaSol = (Number.isFinite(beforeSol) && Number.isFinite(afterSol))
+      ? (Number(afterSol) - Number(beforeSol)).toFixed(4)
+      : "?";
+    await sendHTML(
+      `🚨 <b>BURNER BALANCE DRAIN</b>\n` +
+      `Before: ${htmlEscape(before)} SOL\n` +
+      `After: ${htmlEscape(after)} SOL\n` +
+      `Delta: ${htmlEscape(deltaSol)} SOL (${htmlEscape(drop)}% drop)\n` +
+      `Action required: verify wallet — possible drain, leak, or unexpected close`
+    );
+  } catch (e) {
+    log("telegram_error", `notifyBalanceDrain failed: ${e.message}`);
   }
 }
 

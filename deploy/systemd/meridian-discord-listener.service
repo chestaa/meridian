@@ -14,6 +14,7 @@
 Description=Meridian Discord Listener (Path A signal source)
 After=network-online.target
 Wants=network-online.target
+OnFailure=meridian-notify@%n.service
 
 [Service]
 Type=simple
