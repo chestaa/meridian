@@ -246,7 +246,44 @@ export function formatDigest(data) {
   return lines.join("\n");
 }
 
-export function buildDigest({ now = Date.now(), timers = null } = {}) {
+export function buildDigest({ now = Date.now(), timers = null, executive = false } = {}) {
   const data = gatherDigestData({ now, timers });
+  if (executive) {
+    return { data, html: formatExecutiveDigest(data) };
+  }
   return { data, html: formatDigest(data) };
+}
+
+/**
+ * Executive digest (Sirius UX upgrade C) — short plain-Indonesia summary.
+ * Reads paper-trades.json + circuit-breaker-state.json for the high-level
+ * pulse: open positions, today's PnL, 7d win rate, wallet, bot status.
+ * Walletbalance + win-rate hooks are passed in by the caller to avoid
+ * pulling tools/wallet into digest.js (read-only module).
+ */
+export function formatExecutiveDigest(data, extras = {}) {
+  const lines = [];
+  lines.push(`📊 <b>RINGKASAN HARI INI</b>`);
+  lines.push(`${nowJakarta()} WIB`);
+  lines.push("");
+  lines.push(`Posisi terbuka: ${data.paper.open_count}`);
+  const realized = data.paper.today_realized_avg_pct;
+  if (realized == null) {
+    lines.push(`Untung hari ini: belum ada close`);
+  } else {
+    const sign = realized >= 0 ? "+" : "";
+    lines.push(`Untung hari ini: ${sign}${realized.toFixed(2)}%`);
+  }
+  if (extras.winRate7d != null) {
+    lines.push(`Win rate 7 hari: ${extras.winRate7d}%`);
+  }
+  if (extras.walletSol != null) {
+    const usdStr = extras.walletUsd != null ? ` ($${extras.walletUsd.toFixed(0)})` : "";
+    lines.push(`Wallet: ${Number(extras.walletSol).toFixed(3)} SOL${usdStr}`);
+  }
+  const cbStatus = data.circuit.halted ? "🔴 halted" : "🟢 jalan";
+  lines.push(`Bot: ${cbStatus}`);
+  lines.push("");
+  lines.push(`Detail teknis: /details`);
+  return lines.join("\n");
 }

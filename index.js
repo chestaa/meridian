@@ -44,7 +44,9 @@ import { judgeCandidates, formatOrionVerdicts } from "./agents/orion.js";
 import { formatDeployReport, formatNoDeployReport, andromedaEnabled } from "./agents/andromeda.js";
 import { deployFromOrionVerdict, vegaDeterministicDeployEnabled } from "./agents/vega.js";
 import { runDeterministicManagement, managerDeterministicEnabled } from "./agents/manager.js";
-import { buildDigest } from "./digest.js";
+import { buildDigest, formatExecutiveDigest, gatherDigestData } from "./digest.js";
+import { execSync } from "child_process";
+import fs from "fs";
 
 const isMain = process.argv[1]
   ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
@@ -1540,6 +1542,10 @@ function formatHelpText() {
     "Telegram commands",
     "",
     "/help — show commands",
+    "/menu — main inline-button menu",
+    "/about — what this bot does (Indonesia)",
+    "/log — last 50 lines journalctl meridian.service",
+    "/details — verbose digest (technical)",
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
     "/positions — list open positions",
@@ -1660,6 +1666,127 @@ async function drainTelegramQueue() {
   }
 }
 
+// ─── Main menu (Sirius UX upgrade A) ─────────────────────────────
+// Plain inline-keyboard menu; callbacks use prefix "main:" to avoid
+// colliding with the "cfg:" settings-menu callbacks.
+const MAIN_MENU_BUTTONS = [
+  [
+    { text: "📊 Positions", callback_data: "main:positions" },
+    { text: "📋 Digest",    callback_data: "main:digest" },
+  ],
+  [
+    { text: "💰 Wallet",    callback_data: "main:wallet" },
+    { text: "📜 Log",       callback_data: "main:log" },
+  ],
+  [
+    { text: "ℹ️ About",     callback_data: "main:about" },
+  ],
+];
+
+async function showMainMenu() {
+  await sendMessageWithButtons(
+    "Meridian — pilih menu:",
+    MAIN_MENU_BUTTONS,
+  ).catch(() => {});
+}
+
+// 7d paper-trade win rate helper for executive digest
+function computeWinRate7d() {
+  try {
+    const p = readJsonSafe("paper-trades.json");
+    const trades = Array.isArray(p?.trades) ? p.trades : [];
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const closed = trades.filter((t) => {
+      if (t.status === "open") return false;
+      const ts = t.closed_at || t.matured_at;
+      const ms = typeof ts === "number" ? ts : Date.parse(ts || "");
+      return Number.isFinite(ms) && ms >= cutoff;
+    });
+    if (closed.length === 0) return null;
+    const wins = closed.filter((t) => {
+      const pnl = t.fee_inclusive_pnl_pct ?? t.latest_snapshot?.fee_inclusive_pnl_pct ?? t.latest_snapshot?.price_proxy_pnl_pct;
+      return Number.isFinite(pnl) && pnl > 0;
+    }).length;
+    return Math.round((wins / closed.length) * 100);
+  } catch { return null; }
+}
+
+function readJsonSafe(rel) {
+  try {
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    return JSON.parse(fs.readFileSync(path.join(dir, rel), "utf8"));
+  } catch { return null; }
+}
+
+async function handleExecutiveDigest() {
+  try {
+    const data = gatherDigestData({ timers });
+    const winRate7d = computeWinRate7d();
+    let walletSol = null;
+    let walletUsd = null;
+    try {
+      const w = await getWalletBalances();
+      walletSol = Number(w?.sol);
+      const solPrice = Number(w?.sol_price_usd ?? w?.solPriceUsd);
+      if (Number.isFinite(walletSol) && Number.isFinite(solPrice)) {
+        walletUsd = walletSol * solPrice;
+      }
+    } catch { /* non-fatal */ }
+    const html = formatExecutiveDigest(data, { winRate7d, walletSol, walletUsd });
+    await sendHTML(html);
+  } catch (e) {
+    await sendMessage(`Digest error: ${e.message}`).catch(() => {});
+  }
+}
+
+async function handleLog() {
+  try {
+    let out = "";
+    try {
+      out = execSync("journalctl -u meridian.service -n 50 --no-pager 2>&1", {
+        encoding: "utf8",
+        timeout: 5000,
+      });
+    } catch (e) {
+      out = e.stdout?.toString?.() || `journalctl unavailable: ${e.message}`;
+    }
+    let text = out.trim();
+    if (text.length > 3800) text = "...(truncated)...\n" + text.slice(-3800);
+    await sendMessage("```\n" + text + "\n```");
+  } catch (e) {
+    await sendMessage(`Log error: ${e.message}`).catch(() => {});
+  }
+}
+
+function formatAboutText() {
+  const maxPos = config.risk?.maxPositions ?? "?";
+  const dep = config.management?.deployAmountSol ?? "?";
+  const maxDep = config.risk?.maxDeployAmount ?? "?";
+  const dry = process.env.DRY_RUN === "true" ? "PAPER (dry-run)" : "LIVE (burner)";
+  return [
+    "ℹ️ <b>Meridian</b>",
+    "",
+    "Bot autonomous Liquidity Provider untuk DLMM Meteora di Solana.",
+    "Tugasnya: scan pool, deploy LP, monitor, close kalau exit condition.",
+    "",
+    "<b>Konfigurasi sekarang</b>",
+    `Mode: ${dry}`,
+    `Max posisi: ${maxPos}`,
+    `Deploy amount: ${dep} SOL (cap ${maxDep} SOL)`,
+    "",
+    "<b>Pipeline</b>",
+    "Meteora pools → Cassiopeia filter → Orion judge → Vega execute → Andromeda monitor",
+    "",
+    "<b>Safety</b>",
+    "• Circuit breaker (halt deploy kalau loss harian > cap)",
+    "• Hardcoded cap (maxDeployAmount, maxPositions)",
+    "• Burner wallet only (no main funds)",
+    "• Allow-list Telegram user-id",
+    "",
+    "Menu: /menu  •  Detail: /details  •  Help: /help",
+  ].join("\n");
+}
+
 async function telegramHandler(msg) {
   const text = msg?.text?.trim();
   if (!text) return;
@@ -1671,14 +1798,50 @@ async function telegramHandler(msg) {
     }
     return;
   }
-  if (text === "/settings" || text === "/menu" || text === "/configmenu") {
+
+  // Main menu callback dispatcher (Sirius UX upgrade A)
+  if (msg?.isCallback && text.startsWith("main:")) {
+    const action = text.slice(5);
+    await answerCallbackQuery(msg.callbackQueryId).catch(() => {});
+    // Re-dispatch as a synthetic command message into the same handler
+    const dispatch = {
+      positions: "/positions",
+      digest:    "/digest",
+      log:       "/log",
+      about:     "/about",
+      wallet:    "/wallet",
+    }[action];
+    if (dispatch) {
+      await telegramHandler({ ...msg, text: dispatch, isCallback: false, callbackData: null });
+    }
+    return;
+  }
+
+  if (text === "/start" || text === "/menu") {
+    await showMainMenu();
+    return;
+  }
+  if (text === "/settings" || text === "/configmenu") {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
     return;
   }
 
-  // /digest — on-demand instant pulse. Bypasses busy-queue gate AND
-  // isExecutiveMode (user-initiated, always reply).
+  if (text === "/about") {
+    await sendHTML(formatAboutText()).catch(() => {});
+    return;
+  }
+
+  if (text === "/log") {
+    await handleLog();
+    return;
+  }
+
+  // /digest — executive summary (default). /details = legacy verbose digest.
   if (text === "/digest") {
+    await handleExecutiveDigest();
+    return;
+  }
+  if (text === "/details") {
     try {
       const { html } = buildDigest({ timers });
       await sendHTML(html);
