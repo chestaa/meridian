@@ -468,9 +468,50 @@ async function poll(onMessage) {
   }
 }
 
+// ─── Bot command menu registration (Sirius) ──────────────────────
+// Registers the slash-command autocomplete menu visible in Telegram clients.
+// Idempotent — safe to call on every startup. Never throws; Telegram API
+// outages must not block bot polling.
+const BOT_COMMANDS = [
+  { command: "menu",        description: "📋 Buka menu utama" },
+  { command: "positions",   description: "📊 Posisi terbuka" },
+  { command: "digest",      description: "📋 Ringkasan hari ini" },
+  { command: "details",     description: "📊 Digest lengkap (teknis)" },
+  { command: "wallet",      description: "💰 Saldo wallet" },
+  { command: "log",         description: "📜 50 baris log terakhir" },
+  { command: "about",       description: "ℹ️ Tentang bot" },
+  { command: "close",       description: "❌ Tutup posisi by index" },
+  { command: "closeall",    description: "❌ Tutup semua posisi" },
+  { command: "set",         description: "📝 Set note posisi" },
+  { command: "configmenu",  description: "⚙️ Menu konfigurasi" },
+];
+
+export async function registerBotCommands() {
+  if (!TOKEN) return false;
+  try {
+    const res = await fetch(`${BASE}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commands: BOT_COMMANDS }),
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      log("telegram_warn", `setMyCommands ${res.status}: ${errText.slice(0, 200)}`);
+      return false;
+    }
+    log("telegram", `Bot commands registered (${BOT_COMMANDS.length} entries)`);
+    return true;
+  } catch (e) {
+    log("telegram_warn", `setMyCommands failed: ${e.message}`);
+    return false;
+  }
+}
+
 export function startPolling(onMessage) {
   if (!TOKEN) return;
   _polling = true;
+  // Fire-and-forget command menu registration; never blocks polling.
+  registerBotCommands().catch((e) => log("telegram_warn", `registerBotCommands error: ${e.message}`));
   poll(onMessage); // fire-and-forget
   log("telegram", "Bot polling started");
 }
