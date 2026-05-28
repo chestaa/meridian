@@ -1,3 +1,9 @@
+- [Deploy 2026-05-23 Pillar A+B live restart](deploy-2026-05-23-pillar-ab-live.md) — Phase 1 LIVE go-live via meridian.service restart; 0 open positions, all hashes match, no errors
 - [Deploy 2026-05-17 exec mode + paper sweep](deploy-2026-05-17-exec-sweep.md) — Combined Sirius+Andromeda deploy: 10 files, 33 legacy paper trades swept, executive notification mode live
 - [Paper-trades.json shape](reference-paper-trades-shape.md) — File is object with `trades` key, NOT bare array — survey scripts must handle both
 - [Sweep script Telegram limitation](sweep-script-telegram-limitation.md) — scripts/sweep-paper-trades.js runs standalone; Telegram aggregate skipped if env not loaded in script context
+- [VPS SSH canonical path](reference-vps-ssh-canonical-path.md) — Key relocated 2026-05-14 to `~/.ssh/meridian_vps_ed25519`; old `./vps-key` deleted, do not reference
+- [Incident 2026-05-23 discord-listener spam](incident-2026-05-23-discord-listener-spam.md) — `/usr/bin/node` v18 vs `/usr/local/bin/node` v22 ExecStart bug + watchdog rate-limit hardening applied across all 5 units
+- [Incident 2026-05-23 Move 1 halt open position](incident-2026-05-23-move1-halt-open-position.md) — Deploy halted Phase 1 because VPS had open SPCX-SOL position despite task spec assuming 0 — restart preconditions check pattern
+- [Caveman install 2026-05-28](caveman-install-2026-05-28.md) — Caveman skill installed via npx; default mode lite via %APPDATA%\caveman\config.json; RTK untouched; rollback via --uninstall
+- [Deploy 2026-05-28 snapshot publisher](deploy-2026-05-28-snapshot-publisher.md) — Status snapshot timer live every 5min; pushes to chestaa/meridian status branch via SSH deploy key; repo visibility blocker for raw URL

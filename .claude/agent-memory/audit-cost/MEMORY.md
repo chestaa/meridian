@@ -1,1 +1,2 @@
 - [Telegram reporting inventory](telegram-reporting-inventory.md) — Full map of Telegram notif paths + boss-report timer install 2026-05-16
+- [VPS SSH canonical path](vps-ssh-canonical-path.md) — Use C:\Users\Pradikta Andrianto\.ssh\meridian_vps_ed25519 + root@124.156.202.109; never ./vps-key

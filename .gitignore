@@ -75,6 +75,10 @@ signals/history/
 # Backtest reports
 backtest-reports/
 
+# Snapshot publisher runtime artifacts
+status-snapshot.json
+.git-worktrees/
+
 # Agent bundles / archives
 .agent-bundle/
 *.zip

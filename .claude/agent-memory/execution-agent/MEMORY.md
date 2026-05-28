@@ -1,0 +1,2 @@
+- [Vega PR-3 deterministic deploy](vega-pr3-deterministic-deploy.md) — agents/vega.js dispatch path via executeTool; flag default OFF; 43-assertion test green
+- [executeTool seam pattern](executor-test-seam-pattern.md) — ESM namespace bindings can't be redefined; use exported __setForTests instead

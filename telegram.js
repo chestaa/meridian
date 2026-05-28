@@ -493,7 +493,7 @@ export function htmlEscape(value) {
 
 // ─── OOR cooldown state (Vega fix #4) ────────────────────────────
 // Per-position cooldown so notifyOutOfRange doesn't spam every mgmt tick.
-const OOR_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h
+const OOR_ALERT_COOLDOWN_MS = (config.management?.oorCooldownHours ?? 6) * 60 * 60 * 1000; // driven by config, was hardcoded 6h
 const _oorLastAlertedAt = new Map(); // positionId -> timestamp
 
 // ─── Manual-close dedupe state (Vega fix #4) ─────────────────────

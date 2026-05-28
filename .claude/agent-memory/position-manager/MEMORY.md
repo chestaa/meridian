@@ -1,0 +1,1 @@
+- [PR4 Deterministic Manager](pr4-deterministic-manager.md) — agents/manager.js extracted, MANAGER LLM optional via flag, default OFF

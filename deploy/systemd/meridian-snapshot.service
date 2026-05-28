@@ -1,0 +1,17 @@
+[Unit]
+Description=Meridian Status Snapshot Publisher (status branch)
+After=network-online.target
+Wants=network-online.target
+OnFailure=meridian-notify@%n.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/meridian
+ExecStart=/usr/local/bin/node /opt/meridian/scripts/snapshot-publisher.js --push
+Environment=NODE_ENV=production
+EnvironmentFile=-/opt/meridian/.env
+TimeoutStartSec=60s
+
+[Install]
+WantedBy=multi-user.target
