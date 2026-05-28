@@ -1,5 +1,5 @@
 {
-  "ts": "2026-05-28T06:36:30.203Z",
+  "ts": "2026-05-28T06:39:10.698Z",
   "wallet": {
     "pubkey": "DgA9MZ…1Hiu",
     "sol_free": 0.884393,
@@ -28,6 +28,13 @@
     "auto-screener"
   ],
   "config_active": {
-    "dryRun": true
+    "dryRun": true,
+    "oor_wait_min": 20,
+    "oor_cooldown_h": 6,
+    "deploy_amount_sol": 0.1,
+    "max_positions": 1,
+    "max_bot_pct": 20,
+    "max_bundlers_pct": 20,
+    "max_top10_pct": 55
   }
 }
