@@ -17,6 +17,8 @@ import {
 } from "../tools/sources/solscan-trending.js";
 
 const realFetch = globalThis.fetch;
+const realKey = process.env.BIRDEYE_API_KEY;
+const TEST_KEY = "test-birdeye-key";
 let passed = 0;
 function ok(label) {
   passed++;
@@ -36,10 +38,11 @@ function jsonResponse(body, { ok = true, status = 200 } = {}) {
 }
 
 // Build a fake fetch router. `meteoraByMint` maps mint → Meteora pool array.
-function makeFetch({ trending, meteoraByMint = {}, birdeyeFail = false, birdeyeStatus = 200 }) {
-  return (url) => {
+function makeFetch({ trending, meteoraByMint = {}, birdeyeFail = false, birdeyeStatus = 200, capture }) {
+  return (url, opts = {}) => {
     const u = String(url);
     if (u.includes(BIRDEYE_HOST)) {
+      if (capture) capture.headers = opts.headers || null;
       if (birdeyeFail) return Promise.reject(new Error("network down"));
       if (birdeyeStatus !== 200) return jsonResponse({}, { ok: false, status: birdeyeStatus });
       return jsonResponse({ data: { tokens: trending } });
@@ -85,13 +88,23 @@ function meteoraPool(mint, overrides = {}) {
 async function run() {
   console.log("test-solscan-source");
 
-  // ── Case 1: normalization shape ──
+  // Every case below (except the explicit no-key case) requires the key env set,
+  // since the source now skips the fetch entirely when BIRDEYE_API_KEY is absent.
+  process.env.BIRDEYE_API_KEY = TEST_KEY;
+
+  // ── Case 1: normalization shape + X-API-KEY header sent ──
   __resetSolscanCache();
+  const cap = {};
   globalThis.fetch = makeFetch({
     trending: [{ address: "MintAAA", symbol: "AAA" }],
     meteoraByMint: { MintAAA: [meteoraPool("MintAAA")] },
+    capture: cap,
   });
   let pools = await fetchSolscanTrending();
+  assert.ok(cap.headers, "Birdeye request sent headers");
+  assert.strictEqual(cap.headers["X-API-KEY"], TEST_KEY, "X-API-KEY header carries env key");
+  assert.strictEqual(cap.headers["x-chain"], "solana", "x-chain header preserved");
+  assert.strictEqual(cap.headers.accept, "application/json", "accept header preserved");
   assert.strictEqual(pools.length, 1, "expected 1 normalized pool");
   const p = pools[0];
   assert.strictEqual(p.pool_address, "pool_MintAAA", "pool_address mapped");
@@ -155,6 +168,20 @@ async function run() {
   assert.strictEqual(pools[0].pool_address, "pool_SHARED", "kept shared pool");
   ok("dedup collapses duplicate pool_address");
 
+  // ── Case 6: graceful [] when BIRDEYE_API_KEY absent (no fetch, no empty key) ──
+  __resetSolscanCache();
+  delete process.env.BIRDEYE_API_KEY;
+  const capNoKey = {};
+  globalThis.fetch = makeFetch({
+    trending: [{ address: "MintAAA", symbol: "AAA" }],
+    meteoraByMint: { MintAAA: [meteoraPool("MintAAA")] },
+    capture: capNoKey,
+  });
+  pools = await fetchSolscanTrending();
+  assert.deepStrictEqual(pools, [], "no key → []");
+  assert.strictEqual(capNoKey.headers, undefined, "Birdeye fetch skipped entirely (no request)");
+  ok("graceful [] + no fetch when BIRDEYE_API_KEY absent");
+
   console.log(`\nALL PASS — ${passed} assertions groups`);
 }
 
@@ -165,4 +192,6 @@ run()
   })
   .finally(() => {
     globalThis.fetch = realFetch;
+    if (realKey === undefined) delete process.env.BIRDEYE_API_KEY;
+    else process.env.BIRDEYE_API_KEY = realKey;
   });

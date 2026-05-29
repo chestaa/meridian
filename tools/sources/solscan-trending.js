@@ -22,9 +22,10 @@ import { findDlmmPoolForMint, numeric } from "./meteora-crossref.js";
  * Never throws (must not break the screening cycle).
  */
 
-// Public Birdeye endpoint. No API key available locally — Birdeye's public tier
-// historically responds without a key for trending_tokens; if it now requires a
-// key it returns 401/429 and we degrade to [] gracefully.
+// Birdeye trending endpoint. Requires an API key sent as the `X-API-KEY` header.
+// Key is read from process.env.BIRDEYE_API_KEY only (never hardcoded). If the env
+// var is absent we skip the fetch entirely and degrade to [] gracefully — no
+// pointless 401, no empty-key header.
 const BIRDEYE_TRENDING = "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20";
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5-minute in-memory cache
@@ -35,10 +36,20 @@ let _cache = { at: 0, pools: null };
  * @returns {Promise<Array>} raw trending token entries, or [] on any failure.
  */
 async function fetchBirdeyeTrending() {
+  const apiKey = process.env.BIRDEYE_API_KEY;
+  if (!apiKey) {
+    // No key → don't send an empty header and eat a 401. Degrade gracefully.
+    log("screening", "solscan-trending: BIRDEYE_API_KEY not set, skipping Birdeye fetch");
+    return [];
+  }
   let res;
   try {
     res = await fetch(BIRDEYE_TRENDING, {
-      headers: { accept: "application/json", "x-chain": "solana" },
+      headers: {
+        accept: "application/json",
+        "x-chain": "solana",
+        "X-API-KEY": apiKey,
+      },
     });
   } catch (err) {
     log("screening", `solscan-trending: Birdeye fetch error: ${err.message}`);
