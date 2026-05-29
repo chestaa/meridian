@@ -86,7 +86,7 @@ function getVolatilityTimeframe(sourceTimeframe) {
   return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
 }
 
-function getRawPoolScreeningRejectReason(pool, s) {
+export function getRawPoolScreeningRejectReason(pool, s) {
   const base = pool?.token_x || {};
   const quote = pool?.token_y || {};
   const binStep = numeric(pool?.dlmm_params?.bin_step);
@@ -416,18 +416,30 @@ export async function discoverPools({
             .then((r) => r.ok ? r.json() : null)
             .then((d) => {
               const t = Array.isArray(d) ? d[0] : d;
-              return { pool: p.pool, dev: t?.dev || null };
+              // Piggyback created_at fallback (no extra API call) — Meteora pool
+              // discovery sometimes returns null base_token_created_at; Jupiter
+              // assets/search carries it. Used to back-fill token_age_hours so
+              // the live 8h safety floor / age gates have data.
+              return { pool: p.pool, dev: t?.dev || null, createdAt: numeric(t?.created_at) };
             })
-            .catch(() => ({ pool: p.pool, dev: null }))
+            .catch(() => ({ pool: p.pool, dev: null, createdAt: null }))
         )
       );
       const devMap = {};
+      const createdAtMap = {};
       for (const r of devResults) {
-        if (r.status === "fulfilled") devMap[r.value.pool] = r.value.dev;
+        if (r.status === "fulfilled") {
+          devMap[r.value.pool] = r.value.dev;
+          if (r.value.createdAt != null) createdAtMap[r.value.pool] = r.value.createdAt;
+        }
       }
       pools = pools.filter((p) => {
         const dev = devMap[p.pool];
         if (dev) p.dev = dev; // enrich in-place
+        // Back-fill token_age_hours when Meteora gave us nothing
+        if (p.token_age_hours == null && createdAtMap[p.pool] != null) {
+          p.token_age_hours = Math.floor((Date.now() - createdAtMap[p.pool]) / 3_600_000);
+        }
         if (dev && isDevBlocked(dev)) {
           log("dev_blocklist", `Filtered blocked deployer (jup) ${dev.slice(0, 8)} token ${p.base?.symbol}`);
           return false;

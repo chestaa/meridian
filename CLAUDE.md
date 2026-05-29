@@ -81,6 +81,8 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | maxBundlersPct | screening | 30 |
 | maxTop10Pct | screening | 60 |
 | blockedLaunchpads | screening | [] |
+| minTokenAgeHours | screening | 24 |
+| maxTokenAgeHours | screening | 720 |
 | deployAmountSol | management | 0.5 |
 | maxDeployAmount | risk | 50 |
 | maxPositions | risk | 3 |
