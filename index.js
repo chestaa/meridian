@@ -1727,8 +1727,17 @@ async function handleExecutiveDigest() {
     try {
       const w = await getWalletBalances();
       walletSol = Number(w?.sol);
-      const solPrice = Number(w?.sol_price_usd ?? w?.solPriceUsd);
-      if (Number.isFinite(walletSol) && Number.isFinite(solPrice)) {
+      // getWalletBalances() returns LIVE values from Jupiter price v3 (via Helius):
+      //   sol_price = live USD/SOL, sol_usd = live SOL position value in USD.
+      // Prefer the pre-computed live sol_usd; fall back to sol * sol_price.
+      // Both are live — never a hardcoded/stale constant. If neither is finite
+      // (price API down) leave walletUsd null so the digest omits USD rather
+      // than printing a wrong number.
+      const solUsd = Number(w?.sol_usd);
+      const solPrice = Number(w?.sol_price);
+      if (Number.isFinite(solUsd) && solUsd > 0) {
+        walletUsd = solUsd;
+      } else if (Number.isFinite(walletSol) && Number.isFinite(solPrice) && solPrice > 0) {
         walletUsd = walletSol * solPrice;
       }
     } catch { /* non-fatal */ }
