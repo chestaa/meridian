@@ -98,6 +98,12 @@ export const config = {
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     useDiscordSignals: u.useDiscordSignals ?? false,
     discordSignalMode: u.discordSignalMode ?? "merge", // merge | only
+    useSolscanTrending: u.useSolscanTrending ?? false, // Phase D: Birdeye/Solscan trending source
+    solscanTrendingMode: u.solscanTrendingMode ?? "merge", // merge | only
+    usePumpfunGraduated: u.usePumpfunGraduated ?? false, // Phase B: pump.fun graduated-token source
+    pumpfunGraduatedMode: u.pumpfunGraduatedMode ?? "merge", // merge | only
+    pumpfunMaxGraduationAgeHours: u.pumpfunMaxGraduationAgeHours ?? 48, // only tokens graduated within this window
+    requireMultiSourceConfirm: u.requireMultiSourceConfirm ?? false, // Phase G: live hard gate — reject single-source pools (default OFF = soft bonus only)
     avoidPvpSymbols:   u.avoidPvpSymbols   ?? true, // avoid exact-symbol rivals with real active pools
     blockPvpSymbols:   u.blockPvpSymbols   ?? false, // hard-filter PVP rivals before the LLM sees them
     maxBundlePct:      u.maxBundlePct      ?? 30,  // max bundle holding % (OKX advanced-info)

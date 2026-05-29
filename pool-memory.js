@@ -114,6 +114,46 @@ export function setPoolAndTokenCooldown({ poolAddress, baseMint = null, hours = 
 // ─── Write ─────────────────────────────────────────────────────
 
 /**
+ * Phase G — multi-source cross-validation provenance.
+ * Append a signal sighting {source, ts} to the pool entry's
+ * signal_source_history array (created if absent). Additive; no migration.
+ * Called per-sighting from the screening merge block.
+ *
+ * @param {string} poolAddress
+ * @param {string} source  e.g. "meteora", "discord", "solscan"
+ */
+export function recordSignalSighting(poolAddress, source) {
+  if (!poolAddress || !source) return;
+
+  const db = load();
+
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: poolAddress.slice(0, 8),
+      base_mint: null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+      snapshots: [],
+    };
+  }
+
+  const entry = db[poolAddress];
+  if (!Array.isArray(entry.signal_source_history)) entry.signal_source_history = [];
+  entry.signal_source_history.push({ source: String(source), ts: Date.now() });
+  entry.signal_source_history = entry.signal_source_history.slice(-50);
+
+  save(db);
+  return entry.signal_source_history.length;
+}
+
+/**
  * Record a closed deploy into pool-memory.json.
  * Called automatically from recordPerformance() in lessons.js.
  *

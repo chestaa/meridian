@@ -2,9 +2,11 @@ import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
-import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
+import { isBaseMintOnCooldown, isPoolOnCooldown, recordSignalSighting } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { fetchSolscanTrending } from "./sources/solscan-trending.js";
+import { fetchPumpfunGraduated } from "./sources/pumpfun-graduated.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -55,12 +57,27 @@ export function liveOverlay() {
   return (config.dryRun === false && config.liveOverrides) ? config.liveOverrides : null;
 }
 
-function scoreCandidate(pool) {
+/**
+ * Phase G — append a signal source tag to a raw pool's signal_sources array
+ * WITHOUT overwriting existing tags. Idempotent per source. Maintains the
+ * cross_source_confirmed flag (>=2 distinct sources). Returns the pool.
+ */
+export function tagSignalSource(pool, source) {
+  if (!pool || !source) return pool;
+  if (!Array.isArray(pool.signal_sources)) pool.signal_sources = [];
+  if (!pool.signal_sources.includes(source)) pool.signal_sources.push(source);
+  pool.cross_source_confirmed = pool.signal_sources.length >= 2;
+  return pool;
+}
+
+export function scoreCandidate(pool) {
   const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
   const organic = Number(pool.organic_score || 0);
   const volume = Number(pool.volume_window || 0);
   const holders = Number(pool.holders || 0);
-  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
+  const sourceCount = Array.isArray(pool.signal_sources) ? pool.signal_sources.length : 1;
+  const multiSourceBonus = Math.max(0, sourceCount - 1) * 500;
+  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100 + multiSourceBonus;
 }
 
 function numeric(value) {
@@ -333,6 +350,13 @@ export async function discoverPools({
 
   let rawPools = Array.isArray(data.data) ? data.data : [];
 
+  // Phase G — stamp Meteora as the base source for every discovery pool.
+  for (const pool of rawPools) {
+    if (!pool?.pool_address) continue;
+    tagSignalSource(pool, "meteora");
+    recordSignalSighting(pool.pool_address, "meteora");
+  }
+
   if (config.screening.useDiscordSignals) {
     const signalCandidates = await fetchDiscordSignalCandidates().catch((error) => {
       log("screening", `Discord signal fetch failed: ${error.message}`);
@@ -355,21 +379,104 @@ export async function discoverPools({
 
     if (config.screening.discordSignalMode === "only") {
       rawPools = signalPools;
+      // Phase G — discord-only mode: discord is the sole origin source.
+      for (const pool of rawPools) {
+        if (!pool?.pool_address) continue;
+        tagSignalSource(pool, "discord");
+        recordSignalSighting(pool.pool_address, "discord");
+      }
     } else if (signalPools.length > 0) {
       const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
       for (const signalPool of signalPools) {
         if (byPool.has(signalPool.pool_address)) {
-          byPool.set(signalPool.pool_address, {
+          const merged = {
             ...byPool.get(signalPool.pool_address),
             discord_signal: true,
             discord_signal_count: signalPool.discord_signal_count,
             discord_signal_seen_count: signalPool.discord_signal_seen_count,
             discord_signal_first_seen_at: signalPool.discord_signal_first_seen_at,
             discord_signal_last_seen_at: signalPool.discord_signal_last_seen_at,
-          });
+          };
+          // Phase G — APPEND discord to existing (e.g. meteora) provenance.
+          tagSignalSource(merged, "discord");
+          byPool.set(signalPool.pool_address, merged);
         } else {
+          tagSignalSource(signalPool, "discord");
           byPool.set(signalPool.pool_address, signalPool);
         }
+        recordSignalSighting(signalPool.pool_address, "discord");
+      }
+      rawPools = Array.from(byPool.values());
+    }
+  }
+
+  // Phase D — Solscan/Birdeye trending source. Parallel to Meteora trending.
+  // Graceful: fetchSolscanTrending never throws (returns [] on API failure).
+  if (config.screening.useSolscanTrending) {
+    const solscanPools = (await fetchSolscanTrending()) || [];
+    if (config.screening.solscanTrendingMode === "only") {
+      rawPools = solscanPools;
+      // Phase G — solscan-only mode: solscan is the sole origin source.
+      for (const pool of rawPools) {
+        if (!pool?.pool_address) continue;
+        tagSignalSource(pool, "solscan");
+        recordSignalSighting(pool.pool_address, "solscan");
+      }
+    } else if (solscanPools.length > 0) {
+      const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
+      for (const solscanPool of solscanPools) {
+        if (!solscanPool?.pool_address) continue;
+        if (byPool.has(solscanPool.pool_address)) {
+          // Existing Meteora pool wins on metrics; APPEND solscan provenance.
+          // signal_sources[] (via tagSignalSource) is authoritative; do NOT
+          // overwrite the scalar signal_source — Meteora origin is preserved.
+          const merged = {
+            ...byPool.get(solscanPool.pool_address),
+          };
+          tagSignalSource(merged, "solscan");
+          byPool.set(solscanPool.pool_address, merged);
+        } else {
+          tagSignalSource(solscanPool, "solscan");
+          byPool.set(solscanPool.pool_address, solscanPool);
+        }
+        recordSignalSighting(solscanPool.pool_address, "solscan");
+      }
+      rawPools = Array.from(byPool.values());
+    }
+  }
+
+  // Phase B — Pump.fun graduated-token source. Parallel to Meteora trending.
+  // Graceful: fetchPumpfunGraduated never throws (returns [] on API failure).
+  if (config.screening.usePumpfunGraduated) {
+    const pumpfunPools = (await fetchPumpfunGraduated()) || [];
+    if (config.screening.pumpfunGraduatedMode === "only") {
+      rawPools = pumpfunPools;
+      // Phase G — pumpfun-only mode: pumpfun is the sole origin source.
+      for (const pool of rawPools) {
+        if (!pool?.pool_address) continue;
+        tagSignalSource(pool, "pumpfun");
+        recordSignalSighting(pool.pool_address, "pumpfun");
+      }
+    } else if (pumpfunPools.length > 0) {
+      const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
+      for (const pumpfunPool of pumpfunPools) {
+        if (!pumpfunPool?.pool_address) continue;
+        if (byPool.has(pumpfunPool.pool_address)) {
+          // Existing pool wins on metrics; APPEND pumpfun provenance + grad stamp.
+          const existing = byPool.get(pumpfunPool.pool_address);
+          const merged = {
+            ...existing,
+            pumpfun_graduated_at: existing.pumpfun_graduated_at ?? pumpfunPool.pumpfun_graduated_at,
+            pumpfun_graduation_age_hours:
+              existing.pumpfun_graduation_age_hours ?? pumpfunPool.pumpfun_graduation_age_hours,
+          };
+          tagSignalSource(merged, "pumpfun");
+          byPool.set(pumpfunPool.pool_address, merged);
+        } else {
+          tagSignalSource(pumpfunPool, "pumpfun");
+          byPool.set(pumpfunPool.pool_address, pumpfunPool);
+        }
+        recordSignalSighting(pumpfunPool.pool_address, "pumpfun");
       }
       rawPools = Array.from(byPool.values());
     }
@@ -769,6 +876,24 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     }
   }
 
+  // Phase G — multi-source cross-validation HARD GATE (live-only).
+  // Default OFF (requireMultiSourceConfirm=false) → soft score bonus only.
+  // When ON + live (DRY_RUN false): reject pools confirmed by < 2 sources.
+  if (config.dryRun === false && config.screening.requireMultiSourceConfirm && eligible.length > 0) {
+    const beforeMS = eligible.length;
+    const kept = eligible.filter((p) => {
+      const sourceCount = Array.isArray(p.signal_sources) ? p.signal_sources.length : 1;
+      if (sourceCount < 2) {
+        log("screening", `Multi-source gate: dropped ${p.name} — single_source_in_live (${(p.signal_sources || []).join(",") || "meteora"})`);
+        pushFilteredReason(filteredOut, p, "single_source_unconfirmed_in_live");
+        return false;
+      }
+      return true;
+    });
+    eligible.splice(0, eligible.length, ...kept);
+    if (eligible.length < beforeMS) log("screening", `Multi-source gate removed ${beforeMS - eligible.length} single-source pool(s)`);
+  }
+
   if (config.indicators.enabled && eligible.length > 0) {
     const confirmations = await Promise.all(
       eligible.map(async (pool) => {
@@ -879,6 +1004,10 @@ function condensePool(p) {
     discord_signal_count: p.discord_signal_count || 0,
     discord_signal_seen_count: p.discord_signal_seen_count || 0,
     discord_signal_last_seen_at: p.discord_signal_last_seen_at || null,
+
+    // Phase G — multi-source cross-validation provenance
+    signal_sources: Array.isArray(p.signal_sources) ? p.signal_sources.slice() : ["meteora"],
+    cross_source_confirmed: Boolean(p.cross_source_confirmed),
 
     // Price action
     price: p.pool_price,
