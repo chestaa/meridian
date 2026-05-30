@@ -44,6 +44,7 @@ import { judgeCandidates, formatOrionVerdicts } from "./agents/orion.js";
 import { formatDeployReport, formatNoDeployReport, andromedaEnabled } from "./agents/andromeda.js";
 import { deployFromOrionVerdict, vegaDeterministicDeployEnabled } from "./agents/vega.js";
 import { runDeterministicManagement, managerDeterministicEnabled } from "./agents/manager.js";
+import { rebalanceOnOor } from "./agents/rebalance.js";
 import { buildDigest, formatExecutiveDigest, gatherDigestData } from "./digest.js";
 import { execSync } from "child_process";
 import fs from "fs";
@@ -327,13 +328,50 @@ export async function runManagementCycle({ silent = false } = {}) {
           }
           continue; // partial does not end the position; keep monitoring
         }
-        // Vega Item 9 — REBALANCE_OOR is gated OFF by default. If it ever fires
-        // (operator opted in) and live re-center is not yet wired, fail-safe to
-        // a legacy hard close so the OOR position is NEVER left unmanaged.
+        // Vega Item 9 — REBALANCE_OOR (gated OFF by default). When the operator
+        // has opted in (flag on, organic >= threshold, under maxRebalances), a
+        // high-organic OOR position is RE-CENTERED instead of hard-closed:
+        // pull 100% + re-deploy same/less capital on the current active bin so
+        // it keeps earning fees. Executed inline via agents/rebalance.js, which
+        // composes the audited close_position + deploy_position entrypoints
+        // (hardcap + circuit breaker enforced unchanged).
+        //
+        // Fail-safe: rebalanceOnOor NEVER leaves a position open + unmanaged.
+        //   - "rebalanced"      → new centered position is live; nothing to do.
+        //   - "closed_*"        → position already closed (capital safe).
+        //   - "closed_error" w/ position still open (pre-close failure) → push
+        //     into exitMap so the existing close path hard-closes it this cycle.
         if (exit.action === "REBALANCE_OOR") {
-          log("state", `REBALANCE_OOR signalled for ${p.pair} but live re-center is unimplemented — failing safe to hard close. ${exit.reason}`);
-          exitMap.set(p.position, `OOR (rebalance unimplemented, hard close fallback): ${exit.reason}`);
-          continue;
+          try {
+            const rb = await rebalanceOnOor({
+              position: p,
+              exit,
+              mgmtConfig: config.management,
+              strategyConfig: config.strategy,
+            });
+            if (rb?.outcome === "rebalanced") {
+              log("state", `Re-centered ${p.pair}: ${exit.reason} → new ${String(rb.new_position).slice(0, 8)} @ bin ${rb.active_bin}, ${rb.amount_sol} SOL (rebalance #${rb.rebalance_count})`);
+              continue; // position re-centered + live; not a close
+            }
+            if (rb?.redeployed === false && rb?.outcome === "closed_error" && rb?.error) {
+              // Pre-close failure — position may still be open. Guarantee it is
+              // managed this cycle by routing through the hard-close path.
+              log("state", `REBALANCE_OOR for ${p.pair} could not execute (${rb.error}) — hard-closing to keep position managed.`);
+              exitMap.set(p.position, `OOR (re-center failed, hard close fallback): ${exit.reason}`);
+              continue;
+            }
+            // Any other "closed_*" outcome → position already closed by the
+            // orchestrator (friction skip or post-close fallback). Done.
+            log("state", `REBALANCE_OOR for ${p.pair} resolved as ${rb?.outcome} (capital safe, position closed). ${rb?.reason || ""}`);
+            continue;
+          } catch (e) {
+            // Defensive: orchestrator should never throw, but if it does, fall
+            // back to the legacy hard close so the OOR position is never left
+            // unmanaged.
+            log("cron_error", `rebalanceOnOor threw for ${p.pair}: ${e.message} — failing safe to hard close.`);
+            exitMap.set(p.position, `OOR (re-center threw, hard close fallback): ${exit.reason}`);
+            continue;
+          }
         }
         exitMap.set(p.position, exit.reason);
         log("state", `Exit alert for ${p.pair}: ${exit.reason}`);

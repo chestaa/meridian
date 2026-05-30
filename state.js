@@ -338,6 +338,32 @@ export function markPartialTpDone(position_address) {
 }
 
 /**
+ * Vega Item 9 — record a successful re-center (rebalance-on-OOR).
+ * Increments rebalance_count, clears the OOR timer (the position just
+ * re-centered on the current active bin, so it is in-range again), and
+ * appends a note. Returns the NEW rebalance_count, or null if the position
+ * is missing/closed (caller should treat that as "do not proceed").
+ */
+export function recordRebalance(position_address, detail = {}) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return null;
+  pos.rebalance_count = Number(pos.rebalance_count ?? 0) + 1;
+  pos.out_of_range_since = null; // re-centered → back in range
+  pos.notes = Array.isArray(pos.notes) ? pos.notes : [];
+  const at = new Date().toISOString();
+  const bits = [];
+  if (detail.new_active_bin != null) bits.push(`bin ${detail.new_active_bin}`);
+  if (detail.amount_sol != null) bits.push(`${detail.amount_sol} SOL`);
+  if (detail.new_position) bits.push(`new ${String(detail.new_position).slice(0, 8)}`);
+  pos.notes.push(`Re-centered (#${pos.rebalance_count}) at ${at}${bits.length ? ` — ${bits.join(", ")}` : ""}`);
+  pushEvent(state, { action: "rebalance", position: position_address, pool_name: pos.pool_name || pos.pool, count: pos.rebalance_count });
+  save(state);
+  log("state", `Position ${position_address} re-centered — rebalance_count=${pos.rebalance_count}`);
+  return pos.rebalance_count;
+}
+
+/**
  * Get a single tracked position.
  */
 export function getTrackedPosition(position_address) {
@@ -509,20 +535,39 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
     if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
       // Vega Item 9 — Rebalance-on-OOR for high-organic tokens. DEFAULT OFF.
-      // When enabled AND organic >= threshold, signal REBALANCE_OOR (re-center,
-      // keep earning) instead of hard close. NOTE: live re-center execution is
-      // NOT wired yet (needs more design — extra TXs, slippage, IL realization).
-      // Flag default false → this branch is dead and OOR hard-closes as today.
+      // When enabled AND organic >= threshold AND under the maxRebalances churn
+      // cap, signal REBALANCE_OOR (re-center on the current active bin, keep
+      // earning fees) instead of a hard close. Live execution lives in
+      // agents/rebalance.js, dispatched from index.js#runManagementCycle.
+      //
+      // Gates (ALL must hold, else fall through to legacy hard close):
+      //   - flag rebalanceOnOorEnabled === true (Vega gates live activation)
+      //   - organic >= rebalanceOnOorMinOrganic (high-organic only — these are
+      //     the tokens worth keeping fee exposure on)
+      //   - rebalance_count < maxRebalances (anti-churn cap; once hit, the
+      //     position has re-centered too many times → hard close instead)
+      //
+      // The friction guard (fees earned vs re-center cost) is enforced at
+      // execution time in agents/rebalance.js, where live fee figures exist.
+      // We do NOT duplicate it here — this function is pure and has no wallet.
       const organic = Number(pos.organic_score);
+      const rebalanceCount = Number(pos.rebalance_count ?? 0);
+      const maxRebalances = Number(mgmtConfig.maxRebalances ?? 3);
       if (
         mgmtConfig.rebalanceOnOorEnabled === true &&
         Number.isFinite(organic) &&
-        organic >= (mgmtConfig.rebalanceOnOorMinOrganic ?? 80)
+        organic >= (mgmtConfig.rebalanceOnOorMinOrganic ?? 80) &&
+        Number.isFinite(rebalanceCount) &&
+        Number.isFinite(maxRebalances) &&
+        rebalanceCount < maxRebalances
       ) {
         return {
           action: "REBALANCE_OOR",
-          reason: `OOR ${minutesOOR}m (limit ${mgmtConfig.outOfRangeWaitMinutes}m) but organic ${organic} >= ${mgmtConfig.rebalanceOnOorMinOrganic ?? 80} — rebalance candidate (execution pending design)`,
-          needs_design: true,
+          reason: `OOR ${minutesOOR}m (limit ${mgmtConfig.outOfRangeWaitMinutes}m) but organic ${organic} >= ${mgmtConfig.rebalanceOnOorMinOrganic ?? 80} and rebalance_count ${rebalanceCount} < ${maxRebalances} — re-center candidate`,
+          organic_score: organic,
+          rebalance_count: rebalanceCount,
+          max_rebalances: maxRebalances,
+          minutes_out_of_range: minutesOOR,
         };
       }
       return {

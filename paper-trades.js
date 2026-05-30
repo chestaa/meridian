@@ -136,6 +136,7 @@ export function recordPaperDeploy(entry) {
     entry_volume: num(entry.entry_volume),
     entry_tvl: num(entry.entry_tvl),
     entry_volatility: num(entry.entry_volatility),
+    entry_organic_score: num(entry.entry_organic_score ?? entry.organic_score),
     entry_age_hours: num(entry.entry_age_hours),
     entry_top10_pct: num(entry.entry_top10_pct),
     entry_bot_pct: num(entry.entry_bot_pct),
@@ -160,6 +161,12 @@ export function recordPaperDeploy(entry) {
     partial_tp_done: false,
     partial_tp_at: null,
     original_amount_sol: Number(entry.amount_sol || 0),
+    // Vega Item 9 — paper mirror of rebalance-on-OOR. When the position goes
+    // OOR past the limit AND is high-organic AND under maxRebalances, the paper
+    // model RE-CENTERS (reset the OOR timer, bump rebalance_count, keep the
+    // trade open) instead of closing — mirroring the live re-center keeping fee
+    // exposure. Once the cap is hit, OOR closes as today. Default flag OFF.
+    rebalance_count: 0,
     notes: ["price_proxy_only"],
   };
   data.trades.push(trade);
@@ -357,6 +364,28 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
       const minutesOOR = Math.floor((Date.now() - new Date(trade.out_of_range_since).getTime()) / 60000);
       const limit = mgmt.outOfRangeWaitMinutes ?? 30;
       if (minutesOOR >= limit) {
+        // Vega Item 9 — paper re-center mirror. High-organic + under cap +
+        // flag on → re-center (NOT a close): reset OOR timer, bump count, keep
+        // running. Mirrors live agents/rebalance.js keeping fee exposure on a
+        // token that may re-enter range. Once maxRebalances is hit, fall
+        // through to OUT_OF_RANGE (hard close). Flag default OFF → unchanged.
+        const organic = Number(trade.entry_organic_score);
+        const count = Number(trade.rebalance_count ?? 0);
+        const maxRebalances = Number(mgmt.maxRebalances ?? 3);
+        if (
+          mgmt.rebalanceOnOorEnabled === true &&
+          Number.isFinite(organic) &&
+          organic >= (mgmt.rebalanceOnOorMinOrganic ?? 80) &&
+          Number.isFinite(count) &&
+          count < maxRebalances
+        ) {
+          trade.rebalance_count = count + 1;
+          trade.out_of_range_since = null; // re-centered → back in range
+          trade.notes = Array.isArray(trade.notes) ? trade.notes : [];
+          trade.notes.push(`paper_rebalance: re-centered (#${trade.rebalance_count}) after OOR ${minutesOOR}m at price ${cur} — organic ${organic} >= ${mgmt.rebalanceOnOorMinOrganic ?? 80}`);
+          log("paper", `Paper re-center ${trade.pool_name}: rebalance #${trade.rebalance_count} after OOR ${minutesOOR}m`);
+          return null; // no exit — remainder keeps running
+        }
         return { action: "OUT_OF_RANGE", reason: `Out of range for ${minutesOOR}m (limit: ${limit}m)` };
       }
     }

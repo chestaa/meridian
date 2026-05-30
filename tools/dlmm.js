@@ -112,6 +112,46 @@ export function __resetTests() {
   for (const key of Object.keys(_testHooks)) _testHooks[key] = null;
 }
 
+// ─── Vega Item 9 — Rebalance-on-OOR friction estimate (PURE, no TX) ──────────
+// A re-center = remove 100% liquidity (1 tx) + re-deploy (1 tx) + the auto-swap
+// of base→SOL that close_position performs (1 tx). Each tx burns priority/base
+// fees, and the swap eats slippage. If accumulated fees earned < this friction,
+// re-centering churns the wallet for a net loss — we must NOT do it. This is a
+// conservative SOL-denominated estimate; callers compare it to fees actually
+// claimed before deciding to re-center vs hard close.
+//
+// Components (deliberately pessimistic — over-estimating friction biases toward
+// the safer "don't churn" outcome):
+//   - gasPerTx: base + priority fee per Solana tx (default 0.00015 SOL)
+//   - txCount: remove + deploy + swap = 3
+//   - swapSlippage: fraction of the re-deployed capital lost crossing the AMM
+//     on the base→SOL auto-swap (default 1% of amountSol)
+// Returns a positive SOL number. Never throws — clamps bad input to a safe
+// non-zero floor so a NaN can never read as "free to rebalance".
+export function estimateRebalanceFrictionSol({
+  amountSol,
+  gasPerTxSol = 0.00015,
+  txCount = 3,
+  swapSlippagePct = 1,
+} = {}) {
+  const amt = Number(amountSol);
+  const gas = Number(gasPerTxSol);
+  const txs = Number(txCount);
+  const slipPct = Number(swapSlippagePct);
+
+  const safeGas = Number.isFinite(gas) && gas >= 0 ? gas : 0.00015;
+  const safeTxs = Number.isFinite(txs) && txs > 0 ? txs : 3;
+  const gasFriction = safeGas * safeTxs;
+
+  const safeAmt = Number.isFinite(amt) && amt > 0 ? amt : 0;
+  const safeSlip = Number.isFinite(slipPct) && slipPct >= 0 ? slipPct : 1;
+  const slipFriction = safeAmt * (safeSlip / 100);
+
+  // Floor at gas-only friction so the guard is never satisfied "for free".
+  const friction = gasFriction + slipFriction;
+  return Number(friction.toFixed(9));
+}
+
 function shouldUseLpAgentRelay() {
   return !!config.api.lpAgentRelayEnabled;
 }

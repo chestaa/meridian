@@ -199,6 +199,11 @@ export const config = {
     // flag pending more design. When OFF, OOR → legacy hard close (no change).
     rebalanceOnOorEnabled: u.rebalanceOnOorEnabled ?? false,
     rebalanceOnOorMinOrganic: u.rebalanceOnOorMinOrganic ?? 80,
+    // Vega Item 9 — anti-churn cap. A position may re-center on OOR at most
+    // maxRebalances times; once hit, OOR → hard close (state.js falls through).
+    // Each re-center is 3 tx + slippage, so unbounded churn would bleed the
+    // wallet. Default 3.
+    maxRebalances:         u.maxRebalances         ?? 3,
     // Andromeda PR-A — max-drawdown-recovery exit (paper-trades.js).
     // ARM when max_drawdown (peak−trough) >= armPct; FIRE when current pnl
     // recovers deltaPct above trough. Distinct from trailing TP, which gates
@@ -214,6 +219,30 @@ export const config = {
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
+  },
+
+  // ─── DAMM v2 Idle-Reserve Parking (item 8, BRAND NEW — flag OFF) ──
+  // Vega owns this money path. Park ONLY idle SOL (above gasReserve + active-LP
+  // headroom) into a Meteora DAMM v2 fee-compounding pool to earn yield on
+  // un-deployed capital. SEPARATE from DLMM LP — does not touch deploy_position,
+  // close_position, swap_token, maxDeployAmount, maxPositions, or DRY_RUN.
+  //
+  // STRICT defaults (brand-new = paranoid):
+  //   enabled       — DEFAULT FALSE. Live activation is VETO'd until SDK
+  //                   installed + Bro explicit gate. Flag flip alone is NOT
+  //                   sufficient; the module also hard-requires the SDK present
+  //                   and DRY_RUN===false at call time.
+  //   maxParkSol    — HARDCAP. The module NEVER parks more than this in one call
+  //                   nor leaves more than this parked. Clamp, never throw-to-park.
+  //   poolAddress   — curated SOL-stable DAMM v2 pool. null = no pool = no park
+  //                   (fail-safe: unset pool means parking is impossible).
+  //   minIdleToPark — don't bother parking dust; require at least this much idle
+  //                   SOL above all reserves before a park is attempted.
+  damm: {
+    enabled:        u.dammV2Enabled        ?? false,
+    maxParkSol:     u.dammV2MaxParkSol      ?? 0.3,
+    poolAddress:    u.dammV2PoolAddress     ?? null,
+    minIdleToPark:  u.dammV2MinIdleToPark   ?? 0.1,
   },
 
   // ─── Strategy Mapping ───────────────────
