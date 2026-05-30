@@ -87,6 +87,30 @@ function getWallet() {
   return getSigningWallet();
 }
 
+// ─── Test seam (production-inert) ──────────────────────────────
+// ESM exports are immutable bindings, so tests cannot monkey-patch
+// getPool / sendAndConfirmTransaction directly. These overridable hooks
+// default to the real implementations and are ONLY populated by
+// __setForTests. They are never touched in production (Vega Item 2B
+// partial-TP path validation — see scripts/validate-partial-tp.js).
+const _testHooks = {
+  getPool: null,
+  getWallet: null,
+  getMyPositions: null,
+  sendAndConfirmTransaction: null,
+  lookupPoolForPosition: null,
+};
+
+export function __setForTests(overrides = {}) {
+  for (const key of Object.keys(_testHooks)) {
+    if (key in overrides) _testHooks[key] = overrides[key];
+  }
+}
+
+export function __resetTests() {
+  for (const key of Object.keys(_testHooks)) _testHooks[key] = null;
+}
+
 function shouldUseLpAgentRelay() {
   return !!config.api.lpAgentRelayEnabled;
 }
@@ -912,6 +936,48 @@ async function fetchLpAgentOpenPositions(walletAddress) {
   }
 }
 
+// ─── Live velocity stats (Vega Item 6 wiring) ──────────────────
+// The velocity-drop exit (state.js#updatePnlAndCheckExits) reads
+// price_change_1h_pct + net_buyers_1h off the position object. Paper trades
+// get these from token enrichment (token.js stats1h). Live positions previously
+// LACKED them, so the velocity exit could NEVER fire live (VEGA VETO). This
+// fetches the SAME Jupiter source paper uses, keyed by base mint, with a short
+// TTL cache so the management cron doesn't hammer the API.
+const _velocityStatsCache = new Map(); // mint → { at, value }
+const VELOCITY_STATS_TTL = 60_000; // 1 min — fresh enough for a 1h-window signal
+
+export async function fetchVelocityStatsForMint(baseMint) {
+  if (!baseMint) return { price_change_1h_pct: null, net_buyers_1h: null };
+  const key = String(baseMint);
+  const cached = _velocityStatsCache.get(key);
+  if (cached && Date.now() - cached.at < VELOCITY_STATS_TTL) return cached.value;
+
+  const empty = { price_change_1h_pct: null, net_buyers_1h: null };
+  try {
+    const res = await fetch(`https://datapi.jup.ag/v1/assets/search?query=${encodeURIComponent(key)}`);
+    if (!res.ok) {
+      log("velocity_stats", `HTTP ${res.status} for mint ${key.slice(0, 8)}`);
+      _velocityStatsCache.set(key, { at: Date.now(), value: empty });
+      return empty;
+    }
+    const data = await res.json();
+    const tokens = Array.isArray(data) ? data : [data];
+    // Prefer an exact mint match; fall back to the first result.
+    const t = tokens.find((x) => x?.id === key) || tokens[0];
+    const s = t?.stats1h;
+    const value = {
+      price_change_1h_pct: s?.priceChange != null && Number.isFinite(Number(s.priceChange)) ? Number(s.priceChange) : null,
+      net_buyers_1h: s?.numNetBuyers != null && Number.isFinite(Number(s.numNetBuyers)) ? Number(s.numNetBuyers) : null,
+    };
+    _velocityStatsCache.set(key, { at: Date.now(), value });
+    return value;
+  } catch (e) {
+    log("velocity_stats", `Fetch error for mint ${key.slice(0, 8)}: ${e.message}`);
+    _velocityStatsCache.set(key, { at: Date.now(), value: empty });
+    return empty;
+  }
+}
+
 // ─── Fetch DLMM PnL API for all positions in a pool ────────────
 async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
@@ -1134,6 +1200,16 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
     pools.forEach((pool, i) => { binDataByPool[pool.poolAddress] = pnlMaps[i]; });
     const lpAgentByPosition = await fetchLpAgentOpenPositions(walletAddress);
 
+    // Vega Item 6 — fetch 1h velocity stats per base mint (parallel, cached) so
+    // the live position object carries price_change_1h_pct + net_buyers_1h. The
+    // velocity-drop exit reads these; without them it can never fire live.
+    const velocityByMint = {};
+    if (config.management.velocityExitEnabled !== false) {
+      const uniqueMints = [...new Set(pools.map((pool) => pool.tokenXMint).filter(Boolean))];
+      const velStats = await Promise.all(uniqueMints.map((mint) => fetchVelocityStatsForMint(mint)));
+      uniqueMints.forEach((mint, i) => { velocityByMint[mint] = velStats[i]; });
+    }
+
     const positions = [];
     for (const pool of pools) {
       for (const positionAddress of (pool.listPositions || [])) {
@@ -1260,6 +1336,10 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
           age_minutes:        binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState,
           minutes_out_of_range: minutesOutOfRange(positionAddress),
           instruction:        tracked?.instruction ?? null,
+          // Vega Item 6 — 1h velocity signal (same Jupiter source as paper).
+          // null when stats unavailable → velocity exit safely no-ops.
+          price_change_1h_pct: velocityByMint[pool.tokenXMint]?.price_change_1h_pct ?? null,
+          net_buyers_1h:       velocityByMint[pool.tokenXMint]?.net_buyers_1h ?? null,
         });
       }
     }
@@ -1957,12 +2037,12 @@ export async function partialClosePosition({ position_address, pct, reason }) {
 
   try {
     log("partial_close", `Partial close ${pctNum}% (bps=${bps}) for ${position_address}: ${reason || "scale-out"}`);
-    const wallet = getWallet();
-    const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
+    const wallet = (_testHooks.getWallet || getWallet)();
+    const poolAddress = await (_testHooks.lookupPoolForPosition || lookupPoolForPosition)(position_address, wallet.publicKey.toString());
 
     // Fresh pool load so SDK reads current bin liquidity state.
     poolCache.delete(poolAddress.toString());
-    const pool = await getPool(poolAddress);
+    const pool = await (_testHooks.getPool || getPool)(poolAddress);
     const positionPubKey = new PublicKey(position_address);
 
     // Determine bin range + verify there is liquidity to pull.
@@ -1991,9 +2071,10 @@ export async function partialClosePosition({ position_address, pct, reason }) {
       shouldClaimAndClose: false, // CRITICAL — keep the account alive
     });
 
+    const sendTx = _testHooks.sendAndConfirmTransaction || sendAndConfirmTransaction;
     const txHashes = [];
     for (const tx of Array.isArray(partialTx) ? partialTx : [partialTx]) {
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      const txHash = await sendTx(getConnection(), tx, [wallet]);
       txHashes.push(txHash);
     }
     if (txHashes.length === 0) {
@@ -2006,7 +2087,7 @@ export async function partialClosePosition({ position_address, pct, reason }) {
     // Verify the position is STILL OPEN (we must NOT have closed the account).
     let stillOpen = false;
     try {
-      const refreshed = await getMyPositions({ force: true, silent: true });
+      const refreshed = await (_testHooks.getMyPositions || getMyPositions)({ force: true, silent: true });
       stillOpen = Boolean(refreshed?.positions?.some((p) => p.position === position_address));
     } catch (e) {
       log("partial_close_warn", `Post-partial verification failed: ${e.message}`);
