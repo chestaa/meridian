@@ -7,6 +7,7 @@ import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { fetchSolscanTrending } from "./sources/solscan-trending.js";
 import { fetchPumpfunGraduated } from "./sources/pumpfun-graduated.js";
+import { fetchDiscordMeteoraIdnRanked } from "./sources/discord-meteoraidn.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -501,24 +502,52 @@ export async function discoverPools({
   }
 
   if (config.screening.useDiscordSignals) {
-    const signalCandidates = await fetchDiscordSignalCandidates().catch((error) => {
-      log("screening", `Discord signal fetch failed: ${error.message}`);
-      return [];
-    });
-    const signalPools = signalCandidates
-      .map((candidate) => {
-        const discoveryPool = candidate.discovery_pool;
-        if (!discoveryPool?.pool_address) return null;
-        return {
-          ...discoveryPool,
-          discord_signal: true,
-          discord_signal_count: candidate.source_count || 1,
-          discord_signal_seen_count: candidate.seen_count || 1,
-          discord_signal_first_seen_at: candidate.first_seen_at || null,
-          discord_signal_last_seen_at: candidate.last_seen_at || null,
-        };
-      })
-      .filter(Boolean);
+    // Fix #3 — Discord phantom source. The legacy HiveMind path
+    // (api.agentmeridian.xyz/signals/discord/candidates) returns 404 → [] →
+    // the flag was a no-op. `discordSource` switches between the REAL local
+    // MeteoraIDN ranked-digest source (default) and the dead HiveMind path.
+    const discordSource = config.screening.discordSource ?? "meteoraidn_ranked";
+    let signalPools = [];
+
+    if (discordSource === "meteoraidn_ranked") {
+      // REAL source: parse MeteoraIDN #dlmm-multiday-opps / #dlmm-exotic-opps
+      // ranked digests (Lincoln Score / FDV / TVL / bin step / base fee). Metlex
+      // firehose is deliberately excluded inside the module. Never throws.
+      signalPools = (await fetchDiscordMeteoraIdnRanked()) || [];
+    } else {
+      // Legacy HiveMind path (currently 404 → phantom). Kept behind the flag for
+      // when/if the endpoint returns. Graceful: failure → [].
+      const signalCandidates = await fetchDiscordSignalCandidates().catch((error) => {
+        log("screening", `Discord signal fetch failed: ${error.message}`);
+        return [];
+      });
+      signalPools = signalCandidates
+        .map((candidate) => {
+          const discoveryPool = candidate.discovery_pool;
+          if (!discoveryPool?.pool_address) return null;
+          return {
+            ...discoveryPool,
+            discord_signal: true,
+            discord_signal_count: candidate.source_count || 1,
+            discord_signal_seen_count: candidate.seen_count || 1,
+            discord_signal_first_seen_at: candidate.first_seen_at || null,
+            discord_signal_last_seen_at: candidate.last_seen_at || null,
+          };
+        })
+        .filter(Boolean);
+    }
+
+    // Source-agnostic copier: lift only the discord_* surface fields a signal
+    // pool carries onto a merged Meteora pool. Tolerates both HiveMind shape
+    // (discord_signal_count/seen_count/...) and MeteoraIDN ranked shape
+    // (discord_source/discord_lincoln_score/...). Undefined fields are skipped.
+    const liftDiscordFields = (signalPool) => {
+      const lifted = { discord_signal: true };
+      for (const [k, v] of Object.entries(signalPool)) {
+        if (k.startsWith("discord_") && v !== undefined) lifted[k] = v;
+      }
+      return lifted;
+    };
 
     if (config.screening.discordSignalMode === "only") {
       rawPools = signalPools;
@@ -531,14 +560,11 @@ export async function discoverPools({
     } else if (signalPools.length > 0) {
       const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
       for (const signalPool of signalPools) {
+        if (!signalPool?.pool_address) continue;
         if (byPool.has(signalPool.pool_address)) {
           const merged = {
             ...byPool.get(signalPool.pool_address),
-            discord_signal: true,
-            discord_signal_count: signalPool.discord_signal_count,
-            discord_signal_seen_count: signalPool.discord_signal_seen_count,
-            discord_signal_first_seen_at: signalPool.discord_signal_first_seen_at,
-            discord_signal_last_seen_at: signalPool.discord_signal_last_seen_at,
+            ...liftDiscordFields(signalPool),
           };
           // Phase G — APPEND discord to existing (e.g. meteora) provenance.
           tagSignalSource(merged, "discord");

@@ -1,0 +1,20 @@
+[Unit]
+Description=Meridian Intel Digest (Orion — auto-learn, ADVISORY ONLY, no money/config touch)
+After=network-online.target
+Wants=network-online.target
+OnFailure=meridian-notify@%n.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/meridian
+# Reads intel/{x,telegram,discord} crawls, asks DeepSeek V4 Flash for advisory
+# suggestions, writes ONLY to intel/digests/, notifies Telegram top-3.
+# This unit NEVER edits config/state/user-config or touches money paths.
+ExecStart=/usr/local/bin/node /opt/meridian/scripts/intel-digest.js
+Environment=NODE_ENV=production
+EnvironmentFile=-/opt/meridian/.env
+TimeoutStartSec=120s
+
+[Install]
+WantedBy=multi-user.target

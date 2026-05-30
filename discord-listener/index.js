@@ -27,6 +27,37 @@ import { runPreChecks } from "./pre-checks.js";
 const SIGNALS_FILE = path.join(ROOT, "discord-signals.json");
 const SIGNAL_INBOX_DIR = path.join(ROOT, "signals", "inbox");
 
+// Fix #3 — MeteoraIDN ranked-digest mirror. The screening source
+// tools/sources/discord-meteoraidn.js reads this file (DISCORD_RANKED_FEED).
+// We mirror the raw curated digest text here so the screener can parse pool
+// addresses + Lincoln Score / FDV / TVL / bin step / base fee out-of-band.
+// READ-ONLY capture: we never reply/react. Metlex firehose is NOT mirrored here.
+const RANKED_DIGEST_FILE = process.env.DISCORD_RANKED_FEED || path.join(ROOT, "discord-ranked-digest.json");
+const RANKED_CHANNEL_RE = /multiday-opps|exotic-opps/i;
+const RANKED_DIGEST_KEEP = 60; // newest N digest messages
+
+function mirrorRankedDigest(message, fullText) {
+  try {
+    let records = [];
+    if (fs.existsSync(RANKED_DIGEST_FILE)) {
+      try { records = JSON.parse(fs.readFileSync(RANKED_DIGEST_FILE, "utf8")); } catch { records = []; }
+      if (!Array.isArray(records)) records = Array.isArray(records?.records) ? records.records : [];
+    }
+    records.unshift({
+      source: `${message.guild?.name || "discord"}#${message.channel?.name || "unknown"}`,
+      channel: message.channel?.name || "unknown",
+      author: message.author?.username || "unknown",
+      text: fullText,
+      timestamp: message.createdAt ? message.createdAt.toISOString() : new Date().toISOString(),
+      msg_id: message.id,
+    });
+    fs.writeFileSync(RANKED_DIGEST_FILE, JSON.stringify(records.slice(0, RANKED_DIGEST_KEEP), null, 2));
+    console.log(`  [ranked-digest] mirrored #${message.channel?.name} → ${path.basename(RANKED_DIGEST_FILE)}`);
+  } catch (err) {
+    console.error(`  [ranked-digest write failed] ${err.message}`);
+  }
+}
+
 function sanitizeSourceName(name) {
   return String(name || "discord")
     .toLowerCase()
@@ -149,12 +180,21 @@ client.on("messageCreate", async (message) => {
   if (!CHANNEL_IDS.includes(message.channelId)) return;
   // Skip own messages
   if (message.author?.id === client.user?.id) return;
-  // Only process messages from Metlex Pool Bot
-  if (message.author?.username !== "Metlex Pool Bot") return;
 
   const content = message.content || "";
   const embeds = message.embeds?.map(e => `${e.title || ""} ${e.description || ""}`).join(" ") || "";
   const fullText = `${content} ${embeds}`;
+
+  // Fix #3 — mirror MeteoraIDN ranked-digest channels for the screening source.
+  // This runs for ANY author in those channels (the digest is posted by the
+  // MeteoraIDN bot) and is independent of the Metlex address pipeline below.
+  if (RANKED_CHANNEL_RE.test(message.channel?.name || "")) {
+    mirrorRankedDigest(message, fullText);
+    return; // ranked digest is not an address-firehose message; nothing more to do
+  }
+
+  // Only process messages from Metlex Pool Bot for the address pipeline
+  if (message.author?.username !== "Metlex Pool Bot") return;
 
   const matches = [...fullText.matchAll(SOL_ADDR_RE)].map(m => m[0]);
   const unique = [...new Set(matches)].filter(isLikelySolanaAddress);

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Meridian intel digest once daily (06:00 UTC) — cost-capped, 1 run/day
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 UTC
+AccuracySec=5min
+Unit=meridian-intel-digest.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

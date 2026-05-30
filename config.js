@@ -111,6 +111,7 @@ export const config = {
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     useDiscordSignals: u.useDiscordSignals ?? false,
     discordSignalMode: u.discordSignalMode ?? "merge", // merge | only
+    discordSource: u.discordSource ?? "meteoraidn_ranked", // meteoraidn_ranked (real local) | hivemind (legacy 404 phantom)
     useSolscanTrending: u.useSolscanTrending ?? false, // Phase D: Birdeye/Solscan trending source
     solscanTrendingMode: u.solscanTrendingMode ?? "merge", // merge | only
     usePumpfunGraduated: u.usePumpfunGraduated ?? false, // Phase B: pump.fun graduated-token source
@@ -450,6 +451,7 @@ export function reloadScreeningThresholds() {
     if (fresh.maxTop10Pct      != null) s.maxTop10Pct      = fresh.maxTop10Pct;
     if (fresh.useDiscordSignals !== undefined) s.useDiscordSignals = fresh.useDiscordSignals;
     if (fresh.discordSignalMode != null) s.discordSignalMode = fresh.discordSignalMode;
+    if (fresh.discordSource != null) s.discordSource = fresh.discordSource;
     if (fresh.excludeHighSupplyConcentration !== undefined) s.excludeHighSupplyConcentration = fresh.excludeHighSupplyConcentration;
     if (fresh.minOrganic     != null) s.minOrganic     = fresh.minOrganic;
     if (fresh.minQuoteOrganic != null) s.minQuoteOrganic = fresh.minQuoteOrganic;
