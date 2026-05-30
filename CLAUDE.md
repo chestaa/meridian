@@ -87,6 +87,8 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | requireFreezeRenounced | screening | true |
 | rejectRugpullFlag | screening | true |
 | devSoldAllRequiresHighConcentration | screening | true |
+| tvlMcapGateEnabled | screening | true |
+| maxTvlMcapRatio | screening | 0.2 |
 | deployAmountSol | management | 0.5 |
 | maxDeployAmount | risk | 50 |
 | maxPositions | risk | 3 |
@@ -123,6 +125,8 @@ Before `deploy_position` executes:
 - `amount_x > 0` is rejected. Deploys are single-side SOL only (`amount_y` / `amount_sol`)
 - SOL balance must cover `amount_y + gasReserve`
 - `blockedLaunchpads` enforced in `getTopCandidates()` before LLM sees candidates
+
+**TVL/MC ratio gate (Cassiopeia, Item 2 — LIVE-ONLY):** in `getTopCandidates()`, fires only when `DRY_RUN=false` AND `tvlMcapGateEnabled`. Rejects pools whose `tvl/mcap > maxTvlMcapRatio` (default 0.2). Thesis (@0xyunss + community, 71% win backtest): smaller TVL/MC → thinner liquidity vs cap → tighter active range → better fee capture. FAIL-SAFE: missing/zero mcap or tvl → `tvl_mcap_ratio_unknown` reject (anti-pattern #2). Pure fn `tvlMcapGateRejectReason(pool, s)`. Reject reasons: `tvl_mcap_ratio_too_high`, `tvl_mcap_ratio_unknown`. Paper/backtest unaffected (live overlay).
 
 ---
 

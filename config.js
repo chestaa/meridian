@@ -138,6 +138,14 @@ export const config = {
     // When true (default), dev_sold_all only rejects if compounded with high top10
     // concentration (>maxTop10Pct). When false, reverts to legacy hard live-reject.
     devSoldAllRequiresHighConcentration: u.devSoldAllRequiresHighConcentration ?? true,
+    // ─── Item 2 (yunus screen) — TVL/MC ratio gate (LIVE-ONLY) ───
+    // @0xyunss + community (71% win backtest): smaller TVL/MC → thinner liquidity
+    // vs cap → tighter active range → better fee capture. Reject pools whose
+    // tvl/mcap exceeds maxTvlMcapRatio. Fires ONLY when dryRun===false (paper
+    // unaffected). FAIL-SAFE: missing/zero mcap or tvl → reject (anti-pattern #2).
+    // Reject reasons: tvl_mcap_ratio_too_high, tvl_mcap_ratio_unknown.
+    tvlMcapGateEnabled: u.tvlMcapGateEnabled ?? true,
+    maxTvlMcapRatio:    u.maxTvlMcapRatio    ?? 0.2,
   },
 
   // ─── Position Management ────────────────
@@ -467,6 +475,8 @@ export function reloadScreeningThresholds() {
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
+    if (fresh.tvlMcapGateEnabled !== undefined) s.tvlMcapGateEnabled = fresh.tvlMcapGateEnabled;
+    if (fresh.maxTvlMcapRatio    != null) s.maxTvlMcapRatio = fresh.maxTvlMcapRatio;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

@@ -148,6 +148,40 @@ export function devSoldAllShouldReject(pool, s) {
   return top10 > maxTop10;
 }
 
+/**
+ * Item 2 (yunus screen) — TVL/MC ratio gate. LIVE-ONLY (fires only when the
+ * caller passes the live overlay; paper/backtest are unaffected by design).
+ *
+ * Thesis (@0xyunss + community, 71% win backtest): a SMALLER TVL/MC ratio means
+ * liquidity is thin relative to market cap → the active range is tighter → fees
+ * concentrate where price actually trades → better fee capture. Pools with a
+ * BLOATED TVL/MC (lots of parked liquidity vs cap) spread fees too thin.
+ *
+ * Reject when tvl/mcap > maxTvlMcapRatio (default 0.2).
+ *
+ * FAIL-SAFE (anti-pattern #2): if mcap or tvl is missing/non-positive we CANNOT
+ * compute the ratio — REJECT with tvl_mcap_ratio_unknown rather than default to
+ * a passing value. A pool we cannot risk-rank does not deploy in live.
+ *
+ * Returns a reject reason string, or null if the gate passes / is disabled.
+ *
+ * @param {object} pool - condensed pool (expects pool.tvl|active_tvl + pool.mcap)
+ * @param {object} s - effective screening thresholds (carries tvlMcapGateEnabled, maxTvlMcapRatio)
+ */
+export function tvlMcapGateRejectReason(pool, s) {
+  if (s?.tvlMcapGateEnabled !== true) return null;
+  const maxRatio = numeric(s?.maxTvlMcapRatio);
+  if (maxRatio == null || maxRatio <= 0) return null; // no usable cap → gate inert
+  const tvl = numeric(pool?.tvl ?? pool?.active_tvl);
+  const mcap = numeric(pool?.mcap ?? pool?.market_cap);
+  // Fail-safe: cannot compute ratio without both positive operands.
+  if (mcap == null || mcap <= 0) return "tvl_mcap_ratio_unknown";
+  if (tvl == null || tvl < 0) return "tvl_mcap_ratio_unknown";
+  const ratio = tvl / mcap;
+  if (ratio > maxRatio) return "tvl_mcap_ratio_too_high";
+  return null;
+}
+
 function includesCaseInsensitive(values, value) {
   if (!Array.isArray(values) || values.length === 0 || !value) return false;
   const needle = String(value).toLowerCase();
@@ -997,6 +1031,30 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       });
       eligible.splice(0, eligible.length, ...kept);
       if (eligible.length < beforeDsa) log("screening", `dev_sold_all gate removed ${beforeDsa - eligible.length} pool(s)`);
+    }
+
+    // Item 2 (yunus screen) — TVL/MC ratio gate. LIVE-ONLY (DRY_RUN=false).
+    // Paper/backtest unaffected. Reject pools whose TVL/MC > maxTvlMcapRatio
+    // (default 0.2) — thin-liquidity-vs-cap pools concentrate fees in a tighter
+    // range. Fail-safe: missing/zero mcap or tvl → tvl_mcap_ratio_unknown reject.
+    if (config.dryRun === false && eff.tvlMcapGateEnabled === true) {
+      const beforeTm = eligible.length;
+      const kept = eligible.filter((p) => {
+        const reason = tvlMcapGateRejectReason(p, eff);
+        if (reason) {
+          const tvl = numeric(p.tvl ?? p.active_tvl);
+          const mcap = numeric(p.mcap);
+          const ratioStr = (tvl != null && mcap != null && mcap > 0) ? (tvl / mcap).toFixed(3) : "n/a";
+          log("screening", `TVL/MC gate: dropped ${p.name} — ${reason} (tvl/mc=${ratioStr}, cap ${eff.maxTvlMcapRatio})`);
+          pushFilteredReason(filteredOut, p, reason === "tvl_mcap_ratio_too_high"
+            ? `tvl_mcap_ratio_too_high (${ratioStr} > ${eff.maxTvlMcapRatio})`
+            : reason);
+          return false;
+        }
+        return true;
+      });
+      eligible.splice(0, eligible.length, ...kept);
+      if (eligible.length < beforeTm) log("screening", `TVL/MC gate removed ${beforeTm - eligible.length} pool(s)`);
     }
 
     // Item 5 — the live-only requireSmartWalletOrHighOrganic hard gate was
