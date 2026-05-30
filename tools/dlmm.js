@@ -25,6 +25,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { recordRealizedLoss } from "../account-circuit-breaker.js";
+import { computeLiveRealizedSolDelta } from "../realized-sol.js";
 import { getSigningWallet } from "../wallet-loader.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
@@ -1606,6 +1607,9 @@ export async function closePosition({ position_address, reason }) {
         let finalValueUsd = 0;
         let initialUsd = 0;
         let feesUsd = tracked.total_fees_claimed_usd || 0;
+        // Vega fix #1 — SOL figures for realized_sol_delta formula fallback.
+        let withdrawnSol = null;
+        let feesSol = null;
         try {
           const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
           for (let attempt = 0; attempt < 6; attempt++) {
@@ -1619,6 +1623,12 @@ export async function closePosition({ position_address, reason }) {
                 finalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
                 initialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
                 feesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
+                const nextWithdrawnSol = posEntry.allTimeWithdrawals?.total?.sol != null
+                  ? parseFloat(posEntry.allTimeWithdrawals.total.sol) : null;
+                const nextFeesSol = posEntry.allTimeFees?.total?.sol != null
+                  ? parseFloat(posEntry.allTimeFees.total.sol) : null;
+                withdrawnSol = Number.isFinite(nextWithdrawnSol) ? nextWithdrawnSol : withdrawnSol;
+                feesSol = Number.isFinite(nextFeesSol) ? nextFeesSol : feesSol;
                 break;
               }
             }
@@ -1627,6 +1637,15 @@ export async function closePosition({ position_address, reason }) {
         } catch (e) {
           log("close_warn", `Relay closed PnL fetch failed: ${e.message}`);
         }
+
+        // Vega fix #1 — formula-based realized SOL delta (relay close path).
+        const relayCloseRsd = config.internalAgents?.realizedSolAccounting !== false
+          ? computeLiveRealizedSolDelta({
+              solDeployed: tracked.amount_sol ?? null,
+              solReceivedOnClose: Number.isFinite(withdrawnSol) ? withdrawnSol : null,
+              feesClaimedSol: Number.isFinite(feesSol) ? feesSol : null,
+            })
+          : null;
 
         await recordPerformance({
           position: position_address,
@@ -1641,11 +1660,16 @@ export async function closePosition({ position_address, reason }) {
           organic_score: tracked.organic_score || null,
           amount_sol: tracked.amount_sol,
           fees_earned_usd: feesUsd,
+          fees_earned_sol: Number.isFinite(feesSol) ? feesSol : undefined,
           final_value_usd: finalValueUsd,
           initial_value_usd: initialUsd,
           minutes_in_range: minutesHeld - minutesOOR,
           minutes_held: minutesHeld,
           close_reason: reason || "agent decision",
+          realized_sol_delta: relayCloseRsd?.realized_sol_delta ?? null,
+          realized_sol_delta_pct: relayCloseRsd?.realized_sol_delta_pct ?? null,
+          realized_sol_method: relayCloseRsd?.method ?? null,
+          realized_sol_estimate: relayCloseRsd?.estimate ?? null,
         });
 
         await recordRealizedLoss({
@@ -1689,6 +1713,10 @@ export async function closePosition({ position_address, reason }) {
           pnl_usd: pnlUsd,
           pnl_pct: pnlPct,
           base_mint: livePosition?.base_mint || null,
+          // Vega fix #1 — SOL figures for realized_sol_delta formula fallback.
+          sol_deployed: tracked.amount_sol ?? null,
+          sol_received: Number.isFinite(withdrawnSol) ? withdrawnSol : null,
+          fees_claimed_sol: Number.isFinite(feesSol) ? feesSol : null,
         };
       }
 
@@ -1857,6 +1885,10 @@ export async function closePosition({ position_address, reason }) {
       let finalValueUsd = 0;
       let initialUsd = 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
+      // Vega fix #1 — SOL-denominated figures for realized_sol_delta formula
+      // fallback (used only when the executor wallet-delta snapshot is missing).
+      let withdrawnSol = null;
+      let feesSol = null;
       try {
         const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
         for (let attempt = 0; attempt < 6; attempt++) {
@@ -1870,6 +1902,10 @@ export async function closePosition({ position_address, reason }) {
               const nextFinalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
               const nextInitialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
               const nextFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
+              const nextWithdrawnSol = posEntry.allTimeWithdrawals?.total?.sol != null
+                ? parseFloat(posEntry.allTimeWithdrawals.total.sol) : null;
+              const nextFeesSol = posEntry.allTimeFees?.total?.sol != null
+                ? parseFloat(posEntry.allTimeFees.total.sol) : null;
 
               if (shouldRejectClosedPnl(nextPnlPct, reason || tracked?.close_reason)) {
                 log("close_warn", `Rejected unsettled closed PnL for ${position_address.slice(0, 8)} on attempt ${attempt + 1}/6: ${nextPnlPct.toFixed(2)}%`);
@@ -1879,6 +1915,8 @@ export async function closePosition({ position_address, reason }) {
                 finalValueUsd = nextFinalValueUsd;
                 initialUsd    = nextInitialUsd;
                 feesUsd       = nextFeesUsd;
+                withdrawnSol  = Number.isFinite(nextWithdrawnSol) ? nextWithdrawnSol : withdrawnSol;
+                feesSol       = Number.isFinite(nextFeesSol) ? nextFeesSol : feesSol;
                 log("close", `Closed PnL from API: pnl=${pnlUsd.toFixed(2)} USD (${pnlPct.toFixed(2)}%), withdrawn=${finalValueUsd.toFixed(2)}, deposited=${initialUsd.toFixed(2)}`);
                 break;
               }
@@ -1911,6 +1949,17 @@ export async function closePosition({ position_address, reason }) {
         }
       }
 
+      // Vega fix #1 — formula-based realized SOL delta persisted into the
+      // performance record (the more precise wallet-delta is computed in the
+      // executor close handler for the live notification). Flagged as estimate.
+      const closeRsd = config.internalAgents?.realizedSolAccounting !== false
+        ? computeLiveRealizedSolDelta({
+            solDeployed: tracked.amount_sol ?? null,
+            solReceivedOnClose: Number.isFinite(withdrawnSol) ? withdrawnSol : null,
+            feesClaimedSol: Number.isFinite(feesSol) ? feesSol : null,
+          })
+        : null;
+
       await recordPerformance({
         position: position_address,
         pool: poolAddress,
@@ -1924,11 +1973,16 @@ export async function closePosition({ position_address, reason }) {
         organic_score: tracked.organic_score || null,
         amount_sol: tracked.amount_sol,
         fees_earned_usd: feesUsd,
+        fees_earned_sol: Number.isFinite(feesSol) ? feesSol : undefined,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: reason || "agent decision",
+        realized_sol_delta: closeRsd?.realized_sol_delta ?? null,
+        realized_sol_delta_pct: closeRsd?.realized_sol_delta_pct ?? null,
+        realized_sol_method: closeRsd?.method ?? null,
+        realized_sol_estimate: closeRsd?.estimate ?? null,
       });
 
       await recordRealizedLoss({
@@ -1970,6 +2024,11 @@ export async function closePosition({ position_address, reason }) {
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: pool.lbPair.tokenXMint.toString(),
+        // Vega fix #1 — SOL figures for realized_sol_delta (formula fallback in
+        // executor when the wallet-delta snapshot is unavailable). Additive.
+        sol_deployed: tracked.amount_sol ?? null,
+        sol_received: Number.isFinite(withdrawnSol) ? withdrawnSol : null,
+        fees_claimed_sol: Number.isFinite(feesSol) ? feesSol : null,
       };
     }
 

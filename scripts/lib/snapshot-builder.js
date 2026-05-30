@@ -116,10 +116,14 @@ export function summarizeClosed(lessonsJson, windowMs, nowMs = Date.now()) {
   });
 
   if (inWindow.length === 0) {
-    return { count: 0, pnl_sum_sol: 0, win_rate: null };
+    return { count: 0, pnl_sum_sol: 0, realized_sol_sum: 0, win_rate: null };
   }
 
   let pnlSum = 0;
+  // Vega fix #1 — TRUE economic sum (realized_sol_delta, incl. IL + slippage +
+  // gas). Falls back to the price-only pnl_sol per-record when realized is absent
+  // (old records / accounting disabled), so this is never less informative.
+  let realizedSum = 0;
   let wins = 0;
   for (const r of inWindow) {
     // Prefer explicit SOL fields; otherwise convert pnl_pct × amount_sol.
@@ -135,6 +139,11 @@ export function summarizeClosed(lessonsJson, windowMs, nowMs = Date.now()) {
       pnlSol = 0;
     }
     pnlSum += pnlSol;
+
+    const realizedDelta = typeof r.realized_sol_delta === 'number' && isFinite(r.realized_sol_delta)
+      ? r.realized_sol_delta
+      : pnlSol;
+    realizedSum += realizedDelta;
 
     // Win definition: pnl_pct > 0 primary; fallback pnl_sol > 0;
     // also count exits flagged with "Trailing TP" close_reason as wins.
@@ -152,6 +161,7 @@ export function summarizeClosed(lessonsJson, windowMs, nowMs = Date.now()) {
   return {
     count: inWindow.length,
     pnl_sum_sol: Number(pnlSum.toFixed(6)),
+    realized_sol_sum: Number(realizedSum.toFixed(6)),
     win_rate: Number((wins / inWindow.length).toFixed(2)),
   };
 }
@@ -203,8 +213,11 @@ export async function buildSnapshot({ rpcUrl } = {}) {
       open_aggregate_pnl_pct: open.open_aggregate_pnl_pct,
       closed_24h_count: closed24.count,
       closed_24h_pnl_sum_sol: closed24.pnl_sum_sol,
+      // Vega fix #1 — TRUE realized SOL (economic, incl. IL + slippage + gas).
+      closed_24h_realized_sol_sum: closed24.realized_sol_sum,
       closed_7d_count: closed7.count,
       closed_7d_pnl_sum_sol: closed7.pnl_sum_sol,
+      closed_7d_realized_sol_sum: closed7.realized_sol_sum,
       // null when no closes in window — avoids misleading "0%" win rate.
       win_rate_24h: closed24.win_rate,
       win_rate_7d: closed7.win_rate,

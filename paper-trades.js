@@ -6,6 +6,7 @@ import { setPoolAndTokenCooldown } from "./pool-memory.js";
 import { config } from "./config.js";
 import { notifyClose, isExecutiveMode, isBigPnl } from "./telegram.js";
 import { recordPerformance } from "./lessons.js";
+import { computePaperRealizedSolDelta } from "./realized-sol.js";
 
 const PAPER_TRADES_FILE = "./paper-trades.json";
 const MAX_TRADES = 300;
@@ -377,6 +378,24 @@ export async function closePaperTrade(trade, exit, snapshot) {
   trade.notes.push(`paper_close: ${exit.action} — ${exit.reason}`);
   const opened = Date.parse(trade.opened_at);
   const durationMin = Number.isFinite(opened) ? Math.floor((Date.now() - opened) / 60000) : null;
+
+  // Vega fix #1 — TRUE realized SOL delta (paper). lp_pnl_pct (final_pnl_pct) is
+  // PRICE-ONLY. Paper has no wallet, so simulate the exit: apply an exit-slippage
+  // haircut + gas estimate to the price-proxy outcome and add fees earned. The
+  // result is the SOL the operator would actually net — strictly <= lp_pnl_pct.
+  // Additive; gated by config.internalAgents.realizedSolAccounting (default ON).
+  if (config.internalAgents?.realizedSolAccounting !== false) {
+    const rsd = computePaperRealizedSolDelta({
+      amountSol: trade.amount_sol,
+      lpPnlPct: trade.final_pnl_pct,
+      feesClaimedSol: trade.fees_claimed_sol,
+    });
+    trade.lp_pnl_pct = trade.final_pnl_pct ?? null; // explicit label: price-only
+    trade.realized_sol_delta = rsd.realized_sol_delta;
+    trade.realized_sol_delta_pct = rsd.realized_sol_delta_pct;
+    trade.realized_sol_method = rsd.method;
+    trade.realized_sol_estimate = rsd.estimate;
+  }
   // Fire Telegram pulse — DRY_RUN paper close.
   // Executive mode: only surface notable closes (|PnL| >= bigPnlThresholdPct).
   // Small-PnL paper closes stay silent and aggregate into daily boss-report.
@@ -391,6 +410,10 @@ export async function closePaperTrade(trade, exit, snapshot) {
       feesSol: trade.fees_claimed_sol ?? 0,
       durationMin,
       feeInclusivePnlPct: trade.final_fee_inclusive_pnl_pct,
+      lpPnlPct: trade.lp_pnl_pct ?? trade.final_pnl_pct ?? null,
+      realizedSolDelta: trade.realized_sol_delta,
+      realizedSolDeltaPct: trade.realized_sol_delta_pct,
+      realizedSolEstimate: trade.realized_sol_estimate,
       positionAddress: trade.id,
       dryRun: true,
     }).catch(() => {});
@@ -436,6 +459,12 @@ export async function closePaperTrade(trade, exit, snapshot) {
         close_reason: exit.reason,
         deployed_at: trade.opened_at,
         source: "paper",
+        // Vega fix #1 — carry the simulated realized SOL delta into the lessons
+        // record so digest/snapshot read TRUE economics, not just price-only PnL.
+        realized_sol_delta: trade.realized_sol_delta ?? null,
+        realized_sol_delta_pct: trade.realized_sol_delta_pct ?? null,
+        realized_sol_method: trade.realized_sol_method ?? null,
+        realized_sol_estimate: trade.realized_sol_estimate ?? null,
       });
     } catch (err) {
       log("paper_warn", `recordPerformance failed for ${trade.pool_name}: ${err.message}`);

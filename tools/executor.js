@@ -45,6 +45,7 @@ const TIMEFRAME_MINUTES = {
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap, notifyDeployFailure } from "../telegram.js";
 import { assertCircuitOK, CircuitBreakerError } from "../account-circuit-breaker.js";
+import { computeLiveRealizedSolDelta } from "../realized-sol.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -681,6 +682,24 @@ export async function executeTool(name, args) {
     }
   }
 
+  // ─── Vega fix #1 — pre-close wallet SOL snapshot ──────────────
+  // Capture wallet SOL right BEFORE a live close so we can measure the TRUE
+  // economic outcome (wallet_after - wallet_before) once the close + post-close
+  // auto-swap have settled. This inherently includes IL + swap slippage + gas.
+  // LIVE only; DRY_RUN paper closes are handled in paper-trades.js. Read-only —
+  // does not influence the close decision or TX in any way.
+  let _walletSolBeforeClose = null;
+  if (
+    name === "close_position" &&
+    process.env.DRY_RUN !== "true" &&
+    config.internalAgents?.realizedSolAccounting !== false
+  ) {
+    try {
+      const balBefore = await getWalletBalances({}).catch(() => null);
+      _walletSolBeforeClose = balBefore?.sol != null ? Number(balBefore.sol) : null;
+    } catch (_e) { /* accounting probe must never block close */ }
+  }
+
   // ─── Execute ──────────────────────────────
   try {
     const result = await fn(args);
@@ -733,17 +752,6 @@ export async function executeTool(name, args) {
         }).catch(() => {});
       } else if (name === "close_position") {
         const isDry = result?.dry_run === true || process.env.DRY_RUN === "true";
-        notifyClose({
-          pair: result.pool_name || args.pool_name || args.position_address?.slice(0, 8),
-          pnlUsd: result.pnl_usd ?? 0,
-          pnlPct: result.pnl_pct ?? 0,
-          pnlSol: result.pnl_sol,
-          feesSol: result.fees_claimed_sol ?? result.fees_sol,
-          durationMin: result.duration_min,
-          feeInclusivePnlPct: result.fee_inclusive_pnl_pct,
-          positionAddress: args.position_address,
-          dryRun: isDry,
-        }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
@@ -766,6 +774,51 @@ export async function executeTool(name, args) {
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
           }
         }
+
+        // Vega fix #1 — TRUE realized SOL delta. Now that close + auto-swap have
+        // settled, measure the wallet-level economic outcome. Preferred path:
+        // wallet_after - wallet_before (ground truth — includes IL + slippage +
+        // gas). Fallback: formula from the close result SOL figures + gas est.
+        // Additive only — lp_pnl_pct (result.pnl_pct) is left untouched.
+        if (!isDry && config.internalAgents?.realizedSolAccounting !== false) {
+          try {
+            let walletSolAfter = null;
+            const balAfter = await getWalletBalances({}).catch(() => null);
+            walletSolAfter = balAfter?.sol != null ? Number(balAfter.sol) : null;
+            const rsd = computeLiveRealizedSolDelta({
+              walletSolBefore: _walletSolBeforeClose,
+              walletSolAfter,
+              solDeployed: result.sol_deployed ?? null,
+              solReceivedOnClose: result.sol_received ?? null,
+              feesClaimedSol: result.fees_claimed_sol ?? result.fees_sol ?? null,
+            });
+            result.realized_sol_delta = rsd.realized_sol_delta;
+            result.realized_sol_delta_pct = rsd.realized_sol_delta_pct;
+            result.realized_sol_method = rsd.method;
+            result.realized_sol_estimate = rsd.estimate;
+            result.lp_pnl_pct = result.pnl_pct ?? null; // explicit label: price-only LP-PnL
+          } catch (e) {
+            log("executor_warn", `realized SOL delta computation failed: ${e.message}`);
+          }
+        }
+
+        // Fire close notification AFTER auto-swap + realized-delta so the message
+        // carries the TRUE economic outcome next to the price-only LP-PnL.
+        notifyClose({
+          pair: result.pool_name || args.pool_name || args.position_address?.slice(0, 8),
+          pnlUsd: result.pnl_usd ?? 0,
+          pnlPct: result.pnl_pct ?? 0,
+          pnlSol: result.pnl_sol,
+          feesSol: result.fees_claimed_sol ?? result.fees_sol,
+          durationMin: result.duration_min,
+          feeInclusivePnlPct: result.fee_inclusive_pnl_pct,
+          lpPnlPct: result.lp_pnl_pct ?? result.pnl_pct ?? null,
+          realizedSolDelta: result.realized_sol_delta,
+          realizedSolDeltaPct: result.realized_sol_delta_pct,
+          realizedSolEstimate: result.realized_sol_estimate,
+          positionAddress: args.position_address,
+          dryRun: isDry,
+        }).catch(() => {});
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         try {
           const balances = await getWalletBalances({});

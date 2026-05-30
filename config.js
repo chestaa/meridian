@@ -274,6 +274,13 @@ export const config = {
     // bearing positions are deferred (logged, not auto-closed) when this
     // path is active — operator must intervene or re-enable the LLM path.
     managerDeterministic: u.internalAgents?.managerDeterministic ?? false,
+    // Vega fix #1 — TRUE realized SOL delta accounting. When ON, every closed
+    // position/trade record carries realized_sol_delta + realized_sol_delta_pct
+    // (economic outcome incl. IL + close-swap slippage + gas) ALONGSIDE the
+    // existing price-only lp_pnl_pct. Pure accounting/reporting — does NOT change
+    // any deploy/close behavior, TX, DRY_RUN, or risk constant. Default ON; flip
+    // false for silent revert to lp_pnl-only reporting. See realized-sol.js.
+    realizedSolAccounting: u.internalAgents?.realizedSolAccounting ?? true,
   },
 
   // ─── Darwinian Signal Weighting ───────

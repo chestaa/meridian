@@ -107,6 +107,17 @@ export function gatherDigestData({ now = Date.now(), timers = null } = {}) {
     ? todayPnlVals.reduce((s, v) => s + v, 0) / todayPnlVals.length
     : null;
 
+  // Vega fix #1 — TRUE realized SOL summed across today's closes (economic
+  // outcome incl. IL + close-swap slippage + gas). Distinct from the price-only
+  // LP-PnL avg above. Only records that carry realized_sol_delta contribute;
+  // returns null when none do (avoids a misleading 0).
+  const todayRealizedSolVals = closedToday
+    .map((t) => t.realized_sol_delta)
+    .filter((v) => Number.isFinite(v));
+  const todayRealizedSolSum = todayRealizedSolVals.length
+    ? Number(todayRealizedSolVals.reduce((s, v) => s + v, 0).toFixed(6))
+    : null;
+
   const openWithPnl = open
     .map((t) => ({ trade: t, pnl: tradePnl(t) }))
     .filter((x) => Number.isFinite(x.pnl));
@@ -176,6 +187,8 @@ export function gatherDigestData({ now = Date.now(), timers = null } = {}) {
     paper: {
       open_count: open.length,
       today_realized_avg_pct: todayRealizedAvg,
+      // Vega fix #1 — true economic SOL netted today (vs price-only avg above).
+      today_realized_sol_sum: todayRealizedSolSum,
       biggest_winner: biggestWinner
         ? { label: biggestWinner.trade.pool_name || biggestWinner.trade.base_symbol || "?", pnl: biggestWinner.pnl }
         : null,
@@ -200,9 +213,14 @@ export function formatDigest(data) {
   // Paper trading
   lines.push(`💼 <b>Paper trading</b>`);
   const realizedStr = data.paper.today_realized_avg_pct == null
-    ? "today realized: no closes yet"
-    : `today realized: ${fmtPct(data.paper.today_realized_avg_pct)} avg`;
+    ? "today LP-PnL: no closes yet"
+    : `today LP-PnL: ${fmtPct(data.paper.today_realized_avg_pct)} avg`;
   lines.push(`Open: ${data.paper.open_count} trades | ${realizedStr}`);
+  // Vega fix #1 — TRUE economic SOL netted today (incl. IL + slippage + gas).
+  if (data.paper.today_realized_sol_sum != null) {
+    const s = data.paper.today_realized_sol_sum;
+    lines.push(`True realized SOL today: ${s >= 0 ? "+" : ""}${s.toFixed(4)} SOL`);
+  }
   if (data.paper.biggest_winner) {
     lines.push(`Biggest winner open: ${data.paper.biggest_winner.label} ${fmtPct(data.paper.biggest_winner.pnl)}`);
   }
@@ -269,10 +287,15 @@ export function formatExecutiveDigest(data, extras = {}) {
   lines.push(`Posisi terbuka: ${data.paper.open_count}`);
   const realized = data.paper.today_realized_avg_pct;
   if (realized == null) {
-    lines.push(`Untung hari ini: belum ada close`);
+    lines.push(`LP-PnL hari ini: belum ada close`);
   } else {
     const sign = realized >= 0 ? "+" : "";
-    lines.push(`Untung hari ini: ${sign}${realized.toFixed(2)}%`);
+    lines.push(`LP-PnL hari ini (harga saja): ${sign}${realized.toFixed(2)}%`);
+  }
+  // Vega fix #1 — SOL ekonomi sebenarnya (termasuk IL + slippage + gas).
+  if (data.paper.today_realized_sol_sum != null) {
+    const s = data.paper.today_realized_sol_sum;
+    lines.push(`Realisasi SOL sebenarnya: ${s >= 0 ? "+" : ""}${s.toFixed(4)} SOL`);
   }
   if (extras.winRate7d != null) {
     lines.push(`Win rate 7 hari: ${extras.winRate7d}%`);

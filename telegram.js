@@ -593,7 +593,7 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct, pnlSol, feesSol, durationMin, feeInclusivePnlPct, positionAddress = null, dryRun = false }) {
+export async function notifyClose({ pair, pnlUsd, pnlPct, pnlSol, feesSol, durationMin, feeInclusivePnlPct, lpPnlPct, realizedSolDelta, realizedSolDeltaPct, realizedSolEstimate = false, positionAddress = null, dryRun = false }) {
   if (hasActiveLiveMessage()) return;
   // Skip if the user just closed this manually via /close (inline echo already sent)
   if (positionAddress) {
@@ -605,13 +605,27 @@ export async function notifyClose({ pair, pnlUsd, pnlPct, pnlSol, feesSol, durat
   }
   const sign = (pnlUsd ?? 0) >= 0 ? "+" : "";
   const header = dryRun ? `🔵 <b>SIMULATION — Paper Close</b>` : `🔒 <b>Closed</b>`;
-  const pnlLine = `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`;
+  // Vega fix #1 — clearly label the price-only LP-PnL so it is never confused
+  // with the TRUE economic outcome below it.
+  const lpLabelPct = Number.isFinite(lpPnlPct) ? lpPnlPct : pnlPct;
+  const pnlLine = `LP-PnL (price-only): ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${(lpLabelPct ?? 0) >= 0 ? "+" : ""}${(lpLabelPct ?? 0).toFixed(2)}%)`;
   const pnlSolLine = Number.isFinite(pnlSol)
     ? `\nPnL SOL: ${pnlSol >= 0 ? "+" : ""}${Number(pnlSol).toFixed(4)} SOL`
     : "";
   const feesLine = Number.isFinite(feesSol) && feesSol > 0
     ? `\nFees collected: ${Number(feesSol).toFixed(4)} SOL`
     : "";
+  // Vega fix #1 — TRUE realized SOL delta (economic outcome incl. IL + close-swap
+  // slippage + gas). This is the number the wallet actually moved by. ⚠️ flags an
+  // estimate (formula/paper-sim) vs a measured wallet delta.
+  let realizedLine = "";
+  if (Number.isFinite(realizedSolDelta)) {
+    const estTag = realizedSolEstimate ? " ⚠️est" : "";
+    const pctTag = Number.isFinite(realizedSolDeltaPct)
+      ? ` (${realizedSolDeltaPct >= 0 ? "+" : ""}${Number(realizedSolDeltaPct).toFixed(2)}%)`
+      : "";
+    realizedLine = `\n<b>Realized SOL: ${realizedSolDelta >= 0 ? "+" : ""}${Number(realizedSolDelta).toFixed(4)} SOL${pctTag}${estTag}</b>`;
+  }
   const durationLine = Number.isFinite(durationMin) && durationMin >= 0
     ? `\nDuration: ${formatDuration(durationMin)}`
     : "";
@@ -621,6 +635,7 @@ export async function notifyClose({ pair, pnlUsd, pnlPct, pnlSol, feesSol, durat
   await sendHTML(
     `${header} ${htmlEscape(pair)}\n` +
     pnlLine +
+    realizedLine +
     pnlSolLine +
     feesLine +
     feeInclusiveLine +
