@@ -95,6 +95,11 @@ export function trackPosition({
     closed_at: null,
     notes: [],
     peak_pnl_pct: 0,
+    // Vega Item 2B — partial-TP scale-out fires ONCE per position. This flag
+    // is the idempotency guard: once true, updatePnlAndCheckExits never returns
+    // PARTIAL_TP again for this position. Survives restarts (persisted).
+    partial_tp_done: false,
+    partial_tp_at: null,
     pending_peak_pnl_pct: null,
     pending_peak_started_at: null,
     pending_trailing_current_pnl_pct: null,
@@ -314,6 +319,25 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
 }
 
 /**
+ * Vega Item 2B — mark a position's partial TP as executed (idempotent guard).
+ * Returns true if it flipped false→true, false if it was already done (so the
+ * caller can detect a double-fire attempt and skip the on-chain TX).
+ */
+export function markPartialTpDone(position_address) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return false;
+  if (pos.partial_tp_done) return false; // already done — refuse to re-arm
+  pos.partial_tp_done = true;
+  pos.partial_tp_at = new Date().toISOString();
+  pos.notes = Array.isArray(pos.notes) ? pos.notes : [];
+  pos.notes.push(`Partial TP executed at ${pos.partial_tp_at}`);
+  save(state);
+  log("state", `Position ${position_address} partial TP marked done`);
+  return true;
+}
+
+/**
  * Get a single tracked position.
  */
 export function getTrackedPosition(position_address) {
@@ -361,7 +385,14 @@ export function getStateSummary() {
  * Returns { action, reason } or null if no exit needed.
  */
 export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
-  const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
+  const {
+    pnl_pct: currentPnlPct,
+    pnl_pct_suspicious,
+    in_range,
+    fee_per_tvl_24h,
+    price_change_1h_pct,
+    net_buyers_1h,
+  } = positionData;
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
@@ -408,6 +439,32 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     };
   }
 
+  // ── Partial TP scale-out (Vega Item 2B) ────────────────────────
+  // Fires ONCE: peak >= partialTpTriggerPct AND not already done. Returns a
+  // PARTIAL_TP action that the caller executes via partial_close_position
+  // (pull partialTpPct%, keep account open). Idempotency is enforced by the
+  // partial_tp_done flag (set via markPartialTpDone after a confirmed TX) AND
+  // re-checked here. A stop loss (above) always pre-empts a partial — if we're
+  // crashing we close fully, never scale out.
+  if (
+    !pnl_pct_suspicious &&
+    mgmtConfig.partialTpEnabled !== false &&
+    !pos.partial_tp_done &&
+    currentPnlPct != null &&
+    (pos.peak_pnl_pct ?? 0) >= (mgmtConfig.partialTpTriggerPct ?? Infinity)
+  ) {
+    const pct = Number(mgmtConfig.partialTpPct ?? 50);
+    if (Number.isFinite(pct) && pct > 0 && pct < 100) {
+      return {
+        action: "PARTIAL_TP",
+        reason: `Partial TP: peak ${(pos.peak_pnl_pct ?? 0).toFixed(2)}% >= ${mgmtConfig.partialTpTriggerPct}% — scaling out ${pct}% (rest runs with trailing)`,
+        partial_pct: pct,
+        peak_pnl_pct: pos.peak_pnl_pct ?? 0,
+        current_pnl_pct: currentPnlPct,
+      };
+    }
+  }
+
   // ── Trailing TP ────────────────────────────────────────────────
   if (!pnl_pct_suspicious && pos.trailing_active) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
@@ -423,10 +480,51 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     }
   }
 
+  // ── Velocity-drop exit (Vega Item 6) ───────────────────────────
+  // Momentum reversal capture BEFORE trailing drop fully hits. Requires the
+  // position to be IN PROFIT (don't double-punish a losing position; stop loss
+  // owns the downside) AND a hard 1h reversal: price_change_1h < -velocityDropPct
+  // AND net_buyers_1h < 0 (sellers winning). Precedence: after partial TP,
+  // before OOR. Reversibility: velocityExitEnabled=false → silent skip.
+  if (
+    !pnl_pct_suspicious &&
+    mgmtConfig.velocityExitEnabled !== false &&
+    currentPnlPct != null &&
+    currentPnlPct > 0 &&
+    price_change_1h_pct != null &&
+    net_buyers_1h != null &&
+    Number.isFinite(Number(price_change_1h_pct)) &&
+    Number.isFinite(Number(net_buyers_1h)) &&
+    Number(price_change_1h_pct) < -(mgmtConfig.velocityDropPct ?? 15) &&
+    Number(net_buyers_1h) < 0
+  ) {
+    return {
+      action: "VELOCITY_EXIT",
+      reason: `Velocity exit: 1h price ${Number(price_change_1h_pct).toFixed(2)}% < -${mgmtConfig.velocityDropPct ?? 15}% AND net_buyers_1h ${net_buyers_1h} < 0 while in profit (${currentPnlPct.toFixed(2)}%) — momentum reversal`,
+    };
+  }
+
   // ── Out of range too long ──────────────────────────────────────
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
     if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
+      // Vega Item 9 — Rebalance-on-OOR for high-organic tokens. DEFAULT OFF.
+      // When enabled AND organic >= threshold, signal REBALANCE_OOR (re-center,
+      // keep earning) instead of hard close. NOTE: live re-center execution is
+      // NOT wired yet (needs more design — extra TXs, slippage, IL realization).
+      // Flag default false → this branch is dead and OOR hard-closes as today.
+      const organic = Number(pos.organic_score);
+      if (
+        mgmtConfig.rebalanceOnOorEnabled === true &&
+        Number.isFinite(organic) &&
+        organic >= (mgmtConfig.rebalanceOnOorMinOrganic ?? 80)
+      ) {
+        return {
+          action: "REBALANCE_OOR",
+          reason: `OOR ${minutesOOR}m (limit ${mgmtConfig.outOfRangeWaitMinutes}m) but organic ${organic} >= ${mgmtConfig.rebalanceOnOorMinOrganic ?? 80} — rebalance candidate (execution pending design)`,
+          needs_design: true,
+        };
+      }
       return {
         action: "OUT_OF_RANGE",
         reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,

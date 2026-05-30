@@ -83,6 +83,10 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | blockedLaunchpads | screening | [] |
 | minTokenAgeHours | screening | 24 |
 | maxTokenAgeHours | screening | 720 |
+| requireMintRenounced | screening | true |
+| requireFreezeRenounced | screening | true |
+| rejectRugpullFlag | screening | true |
+| devSoldAllRequiresHighConcentration | screening | true |
 | deployAmountSol | management | 0.5 |
 | maxDeployAmount | risk | 50 |
 | maxPositions | risk | 3 |
@@ -111,7 +115,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 
 Before `deploy_position` executes:
 - `bin_step` must be within `[minBinStep, maxBinStep]`
-- `volatility` must be a positive finite number when provided; fresh pool detail with volatility 0/null is rejected
+- `volatility` must be a positive finite number when provided; fresh pool detail with volatility 0/null is rejected. NOTE: `discoverPools()` runs a refetch-before-reject pass (`refetchVolatilityForUnusable`) — pools reading vol≤0 on the 5m feed are re-fetched at 30m; only those STILL ≤0 at 30m are dropped (avoids stale-feed false-positives like the RICH-SOL miss)
 - Total range must be at least `max(35, minBinsBelow)` bins; 1-bin/tiny deploys are refused
 - Position count must be below `maxPositions` (force-fresh scan, no cache)
 - No duplicate pool allowed (same pool_address)
@@ -119,6 +123,24 @@ Before `deploy_position` executes:
 - `amount_x > 0` is rejected. Deploys are single-side SOL only (`amount_y` / `amount_sol`)
 - SOL balance must cover `amount_y + gasReserve`
 - `blockedLaunchpads` enforced in `getTopCandidates()` before LLM sees candidates
+
+---
+
+## Cassiopeia Rug-Protection Gates (screening.js)
+
+Applied inside `getTopCandidates()` after OKX/Jupiter enrichment. All **base gates** (fire in BOTH paper and live) and **fail-closed** per anti-pattern #2 — missing data = reject, never default to safe.
+
+| Gate | Config flag (default) | Reject reason | Data source |
+|------|----------------------|---------------|-------------|
+| Mint authority renounced | `requireMintRenounced` (true) | `mint_authority_not_renounced` | `p.audit.mint_disabled` (Jupiter audit) — reject unless `=== true` |
+| Freeze authority renounced | `requireFreezeRenounced` (true) | `freeze_authority_not_renounced` | `p.audit.freeze_disabled` (Jupiter audit) — reject unless `=== true` |
+| Rugpull / liquidity removal | `rejectRugpullFlag` (true) | `liquidity_removal_rugpull` | `p.is_rugpull` (OKX `isLiquidityRemoval`) — reject if `=== true` |
+| dev_sold_all (compound) | `devSoldAllRequiresHighConcentration` (true) | `dev_sold_all_high_concentration` | rejects only if `dev_sold_all === true` AND `top_holders_pct > maxTop10Pct`. Set flag `false` → legacy hard-reject (`dev_sold_all`). |
+
+- Pure decision fns: `rugGateRejectReason(pool, s)`, `devSoldAllShouldReject(pool, s)` (both exported, unit-tested).
+- When any mint/freeze gate is active, the Jupiter audit fetch runs even if bot/top10 caps are off (else `p.audit` is null → fail-closed reject everything).
+- Smart-money hard coupling (`requireSmartWalletOrHighOrganic`) was **removed** — it was a disguised organic floor. Organic is now governed solely by `minOrganic` (live overlay recommends 72); smart-money stays a `scoreCandidate` bonus only.
+- Tests: `scripts/test-gate-batch.js` (22 assertions).
 
 ---
 

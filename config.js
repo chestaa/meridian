@@ -73,6 +73,19 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    // Vega Item 7 — Dynamic sizing by Orion confidence. Tiers MULTIPLY the
+    // base deploy amount, then computeDynamicDeployAmount HARD-CAPS at
+    // maxDeployAmount (belt). The executor's amountY > maxDeployAmount reject
+    // is the suspenders — sizing can NEVER produce an oversize deploy.
+    // Reversibility: dynamicSizingEnabled=false → fixed base amount (legacy).
+    dynamicSizingEnabled: u.dynamicSizingEnabled ?? true,
+    // Tiers are evaluated in order; first matching [minConf, maxConf) wins.
+    // mult applied to the base (computeDeployAmount) result.
+    sizingTiers: Array.isArray(u.sizingTiers) ? u.sizingTiers : [
+      { minConf: 70, maxConf: 80,  mult: 0.5 },  // 70-80 → 0.5x
+      { minConf: 80, maxConf: 90,  mult: 1.0 },  // 80-90 → 1x
+      { minConf: 90, maxConf: 101, mult: 1.5 },  // 90+   → 1.5x (capped at maxDeployAmount)
+    ],
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -115,6 +128,16 @@ export const config = {
     minTokenAgeHours:   u.minTokenAgeHours   ?? 24,  // skip rug-heavy <24h tokens (Cassiopeia gate)
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? 720, // 30d — skip stale tokens (Cassiopeia gate)
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
+    // ─── Cassiopeia Rug-Protection Base Gates (always-on, fail-closed) ───
+    // Universal rug protection — fire in BOTH paper and live. Per anti-pattern #2,
+    // missing authority data = REJECT (never default to safe). Each toggle-able.
+    requireMintRenounced:   u.requireMintRenounced   ?? true,  // REJECT unless audit.mint_disabled === true
+    requireFreezeRenounced: u.requireFreezeRenounced ?? true,  // REJECT unless audit.freeze_disabled === true
+    rejectRugpullFlag:      u.rejectRugpullFlag      ?? true,  // REJECT when OKX is_rugpull === true (isLiquidityRemoval)
+    // dev_sold_all demotion — was a hard live-reject (false-positive: blocked SQUIRE +8%).
+    // When true (default), dev_sold_all only rejects if compounded with high top10
+    // concentration (>maxTop10Pct). When false, reverts to legacy hard live-reject.
+    devSoldAllRequiresHighConcentration: u.devSoldAllRequiresHighConcentration ?? true,
   },
 
   // ─── Position Management ────────────────
@@ -140,9 +163,33 @@ export const config = {
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
     // Trailing take-profit
+    // Vega Item 2A — trailing trigger lowered 40→18, drop tightened 10→6.
+    // Rationale: at 40% almost no pump armed the trail (most peak <40% then
+    // give it back). 18% arms on realistic pumps; 6% drop locks gains tighter
+    // once armed. Reversibility: restore 40/10 in user-config.json to revert.
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
-    trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
-    trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    trailingTriggerPct:    u.trailingTriggerPct    ?? 18,   // activate trailing at X% PnL
+    trailingDropPct:       u.trailingDropPct       ?? 6,    // close when drops X% from peak
+    // Vega Item 2B — Partial TP scale-out. At peak +partialTpTriggerPct, pull
+    // partialTpPct% of liquidity (bps via removeLiquidity, shouldClaimAndClose:
+    // false → account stays open, rest runs with trailing). Fires ONCE per
+    // position (partial_tp_done flag in state.js / paper-trades.js).
+    // Reversibility: partialTpEnabled=false → silent revert (no partial path).
+    partialTpEnabled:      u.partialTpEnabled      ?? true,
+    partialTpTriggerPct:   u.partialTpTriggerPct   ?? 15,   // peak PnL that arms partial scale-out
+    partialTpPct:          u.partialTpPct          ?? 50,   // % of position to pull (→ bps = pct*100)
+    // Vega Item 6 — Velocity-drop exit. If position in profit AND 1h price
+    // change < -velocityDropPct AND net_buyers_1h < 0 → exit (momentum reversal
+    // captured BEFORE trailing drop fully materializes). Precedence: after
+    // partial TP, before OOR. Reversibility: velocityExitEnabled=false → revert.
+    velocityExitEnabled:   u.velocityExitEnabled   ?? true,
+    velocityDropPct:       u.velocityDropPct       ?? 15,   // 1h price drop magnitude that triggers exit
+    // Vega Item 9 — Rebalance-on-OOR (instead of hard close) for high-organic
+    // tokens (organic >= rebalanceOnOorMinOrganic). DEFAULT OFF — too risky for
+    // same-day live (re-center = extra TXs, slippage, IL realization). Behind
+    // flag pending more design. When OFF, OOR → legacy hard close (no change).
+    rebalanceOnOorEnabled: u.rebalanceOnOorEnabled ?? false,
+    rebalanceOnOorMinOrganic: u.rebalanceOnOorMinOrganic ?? 80,
     // Andromeda PR-A — max-drawdown-recovery exit (paper-trades.js).
     // ARM when max_drawdown (peak−trough) >= armPct; FIRE when current pnl
     // recovers deltaPct above trough. Distinct from trailing TP, which gates
@@ -320,6 +367,57 @@ export function computeDeployAmount(walletSol) {
   const dynamic    = deployable * pct;
   const result     = Math.min(ceil, Math.max(floor, dynamic));
   return parseFloat(result.toFixed(2));
+}
+
+/**
+ * Vega Item 7 — Dynamic deploy sizing by Orion confidence.
+ *
+ * Multiplies the base deploy amount by a confidence-tiered factor, then
+ * HARD-CAPS at maxDeployAmount. This is the BELT. The executor's
+ * `amountY > config.risk.maxDeployAmount` reject is the SUSPENDERS — the two
+ * are independent, so a bug in either layer cannot produce an oversize deploy.
+ *
+ * INVARIANT (proven by test): for ALL confidence values and ALL base amounts,
+ *   computeDynamicDeployAmount(base, conf) <= maxDeployAmount.
+ *
+ * @param {number} baseAmount - base deploy amount (from computeDeployAmount)
+ * @param {number} confidence - Orion confidence 0-100
+ * @param {object} cfg - config (test seam; defaults to live config)
+ * @returns {number} sized amount, never exceeding maxDeployAmount
+ */
+export function computeDynamicDeployAmount(baseAmount, confidence, cfg = config) {
+  const ceil = Number(cfg?.risk?.maxDeployAmount ?? 0);
+  const base = Number(baseAmount);
+  if (!Number.isFinite(base) || base <= 0) return 0;
+
+  // Disabled → fixed base (still capped at ceil — never trust caller).
+  if (cfg?.risk?.dynamicSizingEnabled === false) {
+    const fixed = ceil > 0 ? Math.min(base, ceil) : base;
+    return parseFloat(fixed.toFixed(2));
+  }
+
+  const conf = Number(confidence);
+  const tiers = Array.isArray(cfg?.risk?.sizingTiers) ? cfg.risk.sizingTiers : [];
+  // First matching [minConf, maxConf) tier wins. No match (e.g. conf < lowest
+  // tier floor) → mult 1.0 (treat as base; the deploy still has to clear
+  // Orion's own confidence floor upstream, so this is conservative).
+  let mult = 1.0;
+  if (Number.isFinite(conf)) {
+    for (const t of tiers) {
+      const lo = Number(t?.minConf);
+      const hi = Number(t?.maxConf);
+      const m  = Number(t?.mult);
+      if (Number.isFinite(lo) && Number.isFinite(hi) && Number.isFinite(m) && conf >= lo && conf < hi) {
+        mult = m;
+        break;
+      }
+    }
+  }
+
+  const sized = base * mult;
+  // BELT — hard cap. ceil<=0 means "no cap configured" (defensive; live always >0).
+  const capped = ceil > 0 ? Math.min(sized, ceil) : sized;
+  return parseFloat(Math.max(0, capped).toFixed(2));
 }
 
 /**

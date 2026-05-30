@@ -7,6 +7,7 @@ import {
   getPositionPnl,
   claimFees,
   closePosition,
+  partialClosePosition,
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
@@ -357,6 +358,7 @@ const toolMap = {
   check_smart_wallets_on_pool: checkSmartWalletsOnPool,
   claim_fees: claimFees,
   close_position: closePosition,
+  partial_close_position: partialClosePosition,
   get_wallet_balance: getWalletBalances,
   swap_token: swapToken,
   get_top_lpers: studyTopLPers,
@@ -642,6 +644,7 @@ const WRITE_TOOLS = new Set([
   "deploy_position",
   "claim_fees",
   "close_position",
+  "partial_close_position",
   "swap_token",
 ]);
 const PROTECTED_TOOLS = new Set([
@@ -1002,6 +1005,24 @@ async function runSafetyChecks(name, args) {
     case "swap_token": {
       // Basic check — prevent swapping when DRY_RUN is true
       // (handled inside swapToken itself, but belt-and-suspenders)
+      return { pass: true };
+    }
+
+    case "partial_close_position": {
+      // Vega Item 2B — refuse a partial that is not strictly fractional.
+      // Belt-and-suspenders: dlmm.partialClosePosition rejects too, but a
+      // malformed pct must NEVER reach the SDK as a full (100%) pull, which
+      // would close the account behind the manager's back.
+      const pct = Number(args?.pct);
+      if (!Number.isFinite(pct) || pct <= 0 || pct >= 100) {
+        return {
+          pass: false,
+          reason: `partial_close_position pct ${args?.pct} invalid — must be in (0,100). Use close_position for a full close.`,
+        };
+      }
+      if (!args?.position_address) {
+        return { pass: false, reason: "partial_close_position requires position_address." };
+      }
       return { pass: true };
     }
 

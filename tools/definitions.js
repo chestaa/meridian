@@ -301,6 +301,38 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
   {
     type: "function",
     function: {
+      name: "partial_close_position",
+      description: `Remove a FRACTION of a position's liquidity, keeping the position account OPEN.
+The remainder keeps earning fees and can still hit trailing/velocity/OOR exits.
+Use for partial take-profit scale-out (lock some gains, let the rest run).
+
+This is NOT a full close — use close_position to fully exit.
+WARNING: This executes a real on-chain transaction. Cannot be undone.
+The pct must be strictly between 0 and 100 (e.g. 50 = pull half).`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: {
+            type: "string",
+            description: "The position public key to partially close"
+          },
+          pct: {
+            type: "number",
+            description: "Percent of liquidity to pull, in (0,100). 50 = pull half. 100 is rejected — use close_position."
+          },
+          reason: {
+            type: "string",
+            description: "Why this partial scale-out is happening, e.g. 'partial TP at +15% peak'."
+          }
+        },
+        required: ["position_address", "pct"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "get_wallet_positions",
       description: `Get all open DLMM positions for any Solana wallet address.
 Use this when the user asks about another wallet's positions, wants to monitor a wallet,

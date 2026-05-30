@@ -1920,6 +1920,116 @@ export async function closePosition({ position_address, reason }) {
   }
 }
 
+// ─── Partial Close (Vega Item 2B) ──────────────────────────────
+// Pull a FRACTION of liquidity (bps) while KEEPING the position account open
+// so the remainder keeps earning fees and can still hit trailing/velocity/OOR.
+// Uses the same proven `removeLiquidity` primitive as a full close but with
+// shouldClaimAndClose:false. This is NOT a position-ending operation.
+//
+// Money invariants:
+//   - DRY_RUN guarded (paper accounting handled by paper-trades.js, not here).
+//   - bps clamped to (0, 10000) — refuses a 0% or full (10000) pull. A full
+//     pull MUST go through close_position (which closes the account + records
+//     performance). A 0% pull is a no-op error.
+//   - Idempotency is the CALLER's responsibility via state.markPartialTpDone —
+//     this fn does not track fire-once state, it just executes one pull.
+//   - TX confirmed before returning success (sendAndConfirmTransaction).
+export async function partialClosePosition({ position_address, pct, reason }) {
+  position_address = normalizeMint(position_address);
+
+  const pctNum = Number(pct);
+  if (!Number.isFinite(pctNum) || pctNum <= 0 || pctNum >= 100) {
+    return { success: false, error: `partial pct ${pct} invalid — must be in (0,100). Use close_position for a full pull.` };
+  }
+  const bps = Math.round(pctNum * 100); // 50% → 5000 bps
+  if (bps <= 0 || bps >= 10000) {
+    return { success: false, error: `computed bps ${bps} out of (0,10000) range — refusing partial close.` };
+  }
+
+  if (process.env.DRY_RUN === "true") {
+    return { dry_run: true, would_partial_close: position_address, bps, pct: pctNum, message: "DRY RUN — no transaction sent" };
+  }
+
+  const tracked = getTrackedPosition(position_address);
+  if (tracked?.closed) {
+    return { success: false, error: "Position already closed — cannot partial close." };
+  }
+
+  try {
+    log("partial_close", `Partial close ${pctNum}% (bps=${bps}) for ${position_address}: ${reason || "scale-out"}`);
+    const wallet = getWallet();
+    const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
+
+    // Fresh pool load so SDK reads current bin liquidity state.
+    poolCache.delete(poolAddress.toString());
+    const pool = await getPool(poolAddress);
+    const positionPubKey = new PublicKey(position_address);
+
+    // Determine bin range + verify there is liquidity to pull.
+    let fromBinId = -887272;
+    let toBinId = 887272;
+    let hasLiquidity = false;
+    const positionDataForPull = await pool.getPosition(positionPubKey);
+    const processed = positionDataForPull?.positionData;
+    if (processed) {
+      fromBinId = processed.lowerBinId ?? fromBinId;
+      toBinId = processed.upperBinId ?? toBinId;
+      const bins = Array.isArray(processed.positionBinData) ? processed.positionBinData : [];
+      hasLiquidity = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
+    }
+    if (!hasLiquidity) {
+      return { success: false, error: "No liquidity to pull — position is empty. Skipping partial close." };
+    }
+
+    // Remove `bps` of liquidity, KEEP account open (shouldClaimAndClose:false).
+    const partialTx = await pool.removeLiquidity({
+      user: wallet.publicKey,
+      position: positionPubKey,
+      fromBinId,
+      toBinId,
+      bps: new BN(bps),
+      shouldClaimAndClose: false, // CRITICAL — keep the account alive
+    });
+
+    const txHashes = [];
+    for (const tx of Array.isArray(partialTx) ? partialTx : [partialTx]) {
+      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      txHashes.push(txHash);
+    }
+    if (txHashes.length === 0) {
+      return { success: false, error: "Partial close produced no transactions." };
+    }
+
+    // Invalidate position cache so the next read reflects the reduced size.
+    _positionsCacheAt = 0;
+
+    // Verify the position is STILL OPEN (we must NOT have closed the account).
+    let stillOpen = false;
+    try {
+      const refreshed = await getMyPositions({ force: true, silent: true });
+      stillOpen = Boolean(refreshed?.positions?.some((p) => p.position === position_address));
+    } catch (e) {
+      log("partial_close_warn", `Post-partial verification failed: ${e.message}`);
+    }
+
+    log("partial_close", `SUCCESS partial ${pctNum}% txs: ${txHashes.join(", ")} (still_open=${stillOpen})`);
+    return {
+      success: true,
+      partial: true,
+      position: position_address,
+      pool: poolAddress,
+      pct: pctNum,
+      bps,
+      txs: txHashes,
+      still_open: stillOpen,
+      base_mint: pool.lbPair.tokenXMint.toString(),
+    };
+  } catch (error) {
+    log("partial_close_error", error.message);
+    return { success: false, error: error.message };
+  }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────
 async function lookupPoolForPosition(position_address, walletAddress) {
   // Check state registry first (fast path)

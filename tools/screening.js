@@ -90,6 +90,64 @@ function isUsableVolatility(value) {
   return Number.isFinite(n) && n > 0;
 }
 
+/**
+ * Cassiopeia rug-protection base gates (fail-closed, anti-pattern #2).
+ * Returns a reject reason string, or null if the pool clears every active gate.
+ * Always-on (fire in BOTH paper and live) — rug protection is universal.
+ *
+ * Each gate is independently toggle-able via config.screening:
+ *   - requireMintRenounced   → mint_authority_not_renounced
+ *   - requireFreezeRenounced → freeze_authority_not_renounced
+ *   - rejectRugpullFlag      → liquidity_removal_rugpull
+ *
+ * FAIL-CLOSED: missing authority data (null/undefined) = REJECT. We do NOT
+ * default to a safe value. `mint_disabled !== true` rejects both `false`
+ * (authority still live = risk) and `null/undefined` (unknown = reject).
+ *
+ * @param {object} pool - condensed pool; expects pool.audit.{mint_disabled,
+ *   freeze_disabled} and pool.is_rugpull (set during OKX enrichment).
+ * @param {object} s - effective screening thresholds (config.screening overlay).
+ */
+export function rugGateRejectReason(pool, s) {
+  const audit = pool?.audit || null;
+
+  if (s?.requireMintRenounced) {
+    const mintDisabled = audit ? audit.mint_disabled : undefined;
+    if (mintDisabled !== true) return "mint_authority_not_renounced";
+  }
+  if (s?.requireFreezeRenounced) {
+    const freezeDisabled = audit ? audit.freeze_disabled : undefined;
+    if (freezeDisabled !== true) return "freeze_authority_not_renounced";
+  }
+  if (s?.rejectRugpullFlag) {
+    if (pool?.is_rugpull === true) return "liquidity_removal_rugpull";
+  }
+  return null;
+}
+
+/**
+ * Item 4 — dev_sold_all gate, demoted from hard live-reject to compound.
+ * Returns true if the pool should be rejected for dev_sold_all.
+ *
+ * When devSoldAllRequiresHighConcentration === true (default):
+ *   reject ONLY if dev_sold_all === true AND top10 concentration > maxTop10Pct.
+ *   Keeps rug protection when concentration is also high, but stops the
+ *   false-positive that blocked SQUIRE (+8%) on dev_sold_all alone.
+ * When false: legacy hard-reject on dev_sold_all alone.
+ *
+ * @param {object} pool - condensed pool with pool.dev_sold_all + pool.audit.top_holders_pct
+ * @param {object} s - effective screening thresholds (carries devSoldAllRequiresHighConcentration, maxTop10Pct)
+ */
+export function devSoldAllShouldReject(pool, s) {
+  if (pool?.dev_sold_all !== true) return false;
+  if (s?.devSoldAllRequiresHighConcentration === false) return true; // legacy hard-reject
+  const maxTop10 = numeric(s?.maxTop10Pct);
+  const top10 = numeric(pool?.audit?.top_holders_pct);
+  if (maxTop10 == null) return false;        // no concentration cap → compound can't trigger
+  if (top10 == null) return false;           // no top10 data → don't reject on dev_sold_all alone
+  return top10 > maxTop10;
+}
+
 function includesCaseInsensitive(values, value) {
   if (!Array.isArray(values) || values.length === 0 || !value) return false;
   const needle = String(value).toLowerCase();
@@ -241,6 +299,57 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   }
 
   return rawPools;
+}
+
+/**
+ * Item 3 — refetch-before-reject for vol≤0 false-positives.
+ * Lyra: volatility 0/null on a 5m feed is frequently a STALE window, not a dead
+ * pool (this cost us the RICH-SOL win). Before letting the volatility gate
+ * reject a pool, re-fetch its volatility at the 30m timeframe. Only the pools
+ * that STILL report vol≤0 at 30m get rejected by the downstream gate.
+ *
+ * Targeted: only re-fetches pools whose current volatility is unusable, so this
+ * costs at most one extra detail call per borderline pool (not the whole page).
+ * Idempotent + graceful: a failed/empty 30m fetch leaves volatility untouched
+ * (still unusable → still rejected). Reversible by removing the call site.
+ */
+async function refetchVolatilityForUnusable(rawPools, fetchDetail = fetchPoolDiscoveryDetail) {
+  if (!Array.isArray(rawPools) || rawPools.length === 0) return rawPools;
+  const stale = rawPools.filter(
+    (pool) => pool?.pool_address && !isUsableVolatility(pool.volatility)
+  );
+  if (stale.length === 0) return rawPools;
+
+  const uniquePoolAddresses = [...new Set(stale.map((pool) => pool.pool_address))];
+  const results = await Promise.allSettled(
+    uniquePoolAddresses.map((poolAddress) =>
+      fetchDetail({ poolAddress, timeframe: MIN_VOLATILITY_TIMEFRAME })
+        .then((pool) => ({ poolAddress, volatility: numeric(pool?.volatility) }))
+    )
+  );
+
+  const rescued = new Map();
+  for (const result of results) {
+    if (result.status !== "fulfilled") continue;
+    if (!isUsableVolatility(result.value.volatility)) continue; // 30m ALSO ≤0 → leave unusable
+    rescued.set(result.value.poolAddress, result.value.volatility);
+  }
+
+  for (const pool of stale) {
+    if (!rescued.has(pool.pool_address)) continue;
+    pool.volatility = rescued.get(pool.pool_address);
+    pool.volatility_timeframe = MIN_VOLATILITY_TIMEFRAME;
+    log("screening", `Volatility rescue: ${pool.name || pool.pool_address} vol≤0 on feed → ${pool.volatility} at 30m`);
+  }
+
+  return rawPools;
+}
+
+// Testable seam — exposes the volatility-rescue pass with an injectable fetcher
+// so scripts/test-gate-batch.js can verify refetch-before-reject without hitting
+// the live Pool Discovery API. Not used in production code paths.
+export function __refetchVolatilityForUnusableForTests(rawPools, fetchDetail) {
+  return refetchVolatilityForUnusable(rawPools, fetchDetail);
 }
 
 async function searchAssetsBySymbol(symbol) {
@@ -483,6 +592,8 @@ export async function discoverPools({
   }
 
   rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
+  // Item 3 — rescue stale vol≤0 readings before the volatility gate rejects them.
+  rawPools = await refetchVolatilityForUnusable(rawPools);
 
   const filteredExamples = [];
   const thresholdedRawPools = rawPools.filter((pool) => {
@@ -579,7 +690,6 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
   const eff = effectiveScreeningThresholds();
-  const overlay = liveOverlay();
   const minTvl = Number(eff.minTvl ?? 0);
   const maxTvl = eff.maxTvl == null ? null : Number(eff.maxTvl);
   const minFeeActiveTvlRatio = Number(eff.minFeeActiveTvlRatio ?? 0);
@@ -653,8 +763,15 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     const maxTop10PctCfg = numeric(eff.maxTop10Pct);
     const botGateActive = maxBotPctCfg != null && maxBotPctCfg > 0;
     const top10GateActive = maxTop10PctCfg != null && maxTop10PctCfg > 0;
+    // Item 1 — rug gates need audit.{mint_disabled,freeze_disabled}. Fetch the
+    // Jupiter audit whenever a mint/freeze gate is active, even if bot/top10
+    // gates are off — otherwise p.audit stays null and fail-closed would reject
+    // every pool. Compound dev_sold_all (Item 4) also reads audit.top_holders_pct.
+    const mintGateActive = eff.requireMintRenounced === true;
+    const freezeGateActive = eff.requireFreezeRenounced === true;
+    const auditNeeded = botGateActive || top10GateActive || mintGateActive || freezeGateActive;
 
-    if (botGateActive || top10GateActive) {
+    if (auditNeeded) {
       const auditResults = await Promise.allSettled(
         eligible.map(async (p) => {
           if (!p.base?.mint) return { pool: p.pool, audit: null };
@@ -841,39 +958,53 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     eligible.splice(0, eligible.length, ...filtered);
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
 
-    // Cassiopeia Option C — live-only overlay rejections.
-    // Only fire when liveOverlay() returns non-null (i.e., dryRun===false AND
-    // liveOverrides set). Each rule is individually toggleable.
-    if (overlay) {
-      if (overlay.requireDevNotSoldAll) {
-        const before2 = eligible.length;
-        const kept = eligible.filter((p) => {
-          if (p.dev_sold_all === true) {
-            log("screening", `Live overlay: dropped ${p.name} — dev_sold_all_in_live`);
-            pushFilteredReason(filteredOut, p, "dev_sold_all_in_live");
-            return false;
-          }
-          return true;
-        });
-        eligible.splice(0, eligible.length, ...kept);
-        if (eligible.length < before2) log("screening", `Live overlay removed ${before2 - eligible.length} dev_sold_all pool(s)`);
-      }
-      if (overlay.requireSmartWalletOrHighOrganic) {
-        const before3 = eligible.length;
-        const kept = eligible.filter((p) => {
-          const swCount = Number(p.smart_wallet_count ?? 0);
-          const organic = Number(p.organic_score ?? p.base?.organic ?? 0);
-          if (swCount === 0 && organic < 80) {
-            log("screening", `Live overlay: dropped ${p.name} — no_smart_money_low_organic_in_live (sw=${swCount}, organic=${organic})`);
-            pushFilteredReason(filteredOut, p, "no_smart_money_low_organic_in_live");
-            return false;
-          }
-          return true;
-        });
-        eligible.splice(0, eligible.length, ...kept);
-        if (eligible.length < before3) log("screening", `Live overlay removed ${before3 - eligible.length} no-smart-money pool(s)`);
-      }
+    // Item 1 — Cassiopeia rug-protection BASE gates (always-on, fail-closed).
+    // Fire in BOTH paper and live. mint/freeze authority + OKX rugpull flag.
+    // p.audit (mint_disabled/freeze_disabled) is populated by the Jupiter audit
+    // block above; p.is_rugpull by the OKX risk block above. Missing data =
+    // reject (anti-pattern #2). Each gate toggle-able via config.screening.
+    {
+      const beforeRug = eligible.length;
+      const kept = eligible.filter((p) => {
+        const reason = rugGateRejectReason(p, eff);
+        if (reason) {
+          log("screening", `Rug gate: dropped ${p.name} — ${reason}`);
+          pushFilteredReason(filteredOut, p, reason);
+          return false;
+        }
+        return true;
+      });
+      eligible.splice(0, eligible.length, ...kept);
+      if (eligible.length < beforeRug) log("screening", `Rug gates removed ${beforeRug - eligible.length} pool(s)`);
     }
+
+    // Item 4 — dev_sold_all gate, demoted to compound (BASE gate, fires both
+    // paper and live). Default: reject only when dev_sold_all AND top10 >
+    // maxTop10Pct. Set devSoldAllRequiresHighConcentration=false to revert to
+    // legacy hard-reject on dev_sold_all alone.
+    {
+      const beforeDsa = eligible.length;
+      const kept = eligible.filter((p) => {
+        if (devSoldAllShouldReject(p, eff)) {
+          const reason = eff.devSoldAllRequiresHighConcentration === false
+            ? "dev_sold_all"
+            : "dev_sold_all_high_concentration";
+          log("screening", `Risk filter: dropped ${p.name} — ${reason} (top10=${p.audit?.top_holders_pct ?? "n/a"}%)`);
+          pushFilteredReason(filteredOut, p, reason);
+          return false;
+        }
+        return true;
+      });
+      eligible.splice(0, eligible.length, ...kept);
+      if (eligible.length < beforeDsa) log("screening", `dev_sold_all gate removed ${beforeDsa - eligible.length} pool(s)`);
+    }
+
+    // Item 5 — the live-only requireSmartWalletOrHighOrganic hard gate was
+    // REMOVED. It was a disguised organic floor (the 30-wallet smart-money list
+    // rarely overlaps trending pools, so sw=0 was near-universal). Organic is now
+    // governed solely by minOrganic (live overlay recommends 72), and smart-money
+    // remains a scoreCandidate bonus only. requireDevNotSoldAll overlay key is
+    // superseded by the Item 4 compound base gate.
   }
 
   // Phase G — multi-source cross-validation HARD GATE (live-only).

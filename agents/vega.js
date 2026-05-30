@@ -34,7 +34,7 @@
 //       * candidate pool volatility is missing/<=0
 //       * candidate pool address missing
 
-import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, computeDeployAmount, computeDynamicDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { executeTool as defaultExecuteTool } from "../tools/executor.js";
 import { getWalletBalances as defaultGetWalletBalances } from "../tools/wallet.js";
 import { log } from "../logger.js";
@@ -167,10 +167,19 @@ export async function deployFromOrionVerdict(orionVerdict, candidate, context = 
       log("agent", `[VEGA_DETERMINISTIC] skip ${poolAddress.slice(0, 8)} — wallet balance unknown`);
       return { deployed: false, txSignature: null, error: "wallet balance unknown" };
     }
-    amountY = computeDeployAmount(walletSol);
+    // Vega Item 7 — base from wallet, then scale by Orion confidence tier.
+    // computeDynamicDeployAmount HARD-CAPS at maxDeployAmount internally (BELT).
+    const baseAmount = computeDeployAmount(walletSol);
+    amountY = computeDynamicDeployAmount(baseAmount, orionVerdict.confidence);
+    if (amountY !== baseAmount) {
+      log("agent", `[VEGA_DETERMINISTIC] dynamic sizing conf=${orionVerdict.confidence}% base=${baseAmount} -> ${amountY}`);
+    }
   }
 
   // ─── Hard cap (anti-pattern #7: never let upstream slip an oversize value) ──
+  // SUSPENDERS — independent of computeDynamicDeployAmount's internal BELT cap.
+  // Even a test-seam deployAmountOverride or a future sizing bug cannot exceed
+  // maxDeployAmount past this point. The executor enforces it a THIRD time.
   const maxDeployAmount = Number(config.risk?.maxDeployAmount ?? 0);
   if (!Number.isFinite(amountY) || amountY <= 0) {
     return { deployed: false, txSignature: null, error: `invalid amount_y ${amountY}` };

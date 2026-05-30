@@ -29,7 +29,7 @@ import {
   isMeaningfulReport,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, markPartialTpDone } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -301,6 +301,38 @@ export async function runManagementCycle({ silent = false } = {}) {
           if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
             scheduleTrailingDropConfirmation(p.position);
           }
+          continue;
+        }
+        // Vega Item 2B — PARTIAL_TP is NOT a close. Execute the partial pull
+        // inline (keeps account open), mark done so it fires ONCE, and do NOT
+        // add to exitMap — the remainder keeps running with trailing.
+        // Fail-safe: any error → leave the position fully open + monitored
+        // (never close on a failed partial), surface in mgmt report next cycle.
+        if (exit.action === "PARTIAL_TP") {
+          try {
+            const partialRes = await executeTool("partial_close_position", {
+              position_address: p.position,
+              pct: exit.partial_pct,
+              reason: exit.reason,
+            });
+            if (partialRes?.blocked || partialRes?.error || partialRes?.success === false) {
+              log("state", `Partial TP for ${p.pair} did not execute: ${partialRes?.reason || partialRes?.error || "failed"} — position stays fully open + monitored`);
+            } else {
+              // Only flip the idempotency flag after a confirmed (or dry-run) partial.
+              markPartialTpDone(p.position);
+              log("state", `Partial TP executed for ${p.pair}: ${exit.reason}`);
+            }
+          } catch (e) {
+            log("state", `Partial TP threw for ${p.pair}: ${e.message} — position stays fully open + monitored`);
+          }
+          continue; // partial does not end the position; keep monitoring
+        }
+        // Vega Item 9 — REBALANCE_OOR is gated OFF by default. If it ever fires
+        // (operator opted in) and live re-center is not yet wired, fail-safe to
+        // a legacy hard close so the OOR position is NEVER left unmanaged.
+        if (exit.action === "REBALANCE_OOR") {
+          log("state", `REBALANCE_OOR signalled for ${p.pair} but live re-center is unimplemented — failing safe to hard close. ${exit.reason}`);
+          exitMap.set(p.position, `OOR (rebalance unimplemented, hard close fallback): ${exit.reason}`);
           continue;
         }
         exitMap.set(p.position, exit.reason);

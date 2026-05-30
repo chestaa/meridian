@@ -151,6 +151,14 @@ export function recordPaperDeploy(entry) {
     min_pnl_pct: 0,
     max_drawdown_pct: 0,
     drawdown_recovery_armed_at: null,
+    // Vega Item 2B — paper mirror of partial-TP scale-out. Fires ONCE; on fire
+    // we reduce amount_sol by partialTpPct% (the scaled-out portion is realized
+    // and removed from the running position) so subsequent PnL reflects only
+    // the remainder. original_amount_sol preserves the pre-partial size for
+    // accounting/forensics. partial_tp_done is the idempotency guard.
+    partial_tp_done: false,
+    partial_tp_at: null,
+    original_amount_sol: Number(entry.amount_sol || 0),
     notes: ["price_proxy_only"],
   };
   data.trades.push(trade);
@@ -233,6 +241,33 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
     if (mgmt.takeProfitPct != null && pnlPct >= mgmt.takeProfitPct) {
       return { action: "TAKE_PROFIT", reason: `Take profit: PnL ${pnlPct.toFixed(2)}% >= ${mgmt.takeProfitPct}%` };
     }
+
+    // Vega Item 2B — Partial TP scale-out (paper mirror). NOT a close: when
+    // peak >= partialTpTriggerPct and not yet done, realize partialTpPct% of
+    // the position by reducing amount_sol, mark fire-once, and DO NOT return an
+    // exit. The remainder keeps running with trailing/velocity. Idempotent via
+    // trade.partial_tp_done. SL/TP above already pre-empt (crash = full close).
+    if (
+      mgmt.partialTpEnabled !== false &&
+      !trade.partial_tp_done &&
+      trade.peak_pnl_pct != null &&
+      trade.peak_pnl_pct >= (mgmt.partialTpTriggerPct ?? Infinity)
+    ) {
+      const pct = Number(mgmt.partialTpPct ?? 50);
+      if (Number.isFinite(pct) && pct > 0 && pct < 100) {
+        const orig = Number(trade.original_amount_sol ?? trade.amount_sol) || 0;
+        const remaining = Number((Number(trade.amount_sol || 0) * (1 - pct / 100)).toFixed(6));
+        trade.original_amount_sol = trade.original_amount_sol ?? orig;
+        trade.amount_sol = Math.max(0, remaining);
+        trade.partial_tp_done = true;
+        trade.partial_tp_at = new Date().toISOString();
+        trade.notes = Array.isArray(trade.notes) ? trade.notes : [];
+        trade.notes.push(`partial_tp: scaled out ${pct}% at peak ${trade.peak_pnl_pct.toFixed(2)}% (pnl ${pnlPct.toFixed(2)}%) — remainder ${trade.amount_sol} SOL`);
+        log("paper", `Paper partial TP ${trade.pool_name}: scaled out ${pct}% at peak ${trade.peak_pnl_pct.toFixed(2)}%`);
+        // fall through — no exit returned; remainder keeps running.
+      }
+    }
+
     // Trailing TP
     if (mgmt.trailingTakeProfit && trade.peak_pnl_pct != null && trade.peak_pnl_pct >= (mgmt.trailingTriggerPct ?? Infinity)) {
       const dropFromPeak = trade.peak_pnl_pct - pnlPct;
@@ -240,6 +275,26 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
         return {
           action: "TRAILING_TP",
           reason: `Trailing TP: peak ${trade.peak_pnl_pct.toFixed(2)}% → current ${pnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${mgmt.trailingDropPct}%)`,
+        };
+      }
+    }
+
+    // Vega Item 6 — Velocity-drop exit (paper mirror). In profit + hard 1h
+    // reversal (price_change_1h < -velocityDropPct AND net_buyers_1h < 0).
+    // Precedence: after partial TP + trailing, before DRAWDOWN_RECOVERY/OOR.
+    // Reversibility: velocityExitEnabled=false → silent skip.
+    if (mgmt.velocityExitEnabled !== false && pnlPct > 0) {
+      const pc1h = Number(snapshot.price_change_1h_pct);
+      const nb1h = Number(snapshot.net_buyers_1h);
+      if (
+        Number.isFinite(pc1h) &&
+        Number.isFinite(nb1h) &&
+        pc1h < -(mgmt.velocityDropPct ?? 15) &&
+        nb1h < 0
+      ) {
+        return {
+          action: "VELOCITY_EXIT",
+          reason: `Velocity exit: 1h price ${pc1h.toFixed(2)}% < -${mgmt.velocityDropPct ?? 15}% AND net_buyers_1h ${nb1h} < 0 while in profit (${pnlPct.toFixed(2)}%) — momentum reversal`,
         };
       }
     }
