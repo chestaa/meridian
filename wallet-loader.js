@@ -4,6 +4,7 @@ import { fileURLToPath } from "url";
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 import { log } from "./logger.js";
+import { isEncrypted, resolveValue } from "./lib/env-crypto.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BLACKLIST_PATH = path.join(__dirname, "config", "main-wallets-blacklist.json");
@@ -62,6 +63,19 @@ export function getSigningWallet() {
     );
   } else {
     throw new Error("No wallet key found. Set BURNER_WALLET_KEY (or WALLET_PRIVATE_KEY with DRY_RUN=true for dry-run).");
+  }
+
+  // At-rest decryption (Vega — post pk-leak intel). If the key is enc:-prefixed,
+  // decrypt with ENV_ENCRYPTION_KEY before use. Plaintext keys pass through
+  // unchanged (backward compatible, opt-in). A decrypt failure throws — we NEVER
+  // proceed with a corrupt/half-decrypted key. The decrypted secret is NEVER logged.
+  if (isEncrypted(secret)) {
+    try {
+      secret = resolveValue(secret); // reads ENV_ENCRYPTION_KEY internally
+    } catch (e) {
+      throw new Error(`Failed to decrypt wallet key from ${source}: ${e.message}`);
+    }
+    source = `${source} (enc:AES-256-GCM)`;
   }
 
   let kp;
