@@ -835,13 +835,22 @@ export async function runScreeningCycle({ silent = false } = {}) {
       return screenReport;
     }
 
-    // Pre-fetch active_bin for all passing candidates in parallel
+    // Orion cost fix (2026-06-01) — cap the candidate list shown to the LLM.
+    // `passing` is already score-ordered from the top-10 discovery slice; sending all
+    // of them (each with up to 500-char narrative + 500-char memory) is the main driver
+    // of the 6k+ prompt-token bloat that escalated screening into the v4-pro premium tier.
+    // Top-5 keeps the highest-conviction candidates while bounding prompt size. Reporting
+    // (rejectedCandidates) still uses the full `passing` list below.
+    const PROMPT_CANDIDATE_CAP = config.llm.screeningPromptCandidateCap ?? 5;
+    const promptCandidates = passing.slice(0, PROMPT_CANDIDATE_CAP);
+
+    // Pre-fetch active_bin for prompt candidates in parallel
     const activeBinResults = await Promise.allSettled(
-      passing.map(({ pool }) => getActiveBin({ pool_address: pool.pool }))
+      promptCandidates.map(({ pool }) => getActiveBin({ pool_address: pool.pool }))
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
+    const candidateBlocks = promptCandidates.map(({ pool, sw, n, ti, mem }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
@@ -884,8 +893,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
-        n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
-        mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
+        n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 240)}` : `  narrative_untrusted: none`,
+        mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 240)}` : null,
       ].filter(Boolean).join("\n");
 
       // Stage signals for Darwinian weighting — captured before LLM decides
@@ -1000,11 +1009,11 @@ SCREENING CYCLE
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
-PRE-LOADED CANDIDATES (${passing.length} pools):
+PRE-LOADED CANDIDATES (top ${promptCandidates.length} of ${passing.length} by score):
 ${candidateBlocks.join("\n\n")}
 ${orionBlock ? `\nORION PRE-JUDGMENT (advisory — you may override):\n${orionBlock}\n` : ""}
 ${andromedaOn ? terseReportSteps : legacyReportSteps}
-      `, config.llm.maxSteps, [], "SCREENER", null, 2048, {
+      `, config.llm.screeningMaxSteps ?? config.llm.maxSteps, [], "SCREENER", null, 2048, {
         onToolStart: async ({ name }) => {
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);

@@ -158,6 +158,15 @@ export const config = {
     // 0 bonus (NEUTRAL, never penalize). Default OFF (opt-in).
     feeGenSymmetryBonusEnabled: u.feeGenSymmetryBonusEnabled ?? false,
     feeGenSymmetryWeight:       u.feeGenSymmetryWeight       ?? 300,
+    // ─── Deployability pre-filter (Cassiopeia, Lyra cost-cut) — NOT a risk gate ───
+    // This bot deploys single-side SOL ONLY (executor.js refuses amount_x>0). Pools
+    // quoted in anything but wSOL (USDC etc.) are UNDEPLOYABLE — judged then refused
+    // at deploy. Pure SCREENER+enrichment waste (Lyra: ~17% of candidates, e.g.
+    // GACHA-USDC, AVICI-USDC). When true (default — we ARE SOL-only), reject non-SOL
+    // -quoted pools BEFORE enrichment AND the LLM judge. BASE filter (paper+live).
+    // FAIL-SAFE: missing quote mint → reject (anti-pattern #2). Reject reason:
+    // non_sol_quote_undeployable. Set false to disable (no filter).
+    requireSolQuote: u.requireSolQuote ?? true,
   },
 
   // ─── Position Management ────────────────
@@ -287,6 +296,13 @@ export const config = {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
     maxSteps:    u.maxSteps    ?? 20,
+    // Orion cost fix (2026-06-01) — screening is lookup-heavy (candidates pre-loaded,
+    // active_bin pre-fetched); it needs at most pick→deploy→ack. A dedicated, lower cap
+    // bounds runaway/stall loops on the 97%-cost SCREENER without touching MANAGER/GENERAL.
+    screeningMaxSteps: u.screeningMaxSteps ?? 8,
+    // Orion cost fix (2026-06-01) — cap how many scored candidates are rendered into the
+    // SCREENER goal. Trims the dominant prompt-token driver; reporting still sees all.
+    screeningPromptCandidateCap: u.screeningPromptCandidateCap ?? 5,
     managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "xiaomi/mimo-v2-omni",
     screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "xiaomi/mimo-v2-pro",
     generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "xiaomi/mimo-v2-omni",
@@ -532,6 +548,7 @@ export function reloadScreeningThresholds() {
     if (fresh.maxTvlMcapRatio    != null) s.maxTvlMcapRatio = fresh.maxTvlMcapRatio;
     if (fresh.feeGenSymmetryBonusEnabled !== undefined) s.feeGenSymmetryBonusEnabled = fresh.feeGenSymmetryBonusEnabled;
     if (fresh.feeGenSymmetryWeight != null) s.feeGenSymmetryWeight = fresh.feeGenSymmetryWeight;
+    if (fresh.requireSolQuote     !== undefined) s.requireSolQuote = fresh.requireSolQuote;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

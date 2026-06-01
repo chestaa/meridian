@@ -11,7 +11,12 @@
 
 import { getLlmUsageSummary } from "./llm-usage.js";
 
-export const DAILY_CAP_USD = 0.75;
+// Daily cap raised 0.75 → 1.10 (Vega, 2026-06-01). Rationale: $0.75 hit at 12:01
+// halting LLM rest of day (blind-out) while weekly sat at $1.25/$5. With Orion's
+// screener fix (v4-pro → flash, projected ~$0.05/day) actual burn is far below this;
+// the higher daily is purely a spike safety-margin. Weekly $5 is the REAL backstop
+// and is UNCHANGED — a runaway day still gets caught by the weekly window.
+export const DAILY_CAP_USD = 1.10;
 export const WEEKLY_CAP_USD = 5.00;
 export const ALERT_THRESHOLD_PCT = 0.80;
 

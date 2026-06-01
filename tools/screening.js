@@ -11,6 +11,12 @@ import { fetchDiscordMeteoraIdnRanked } from "./sources/discord-meteoraidn.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
+// Wrapped SOL mint. We deploy single-side SOL ONLY (executor.js refuses
+// amount_x>0), so any pool quoted in something else (USDC, etc.) is
+// undeployable. Used by solQuoteRejectReason() to cut undeployable waste
+// pre-LLM. Exact 32-byte wSOL mint — do not abbreviate.
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
+
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
@@ -225,6 +231,35 @@ export function tvlMcapGateRejectReason(pool, s) {
   if (tvl == null || tvl < 0) return "tvl_mcap_ratio_unknown";
   const ratio = tvl / mcap;
   if (ratio > maxRatio) return "tvl_mcap_ratio_too_high";
+  return null;
+}
+
+/**
+ * Deployability pre-filter (Cassiopeia, Lyra cost-cut) — NOT a risk gate.
+ *
+ * This bot deploys single-side SOL ONLY (executor.js rejects amount_x>0). A pool
+ * quoted in anything other than wSOL (e.g. USDC) is UNDEPLOYABLE — it would be
+ * judged by the LLM, then REFUSED at deploy. Pure SCREENER-cost + clutter waste
+ * (Lyra: ~17% of surfaced candidates, e.g. GACHA-USDC 33x, AVICI-USDC 28x).
+ *
+ * We reject such pools BEFORE the LLM judge to save cost. Lives in screening
+ * (not executor) purely so the spend is never incurred; deployability, not risk.
+ *
+ * FAIL-SAFE (anti-pattern #2): if the quote mint is missing we CANNOT confirm
+ * the pool is SOL-quoted → reject (non_sol_quote_undeployable). Never default to
+ * "assume SOL" — an unknown quote is undeployable by definition.
+ *
+ * Returns a reject reason string, or null if the pool passes / filter disabled.
+ *
+ * @param {object} pool - condensed pool (expects pool.quote.mint)
+ * @param {object} s - effective screening thresholds (carries requireSolQuote)
+ */
+export function solQuoteRejectReason(pool, s) {
+  if (s?.requireSolQuote !== true) return null; // filter disabled → no-op
+  const quoteMint = pool?.quote?.mint;
+  // Fail-safe: missing quote mint → cannot confirm deployability → reject.
+  if (quoteMint == null || quoteMint === "") return "non_sol_quote_undeployable";
+  if (quoteMint !== WSOL_MINT) return "non_sol_quote_undeployable";
   return null;
 }
 
@@ -846,6 +881,26 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     })
     .sort((a, b) => scoreCandidate(b, eff) - scoreCandidate(a, eff))
     .slice(0, limit);
+
+  // Deployability pre-filter (Cassiopeia, Lyra cost-cut) — runs BEFORE all
+  // enrichment (PVP/Jupiter audit/OKX) and BEFORE the LLM judge. We deploy
+  // single-side SOL only; non-SOL-quoted pools (USDC etc.) are undeployable and
+  // pure waste. Cut them here so we never spend enrichment OR judge cost on
+  // them. BASE filter (fires both paper and live). Fail-closed on missing quote.
+  if (eff.requireSolQuote === true && eligible.length > 0) {
+    const beforeSq = eligible.length;
+    const kept = eligible.filter((p) => {
+      const reason = solQuoteRejectReason(p, eff);
+      if (reason) {
+        log("screening", `Deployability: dropped ${p.name} — ${reason} (quote=${p.quote?.symbol || p.quote?.mint || "unknown"})`);
+        pushFilteredReason(filteredOut, p, reason);
+        return false;
+      }
+      return true;
+    });
+    eligible.splice(0, eligible.length, ...kept);
+    if (eligible.length < beforeSq) log("screening", `SOL-quote filter removed ${beforeSq - eligible.length} undeployable pool(s)`);
+  }
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
     await enrichPvpRisk(eligible);

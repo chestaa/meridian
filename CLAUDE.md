@@ -128,6 +128,8 @@ Before `deploy_position` executes:
 
 **TVL/MC ratio gate (Cassiopeia, Item 2 — LIVE-ONLY):** in `getTopCandidates()`, fires only when `DRY_RUN=false` AND `tvlMcapGateEnabled`. Rejects pools whose `tvl/mcap > maxTvlMcapRatio` (default 0.2). Thesis (@0xyunss + community, 71% win backtest): smaller TVL/MC → thinner liquidity vs cap → tighter active range → better fee capture. FAIL-SAFE: missing/zero mcap or tvl → `tvl_mcap_ratio_unknown` reject (anti-pattern #2). Pure fn `tvlMcapGateRejectReason(pool, s)`. Reject reasons: `tvl_mcap_ratio_too_high`, `tvl_mcap_ratio_unknown`. Paper/backtest unaffected (live overlay).
 
+**SOL-quote deployability pre-filter (Cassiopeia, Lyra cost-cut — NOT a risk gate):** in `getTopCandidates()`, fires BEFORE all enrichment (PVP/Jupiter/OKX) AND before the LLM judge when `requireSolQuote` (default `true`). This bot deploys **single-side SOL only** (executor.js refuses `amount_x>0`), so pools quoted in anything but wSOL (`So11111111111111111111111111111111111111112`) are undeployable — judged then refused at deploy = pure SCREENER+enrichment waste (Lyra: ~17% of candidates, e.g. GACHA-USDC, AVICI-USDC). BASE filter (fires paper AND live). FAIL-SAFE: missing quote mint → reject (anti-pattern #2). Pure fn `solQuoteRejectReason(pool, s)` (reads condensed `pool.quote.mint`). Reject reason: `non_sol_quote_undeployable`. Tests: `scripts/test-sol-quote-filter.js` (10 assertions).
+
 ---
 
 ## Cassiopeia Rug-Protection Gates (screening.js)
