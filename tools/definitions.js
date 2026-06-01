@@ -190,6 +190,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           bin_step: { type: "number", description: "Pool bin step (from discover_pools)" },
           base_fee: { type: "number", description: "Pool base fee percentage (from discover_pools)" },
           volatility: { type: "number", description: "Pool volatility at deploy time, sourced from max(screening timeframe, 30m)" },
+          volume_window: { type: "number", description: "Pool volume in the screening window at deploy time (from discover_pools/get_top_candidates). Used for volume-regime strategy selection." },
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
           initial_value_usd: { type: "number", description: "Estimated USD value being deployed" }

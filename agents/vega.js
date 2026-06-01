@@ -189,7 +189,17 @@ export async function deployFromOrionVerdict(orionVerdict, candidate, context = 
     amountY = maxDeployAmount;
   }
 
-  const strategy = config.strategy?.strategy || "bid_ask";
+  // Item (b) — volume-regime strategy spread. The deterministic path is a
+  // "no explicit user strategy" caller, so when the regime feature is ON we
+  // deliberately leave `strategy` undefined and pass `volume_window` to let
+  // deployPosition's pickRegimeStrategy() choose (with its volatility guard).
+  // When OFF we keep the legacy config-level constant. This preserves
+  // override-wins: an explicit strategy would still win if one were ever
+  // passed here in future.
+  const volumeWindow = numberOrNull(pool.volume_window ?? pool.volume_24h ?? pool.volume);
+  const strategy = config.strategy?.volumeRegimeEnabled
+    ? undefined
+    : (config.strategy?.strategy || "bid_ask");
 
   // Pull bin_step from candidate so executor's bin_step gate has the value it needs.
   // Optional — if missing, executor falls back to the on-chain pool object.
@@ -213,6 +223,7 @@ export async function deployFromOrionVerdict(orionVerdict, candidate, context = 
     bins_below: binsBelow,
     bins_above: 0,
     volatility,
+    volume_window: volumeWindow,
     base_mint: pool.base?.mint || pool.base_mint || null,
     bin_step: binStep,
     fee_tvl_ratio: numberOrNull(pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio),
@@ -222,7 +233,7 @@ export async function deployFromOrionVerdict(orionVerdict, candidate, context = 
 
   log(
     "agent",
-    `[VEGA_DETERMINISTIC] deploying pool=${poolAddress.slice(0, 8)} amount=${amountY} bins_below=${binsBelow} strategy=${strategy} volatility=${volatility}`,
+    `[VEGA_DETERMINISTIC] deploying pool=${poolAddress.slice(0, 8)} amount=${amountY} bins_below=${binsBelow} strategy=${strategy ?? `regime(vol_window=${volumeWindow})`} volatility=${volatility}`,
   );
 
   let result;

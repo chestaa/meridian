@@ -146,6 +146,26 @@ Applied inside `getTopCandidates()` after OKX/Jupiter enrichment. All **base gat
 - Smart-money hard coupling (`requireSmartWalletOrHighOrganic`) was **removed** — it was a disguised organic floor. Organic is now governed solely by `minOrganic` (live overlay recommends 72); smart-money stays a `scoreCandidate` bonus only.
 - Tests: `scripts/test-gate-batch.js` (22 assertions).
 
+### Item (a) Fee-Gen-Token — balanced two-sided flow (SCORE BONUS, never a gate)
+
+`feeGenSymmetryBonus(pool, cfg)` (exported, pure, unit-tested) adds a `scoreCandidate` bonus
+for pools with balanced buy/sell flow. **DATA VERDICT:** the Pool Discovery API exposes NO
+per-side fee field (verified by live raw fetch — only aggregate `fee`/`avg_fee`/`fee_pct`/
+`dynamic_fee_pct`). So this is a **PROXY** on buy/sell volume symmetry: `pool.buy_vol`/
+`pool.sell_vol` are aggregated from OKX cluster flow (`buy_vol_usd`/`sell_vol_usd`) during
+`getTopCandidates` enrichment — no extra fetch. A pool whose buy share `buy/(buy+sell)` sits
+in the balanced band `[0.4, 0.6]` churns the active bin both directions → fees per crossing.
+
+- **Scoring:** triangular falloff — full `feeGenSymmetryWeight` (default 300) at perfect 0.5,
+  decaying linearly to 0 at band edges (0.4/0.6); outside band → 0.
+- **Config:** `feeGenSymmetryBonusEnabled` (default **FALSE** — opt-in), `feeGenSymmetryWeight` (300).
+- **FAIL-SAFE (anti-pattern #2):** missing/zero/non-finite/negative side volume → 0 bonus (NEUTRAL,
+  never penalize). **NEVER a gate** — a one-sided pump can still be a fine LP; gating on symmetry
+  would risk dormancy. Bonus is strictly additive (≥0), never a reject.
+- After OKX enrichment, `getTopCandidates` re-sorts (only when flag on) so the bonus influences
+  final ordering (the initial sort runs pre-enrichment when flow isn't yet attached → neutral there).
+- Tests: `scripts/test-feegen-symmetry.js` (17 assertions).
+
 ---
 
 ## bins_below Calculation (SCREENER)

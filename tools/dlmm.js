@@ -504,6 +504,45 @@ export async function getActiveBin({ pool_address }) {
   };
 }
 
+// ─── Item (b) — Volume-regime strategy picker (PURE) ───────────
+// Chooses the LP strategy from live pool metrics when no explicit strategy
+// is supplied and the regime feature is enabled (caller-gated).
+//
+//   HIGH volume (>= volumeRegimeHighThreshold) → "spot"   (tight fee capture)
+//   LOW  volume                                → "bid_ask" (catch volatility)
+//
+// CRITICAL volatility guard (Andromeda risk): a high-volatility pool is NEVER
+// assigned spot — spot on a volatile pool goes out-of-range instantly and
+// realizes IL. If volatility > volumeRegimeMaxVolForSpot → force bid_ask
+// regardless of volume.
+//
+// FAIL-SAFE: volume null/0/non-finite → return the configured default
+// (cfg.strategy) — no silent flip. Returns a strategy string.
+export function pickRegimeStrategy(volume_window, volatility, cfg) {
+  const fallback = cfg?.strategy ?? "bid_ask";
+  const vol = Number(volume_window);
+  // Bad/missing volume → fail-safe to configured default (no silent flip).
+  if (!Number.isFinite(vol) || vol <= 0) return fallback;
+
+  const highThreshold = Number.isFinite(Number(cfg?.volumeRegimeHighThreshold))
+    ? Number(cfg.volumeRegimeHighThreshold)
+    : 50000;
+  const maxVolForSpot = Number.isFinite(Number(cfg?.volumeRegimeMaxVolForSpot))
+    ? Number(cfg.volumeRegimeMaxVolForSpot)
+    : 3;
+
+  const isHighVolume = vol >= highThreshold;
+  if (!isHighVolume) return "bid_ask";
+
+  // High volume → candidate for spot, but apply the volatility guard.
+  const parsedVolatility = Number(volatility);
+  // If volatility is high (and known), NEVER spot — force bid_ask.
+  if (Number.isFinite(parsedVolatility) && parsedVolatility > maxVolForSpot) {
+    return "bid_ask";
+  }
+  return "spot";
+}
+
 // ─── Deploy Position ───────────────────────────────────────────
 export async function deployPosition({
   pool_address,
@@ -520,12 +559,24 @@ export async function deployPosition({
   bin_step,
   base_fee,
   volatility,
+  volume_window, // optional: live volume metric for regime strategy pick (item b)
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
 }) {
   pool_address = normalizeMint(pool_address);
-  const activeStrategy = strategy || config.strategy.strategy;
+  // Strategy resolution priority:
+  //   1. explicit `strategy` (LLM/manual override) — always wins
+  //   2. volume-regime pick — only when enabled AND no explicit strategy
+  //   3. config.strategy.strategy — legacy default / fail-safe
+  let activeStrategy;
+  if (strategy) {
+    activeStrategy = strategy; // override wins
+  } else if (config.strategy.volumeRegimeEnabled) {
+    activeStrategy = pickRegimeStrategy(volume_window, volatility, config.strategy);
+  } else {
+    activeStrategy = config.strategy.strategy; // legacy
+  }
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
   const parsedVolatility = volatility == null ? null : Number(volatility);

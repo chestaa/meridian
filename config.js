@@ -147,6 +147,17 @@ export const config = {
     // Reject reasons: tvl_mcap_ratio_too_high, tvl_mcap_ratio_unknown.
     tvlMcapGateEnabled: u.tvlMcapGateEnabled ?? true,
     maxTvlMcapRatio:    u.maxTvlMcapRatio    ?? 0.2,
+    // ─── Item (a) Fee-Gen-Token signal — balanced two-sided flow (SCORE BONUS ONLY) ───
+    // NEVER a gate (dormancy risk — a one-sided pump can still be a fine LP).
+    // Pool Discovery API exposes NO per-side fee field (verified live: only aggregate
+    // fee/avg_fee/fee_pct/dynamic_fee_pct). PROXY: buy/sell volume symmetry. A pool with
+    // balanced buy/sell flow (ratio in [0.4,0.6] of total) churns both directions →
+    // crosses the active bin repeatedly → generates fees on each swap (vs a one-sided
+    // drift that parks price at one edge). Awards feeGenSymmetryWeight when buy/(buy+sell)
+    // sits in the balanced band. FAIL-SAFE (anti-pattern #2): missing/zero side volume →
+    // 0 bonus (NEUTRAL, never penalize). Default OFF (opt-in).
+    feeGenSymmetryBonusEnabled: u.feeGenSymmetryBonusEnabled ?? false,
+    feeGenSymmetryWeight:       u.feeGenSymmetryWeight       ?? 300,
   },
 
   // ─── Position Management ────────────────
@@ -251,6 +262,17 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    // ── Item (b) — Volume-regime strategy spread (Andromeda plan) ──
+    // When enabled AND no explicit strategy is passed, pickRegimeStrategy()
+    // chooses spot (HIGH volume → tight fee capture) vs bid_ask (LOW volume →
+    // catch volatility). Default OFF — Bro Dikta enables manually after
+    // paper-soak. LLM/manual strategy override always wins. Volatility guard
+    // (Andromeda risk): a high-volatility pool is NEVER assigned spot —
+    // spot on a volatile pool = instant OOR + IL. Fail-safe: bad/missing
+    // volume → fall back to config.strategy.strategy (no silent flip).
+    volumeRegimeEnabled:      u.volumeRegimeEnabled      ?? false,
+    volumeRegimeHighThreshold: u.volumeRegimeHighThreshold ?? 50000,
+    volumeRegimeMaxVolForSpot: u.volumeRegimeMaxVolForSpot ?? 3,
   },
 
   // ─── Scheduling ─────────────────────────
@@ -508,6 +530,8 @@ export function reloadScreeningThresholds() {
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
     if (fresh.tvlMcapGateEnabled !== undefined) s.tvlMcapGateEnabled = fresh.tvlMcapGateEnabled;
     if (fresh.maxTvlMcapRatio    != null) s.maxTvlMcapRatio = fresh.maxTvlMcapRatio;
+    if (fresh.feeGenSymmetryBonusEnabled !== undefined) s.feeGenSymmetryBonusEnabled = fresh.feeGenSymmetryBonusEnabled;
+    if (fresh.feeGenSymmetryWeight != null) s.feeGenSymmetryWeight = fresh.feeGenSymmetryWeight;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

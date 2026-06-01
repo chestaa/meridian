@@ -98,13 +98,14 @@ console.log("\n[buildLessonsSection]");
 {
   const text = buildLessonsSection(mockLessonsState, mockUserConfig);
   assert("returns non-null", text != null);
-  assert("contains header 'Lessons Engine'", text.includes("Lessons Engine"));
-  assert("shows total records (4)", text.includes("Records: <b>4</b>"));
-  assert("shows live/paper breakdown", text.includes("live 1") && text.includes("paper 3"));
-  assert("flags minOrganic as evolved from 60", text.includes("evolved from 60"));
-  assert("shows minFeeActiveTvlRatio as default", text.includes("(default)"));
+  assert("uses plain header 'Apa yang Dipelajari Bot'", text.includes("Apa yang Dipelajari Bot"));
+  assert("states live close count (1) in plain language", text.includes("<b>1</b> posisi sungguhan"));
+  assert("mentions tightened standards (minOrganic evolved)", text.includes("memperketat"));
   assert("includes last evolution timestamp", text.includes("2026-05-15"));
-  assert("includes top lesson with highest confidence (88%)", text.includes("88%"));
+  assert("NO raw bin_step jargon", !/bin_step/.test(text));
+  assert("NO raw fee_tvl_ratio jargon", !/fee_tvl_ratio/.test(text));
+  assert("NO raw volatility= jargon", !/volatility=/.test(text));
+  assert("renders plain insight sentence", /cenderung (menguntungkan|merugi)/.test(text));
 
   // Graceful degradation
   const empty = buildLessonsSection(null, {});

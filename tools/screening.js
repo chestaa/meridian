@@ -71,14 +71,59 @@ export function tagSignalSource(pool, source) {
   return pool;
 }
 
-export function scoreCandidate(pool) {
+export function scoreCandidate(pool, cfg) {
   const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
   const organic = Number(pool.organic_score || 0);
   const volume = Number(pool.volume_window || 0);
   const holders = Number(pool.holders || 0);
   const sourceCount = Array.isArray(pool.signal_sources) ? pool.signal_sources.length : 1;
   const multiSourceBonus = Math.max(0, sourceCount - 1) * 500;
-  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100 + multiSourceBonus;
+  const symmetryBonus = feeGenSymmetryBonus(pool, cfg);
+  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100 + multiSourceBonus + symmetryBonus;
+}
+
+/**
+ * Item (a) Fee-Gen-Token — balanced two-sided flow SCORE BONUS (NEVER a gate).
+ *
+ * DATA VERDICT: the Pool Discovery API exposes NO per-side fee field (verified by
+ * live raw fetch — only aggregate fee/avg_fee/fee_pct/dynamic_fee_pct). So this is a
+ * PROXY built on buy/sell volume symmetry: a pool whose buy share buy/(buy+sell) sits
+ * in the balanced band [0.4, 0.6] churns price across the active bin in BOTH directions,
+ * generating swap fees each crossing — vs a one-sided drift that parks price at an edge
+ * and stops paying. pool.buy_vol / pool.sell_vol are aggregated from OKX cluster flow
+ * during getTopCandidates enrichment (no extra fetch).
+ *
+ * SCORING: award full feeGenSymmetryWeight at perfect 0.5 balance, decaying linearly to
+ * 0 at the band edges (0.4 / 0.6). Outside the band → 0. This is a soft nudge, not a cliff.
+ *
+ * FAIL-SAFE (anti-pattern #2): missing/non-finite/zero side volume → 0 bonus (NEUTRAL).
+ * We never penalize a pool for missing flow data — a pool we cannot rank on symmetry
+ * simply gets no symmetry credit. NEVER a gate: a one-sided pump can still be a fine LP,
+ * so gating on symmetry would risk dormancy (rejecting deployable pools).
+ *
+ * @param {object} pool - condensed pool; reads pool.buy_vol + pool.sell_vol (USD).
+ * @param {object} cfg  - config.screening overlay (feeGenSymmetryBonusEnabled, feeGenSymmetryWeight).
+ * @returns {number} bonus points (>= 0). 0 when disabled, missing data, or outside band.
+ */
+export function feeGenSymmetryBonus(pool, cfg) {
+  if (!cfg || cfg.feeGenSymmetryBonusEnabled !== true) return 0;
+  const weight = numeric(cfg.feeGenSymmetryWeight);
+  if (weight == null || weight <= 0) return 0;
+
+  const buy = numeric(pool?.buy_vol);
+  const sell = numeric(pool?.sell_vol);
+  // Fail-safe neutral: need both sides positive to compute a flow ratio.
+  if (buy == null || sell == null) return 0;
+  if (buy < 0 || sell < 0) return 0;
+  const total = buy + sell;
+  if (total <= 0) return 0;
+
+  const buyShare = buy / total;          // 0..1; 0.5 = perfectly balanced
+  const LOW = 0.4, HIGH = 0.6, MID = 0.5;
+  if (buyShare < LOW || buyShare > HIGH) return 0; // outside balanced band → no credit
+  // Triangular falloff: 1.0 at 0.5, 0.0 at band edges.
+  const proximity = 1 - Math.abs(buyShare - MID) / (MID - LOW);
+  return weight * proximity;
 }
 
 function numeric(value) {
@@ -799,7 +844,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       }
       return true;
     })
-    .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
+    .sort((a, b) => scoreCandidate(b, eff) - scoreCandidate(a, eff))
     .slice(0, limit);
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
@@ -953,6 +998,22 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].kol_in_clusters      = clusters.some((c) => c.has_kol);
         eligible[i].top_cluster_trend    = clusters[0]?.trend ?? null;      // buy|sell|neutral
         eligible[i].top_cluster_hold_pct = clusters[0]?.holding_pct ?? null;
+
+        // Item (a) Fee-Gen-Token — aggregate per-cluster buy/sell USD into a
+        // pool-level two-sided flow proxy (no extra fetch; reuses cluster data).
+        // Consumed by feeGenSymmetryBonus(). Only set when at least one finite
+        // side value exists; otherwise leave undefined so the bonus stays neutral.
+        let buyVol = 0, sellVol = 0, sawFlow = false;
+        for (const c of clusters) {
+          const b = Number(c?.buy_vol_usd);
+          const s = Number(c?.sell_vol_usd);
+          if (Number.isFinite(b)) { buyVol += b; sawFlow = true; }
+          if (Number.isFinite(s)) { sellVol += s; sawFlow = true; }
+        }
+        if (sawFlow) {
+          eligible[i].buy_vol = buyVol;
+          eligible[i].sell_vol = sellVol;
+        }
       }
     }
     // Wash trading hard filter — fake volume = misleading fee yield
@@ -1146,6 +1207,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) {
       log("screening", `Indicator confirmation removed ${before - eligible.length} candidate(s)`);
     }
+  }
+
+  // Item (a) — re-rank now that OKX flow (buy_vol/sell_vol) is enriched, so the
+  // Fee-Gen-Token symmetry bonus (if enabled) can influence final ordering. The
+  // earlier sort ran pre-enrichment when flow data wasn't yet attached. Pure
+  // re-order — adds/removes nothing, fail-safe neutral when the flag is off.
+  if (eligible.length > 1 && eff.feeGenSymmetryBonusEnabled === true) {
+    eligible.sort((a, b) => scoreCandidate(b, eff) - scoreCandidate(a, eff));
   }
 
   return {

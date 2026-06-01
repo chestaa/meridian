@@ -66,6 +66,22 @@ async function getSolBalance(pubkey, rpcUrl) {
   } catch { return null; }
 }
 
+/**
+ * Live SOL/USD price. Returns null on any failure — callers must render
+ * "USD unavailable" rather than a wrong number (never show a stale/hardcoded
+ * price). Uses Jupiter price API; falls back to null silently.
+ */
+async function getSolUsdPrice() {
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+  try {
+    const res = await fetch(`https://lite-api.jup.ag/price/v2?ids=${SOL_MINT}`);
+    if (!res.ok) return null;
+    const d = await res.json();
+    const px = Number(d?.data?.[SOL_MINT]?.price);
+    return Number.isFinite(px) && px > 0 ? px : null;
+  } catch { return null; }
+}
+
 async function sendTelegram(token, chatId, html) {
   const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
@@ -79,6 +95,122 @@ async function sendTelegram(token, chatId, html) {
 // ─── Section generators (pure, exported) ─────────────────────────
 
 /**
+ * Wallet balance section. USD only shown when a live price is supplied;
+ * a null/invalid price renders "(nilai USD tidak tersedia)" instead of a
+ * wrong hardcoded number. (BUG 1 fix — was hardcoded $135/SOL.)
+ * @param {number|null} solBalance
+ * @param {number|null} solUsd - live SOL/USD price, or null if unavailable
+ * @param {string|null} pubkey
+ */
+export function buildBalanceSection(solBalance, solUsd, pubkey) {
+  if (solBalance == null) return `💳 Saldo wallet\n<i>tidak terbaca</i>`;
+  const addr = pubkey ? `\n<i>${pubkey.slice(0, 8)}...${pubkey.slice(-4)}</i>` : "";
+  const usd = Number.isFinite(solUsd) && solUsd > 0
+    ? ` (~$${(solBalance * solUsd).toFixed(2)} · SOL @ $${solUsd.toFixed(0)})`
+    : ` <i>(nilai USD tidak tersedia)</i>`;
+  return `💳 Saldo wallet\n<code>${solBalance.toFixed(4)} SOL</code>${usd}${addr}`;
+}
+
+/**
+ * Trading performance section. (BUG 2 fix.)
+ *
+ * Headline win-rate now comes from LIVE closes only (lessons.performance
+ * where source !== "paper"), windowed to recent activity — NOT the frozen
+ * paper-trades.json blind-scanner batch (47 trades from May 2026 that
+ * polluted the old all-time number into 14W/33L, -8.3%).
+ *
+ * Paper sim results are shown separately and clearly labelled as practice,
+ * so losses are never hidden — just attributed honestly.
+ *
+ * @param {Array} liveRecords - lessons.performance entries (live + paper mixed)
+ * @param {Array} paperTrades - paper-trades.json rows (closed sim trades)
+ * @param {number} openCount  - currently open positions
+ * @param {number} windowDays - recency window for the live headline (default 30)
+ */
+export function buildTradeSection(liveRecords, paperTrades, openCount = 0, windowDays = 30) {
+  const recs = Array.isArray(liveRecords) ? liveRecords : [];
+  const cutoff = Date.now() - windowDays * 86_400_000;
+  const live = recs.filter(r => r && r.source !== "paper");
+  const liveRecent = live.filter(r => {
+    const ts = Date.parse(r.recorded_at || r.closed_at || "");
+    return Number.isFinite(ts) && ts >= cutoff;
+  });
+  const liveWins = liveRecent.filter(r => (r.pnl_usd ?? r.pnl_pct ?? 0) > 0).length;
+  const liveWinRate = liveRecent.length ? Math.round((liveWins / liveRecent.length) * 100) : null;
+  const liveAvgPct = liveRecent.length
+    ? (liveRecent.reduce((s, r) => s + (r.pnl_pct ?? 0), 0) / liveRecent.length)
+    : null;
+
+  const lines = [`📊 Hasil Trading (uang sungguhan)`];
+  if (openCount > 0) lines.push(`▶️ Posisi aktif sekarang: <b>${openCount}</b>`);
+
+  if (liveRecent.length > 0) {
+    const liveLosses = liveRecent.length - liveWins;
+    lines.push(`✅ Menang: ${liveWins}  ❌ Kalah: ${liveLosses}  (dari ${liveRecent.length} posisi ${windowDays} hari terakhir)`);
+    lines.push(`🎯 Tingkat kemenangan: <b>${liveWinRate}%</b>`);
+    if (liveAvgPct != null) {
+      const verb = liveAvgPct >= 0 ? "untung" : "rugi";
+      lines.push(`📈 Rata-rata per posisi: <b>${liveAvgPct >= 0 ? "+" : ""}${liveAvgPct.toFixed(1)}%</b> (${verb})`);
+    }
+  } else {
+    lines.push(`Belum ada posisi sungguhan yang ditutup dalam ${windowDays} hari terakhir.`);
+  }
+
+  // Paper sim — shown separately, labelled as practice (never hidden, never
+  // mixed into the headline). Only render if there are sim trades.
+  const paper = Array.isArray(paperTrades) ? paperTrades.filter(t => t.closed_at) : [];
+  if (paper.length > 0) {
+    const pnl = t => (t.final_fee_inclusive_pnl_pct ?? t.fee_inclusive_pnl_pct ?? t.final_pnl_pct ?? t.pnl_pct ?? 0);
+    const pw = paper.filter(t => pnl(t) > 0).length;
+    lines.push(`<i>— Latihan simulasi (bukan uang asli): ${pw} menang / ${paper.length - pw} kalah, data lama mode uji coba —</i>`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Convert one raw lesson record into a plain-Indonesian insight sentence an
+ * investor understands — no bin_step / volatility / fee_tvl_ratio jargon.
+ * Reads structured fields (outcome, pnl_pct, context) so it degrades safely
+ * when the rule text shape changes.
+ * @param {Object} lesson
+ * @returns {string|null}
+ */
+export function lessonToPlain(lesson) {
+  if (!lesson || !lesson.rule) return null;
+  const rule = String(lesson.rule);
+
+  // Auto-evolved threshold lessons → describe the self-tuning behaviour plainly.
+  if (/AUTO-EVOLVED/i.test(rule)) {
+    return "Bot menyesuaikan sendiri standar pemilihan pool agar lebih ketat, berdasarkan hasil posisi sebelumnya.";
+  }
+
+  // Pull numbers from the structured context string (more reliable than the rule prose).
+  const ctx = String(lesson.context || rule);
+  const num = (re) => { const m = ctx.match(re); return m ? parseFloat(m[1]) : null; };
+  const vol     = num(/volatility=([\d.]+)/);
+  const feeTvl  = num(/fee_tvl_ratio=([\d.]+)/);
+  const pnlPct  = Number.isFinite(lesson.pnl_pct) ? lesson.pnl_pct : num(/PnL\s*([+\-]?[\d.]+)%/);
+
+  const volWord = vol == null ? null : (vol < 2 ? "tenang" : vol < 4 ? "sedang" : "tinggi");
+  const feeWord = feeTvl == null ? null : (feeTvl < 0.1 ? "rendah (di bawah 0.1)" : feeTvl < 0.2 ? "sedang" : "bagus");
+
+  const good = lesson.outcome === "good" || /^PREFER|^WORKED/i.test(rule);
+  const bad  = lesson.outcome === "poor" || lesson.outcome === "bad" || /^FAILED/i.test(rule);
+
+  const traits = [];
+  if (feeWord) traits.push(`fee ${feeWord}`);
+  if (volWord) traits.push(`pergerakan harga ${volWord}`);
+  const traitStr = traits.length ? `pool dengan ${traits.join(" + ")}` : "pola pool tertentu";
+  const pnlStr = pnlPct != null ? ` (hasil ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%)` : "";
+
+  if (good) return `${cap(traitStr)} cenderung menguntungkan${pnlStr} — bot memprioritaskan pola ini.`;
+  if (bad)  return `${cap(traitStr)} cenderung merugi${pnlStr} — bot sekarang menghindari pola ini.`;
+  return `${cap(traitStr)}${pnlStr}.`;
+}
+
+function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+/**
  * Lessons Engine State — performance records + evolved thresholds + top lessons.
  * @param {Object} lessonsState - normalized { lessons:[], performance:[], _lastEvolved?, _config? }
  * @returns {string|null}
@@ -89,18 +221,17 @@ export function buildLessonsSection(lessonsState, userConfig = {}) {
   }
   const perf = Array.isArray(lessonsState.performance) ? lessonsState.performance : [];
   const lessons = Array.isArray(lessonsState.lessons) ? lessonsState.lessons : [];
-  const paperCount = perf.filter(p => p.source === "paper").length;
   const liveCount  = perf.filter(p => p.source !== "paper").length;
 
   const minOrganic    = userConfig.minOrganic ?? DEFAULT_MIN_ORGANIC;
   const minFeeRatio   = userConfig.minFeeActiveTvlRatio ?? DEFAULT_MIN_FEE_ACTIVE_TVL_RATIO;
   const lastEvolved   = userConfig._lastEvolved || null;
-  const organicTag    = minOrganic === DEFAULT_MIN_ORGANIC ? "default" : `evolved from ${DEFAULT_MIN_ORGANIC}`;
-  const feeRatioTag   = minFeeRatio === DEFAULT_MIN_FEE_ACTIVE_TVL_RATIO ? "default" : `evolved from ${DEFAULT_MIN_FEE_ACTIVE_TVL_RATIO}`;
+  const tightened     = (minOrganic !== DEFAULT_MIN_ORGANIC) || (minFeeRatio !== DEFAULT_MIN_FEE_ACTIVE_TVL_RATIO);
 
-  // Top 3 lessons by confidence desc, tie-break recency
+  // Top 3 lessons by confidence desc, tie-break recency. Skip auto-evolved
+  // bookkeeping entries here — those are summarised in one line below.
   const ranked = [...lessons]
-    .filter(l => l && l.rule)
+    .filter(l => l && l.rule && !/AUTO-EVOLVED/i.test(String(l.rule)))
     .sort((a, b) => {
       const ca = a.confidence ?? 0;
       const cb = b.confidence ?? 0;
@@ -110,18 +241,20 @@ export function buildLessonsSection(lessonsState, userConfig = {}) {
     .slice(0, 3);
 
   const lines = [
-    `🧠 <b>Lessons Engine</b>`,
-    `Records: <b>${perf.length}</b> (live ${liveCount} · paper ${paperCount})`,
-    `minOrganic: <b>${minOrganic}</b> (${organicTag})`,
-    `minFeeActiveTvlRatio: <b>${minFeeRatio}</b> (${feeRatioTag})`,
+    `🧠 <b>Apa yang Dipelajari Bot</b>`,
+    `Bot belajar dari <b>${liveCount}</b> posisi sungguhan yang sudah ditutup.`,
   ];
-  if (lastEvolved) lines.push(`Last evolution: <i>${lastEvolved.slice(0, 16).replace("T", " ")}</i>`);
+  if (tightened) {
+    lines.push(`Bot sudah memperketat standar pemilihan pool sendiri agar lebih selektif.`);
+  }
+  if (lastEvolved) {
+    lines.push(`<i>Penyesuaian terakhir: ${lastEvolved.slice(0, 16).replace("T", " ")}</i>`);
+  }
   if (ranked.length > 0) {
-    lines.push(`Top lessons:`);
+    lines.push(`Pelajaran utama:`);
     for (const l of ranked) {
-      const conf = l.confidence != null ? `${Math.round(l.confidence * 100)}%` : "—";
-      const rule = String(l.rule).slice(0, 90);
-      lines.push(`• [${conf}] ${rule}`);
+      const plain = lessonToPlain(l);
+      if (plain) lines.push(`• ${plain}`);
     }
   }
   return lines.join("\n");
@@ -229,16 +362,16 @@ async function runBossReport() {
     solBalance = await getSolBalance(burnerPubkey, RPC_URL);
   } catch { /* dry-run or no key */ }
 
-  // ─── paper trades ────────────────────────────────────────────────
+  // Live SOL/USD — null means "couldn't fetch", render USD as unavailable.
+  const solUsd = await getSolUsdPrice();
+
+  // ─── paper trades (simulation only — kept for the labelled practice line) ──
   const tradesRaw = readJson("paper-trades.json");
   const tradeArr = Array.isArray(tradesRaw?.trades) ? tradesRaw.trades : (Array.isArray(tradesRaw) ? tradesRaw : []);
-  const openTrades   = tradeArr.filter(t => !t.closed_at);
-  const closedTrades = tradeArr.filter(t => !!t.closed_at);
-  const winners = closedTrades.filter(t => (t.final_fee_inclusive_pnl_pct ?? t.fee_inclusive_pnl_pct ?? t.final_pnl_pct ?? t.pnl_pct ?? 0) > 0);
-  const losers  = closedTrades.filter(t => (t.final_fee_inclusive_pnl_pct ?? t.fee_inclusive_pnl_pct ?? t.final_pnl_pct ?? t.pnl_pct ?? 0) <= 0);
-  const totalPnlPct = closedTrades.length
-    ? (closedTrades.reduce((s, t) => s + (t.final_fee_inclusive_pnl_pct ?? t.fee_inclusive_pnl_pct ?? t.final_pnl_pct ?? t.pnl_pct ?? 0), 0) / closedTrades.length).toFixed(1)
-    : null;
+
+  // ─── live open positions (real money) from state.json ───────────────────
+  const stateData = readJson("state.json") || {};
+  const openLiveCount = Object.values(stateData.positions || {}).filter(p => p && !p.closed).length;
 
   // ─── signals ─────────────────────────────────────────────────────
   const inboxCount    = countFiles("signals/inbox");
@@ -280,23 +413,10 @@ async function runBossReport() {
   const modeEmoji = DRY_RUN ? "🔵" : "🟢";
   const modeText  = DRY_RUN ? "Simulasi (aman, belum pakai uang beneran)" : "LIVE — uang sungguhan";
 
-  const balSection = solBalance != null
-    ? `💳 Saldo wallet\n<code>${solBalance.toFixed(4)} SOL</code> (~$${(solBalance * 135).toFixed(2)})\n<i>${burnerPubkey?.slice(0,8)}...${burnerPubkey?.slice(-4)}</i>`
-    : `💳 Saldo wallet\n<i>tidak terbaca</i>`;
+  const balSection = buildBalanceSection(solBalance, solUsd, burnerPubkey);
 
-  const tradeSection = (() => {
-    if (closedTrades.length === 0 && openTrades.length === 0)
-      return `📊 Trading\nBelum ada trade sama sekali`;
-    const lines = [`📊 Trading`];
-    if (openTrades.length > 0) lines.push(`▶️ Posisi aktif: <b>${openTrades.length}</b>`);
-    if (closedTrades.length > 0) {
-      lines.push(`✅ Menang: ${winners.length}  ❌ Kalah: ${losers.length}`);
-      if (totalPnlPct) lines.push(`📈 Rata-rata PnL: <b>${totalPnlPct}%</b>`);
-    } else {
-      lines.push(`Belum ada trade selesai`);
-    }
-    return lines.join("\n");
-  })();
+  const livePerf = Array.isArray(lessonsState?.performance) ? lessonsState.performance : [];
+  const tradeSection = buildTradeSection(livePerf, tradeArr, openLiveCount, 30);
 
   const signalSection = (() => {
     const lines = [`📡 Sinyal Discord`];
