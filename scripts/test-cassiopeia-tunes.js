@@ -80,7 +80,7 @@ check("maxTop10Pct unchanged (base)",                      cfg?.maxTop10Pct,    
 check("liveOverrides.maxTop10Pct unchanged",               cfg?.liveOverrides?.maxTop10Pct, 55);
 check("liveOverrides.minOrganic unchanged",                cfg?.liveOverrides?.minOrganic, 75);
 check("liveOverrides.minFeeActiveTvlRatio unchanged",      cfg?.liveOverrides?.minFeeActiveTvlRatio, 0.07);
-check("maxPositions unchanged (1-slot envelope)",          cfg?.maxPositions,           1);
+check("maxPositions = 2 (Vega-validated 2-slot envelope)", cfg?.maxPositions,           2);
 
 // ─── 5. config.js propagation check ───────────────────────────
 // Confirm the runtime config object reads the new values, not the legacy defaults.
