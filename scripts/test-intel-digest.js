@@ -146,8 +146,15 @@ check("model is DeepSeek V4 Flash", capturedPayload.model === "deepseek/deepseek
 check("output capped (max_tokens set)", typeof capturedPayload.max_tokens === "number" && capturedPayload.max_tokens <= 1200);
 check("requests json_object format", capturedPayload.response_format?.type === "json_object");
 check("digest advisory_only flag true", digest.advisory_only === true);
-check("digest has 3 suggestions", digest.suggestions.length === 3);
-check("suggestion has category+confidence", digest.suggestions[0].category === "tech_tooling" && digest.suggestions[0].confidence === 0.6);
+// Dedup-vs-existing now filters suggestions that re-propose live features. The
+// mock returns 3 (MiMo tech_tooling + Fees/MC gate + RPC backoff). Fees/MC is
+// already implemented (minFeeActiveTvlRatio in user-config) → filtered. So
+// kept + deduped must still total 3, and the surviving #1 is the MiMo eval.
+check("kept + deduped == 3 (none lost)", digest.suggestions.length + digest.deduped_suggestions.length === 3);
+check("Fees/MC + TVL/MC gate filtered as already-implemented",
+  digest.deduped_suggestions.some((d) => /already_implemented:(fees_mc_gate|tvl_mcap_gate)/.test(d.dedup_reason || "")));
+check("surviving suggestion has category+confidence",
+  digest.suggestions[0]?.category === "tech_tooling" && digest.suggestions[0]?.confidence === 0.6);
 check("digest summary populated", digest.summary.length > 0);
 check("digest cost computed (>0)", digest.cost_usd > 0);
 check("digest cost is cheap (< $0.01)", digest.cost_usd < 0.01);
@@ -156,7 +163,7 @@ check("digest date is YYYY-MM-DD", /^\d{4}-\d{2}-\d{2}$/.test(digest.date));
 // ── 9. Telegram render is advisory + escapes HTML. ───────────────────────────
 const tg = topSuggestionsForTelegram(digest, 3);
 check("telegram render advisory-framed", /ADVISORY/i.test(tg) && /nothing auto-applies/i.test(tg));
-check("telegram render includes top suggestion", /Tighten Fees\/MC gate|Evaluate Xiaomi MiMo/.test(tg));
+check("telegram render includes surviving suggestion", /Evaluate Xiaomi MiMo/.test(tg));
 
 // ── 10. writeDigest writes ONLY under intel/digests/ (temp). ─────────────────
 const digestDir = path.join(intelDir, "digests");
