@@ -1,5 +1,5 @@
 {
-  "ts": "2026-06-02T14:31:01.325Z",
+  "ts": "2026-06-02T14:34:53.382Z",
   "wallet": {
     "pubkey": "DgA9MZ…1Hiu",
     "sol_free": 0.856167,
@@ -34,7 +34,7 @@
     "oor_wait_min": 20,
     "oor_cooldown_h": 6,
     "deploy_amount_sol": 0.2,
-    "max_positions": 1,
+    "max_positions": 2,
     "max_bot_pct": 20,
     "max_bundlers_pct": 20,
     "max_top10_pct": 55
