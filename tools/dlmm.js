@@ -543,6 +543,44 @@ export function pickRegimeStrategy(volume_window, volatility, cfg) {
   return "spot";
 }
 
+// ─── Item 1 — Fast bid-ask "bonus stage" override (PURE) ───────
+// Intel (@bengsharksol, 83% WR claim): in a FRESH/early-stage pool the price
+// tends to pump hard ("bonus stage"); an edge-weighted bid_ask sits ready at
+// the range edges to capture that one-directional burst, whereas a tight
+// `spot` position would be left behind instantly.
+//
+// HONEST SCOPE: the Meteora SDK exposes only Spot | Curve | BidAsk and no
+// per-bin custom weight — StrategyType.BidAsk *already is* the edge-weighted
+// distribution. So this is NOT a new shape; it is a TIMING override that only
+// matters when the regime picker would otherwise have returned `spot`. We layer
+// it AFTER pickRegimeStrategy so it never widens behavior beyond "fresh+volatile
+// → prefer bid_ask".
+//
+// Returns true only when ALL hold (FAIL-SAFE — anti-pattern #2 — any missing /
+// non-finite / non-qualifying metric → false → defer to the regime pick):
+//   - feature flag on (cfg.fastBidAskBonusEnabled)
+//   - token_age_hours is a finite number > 0 AND <= fastBidAskMaxAgeHours
+//   - volatility is a finite number >= fastBidAskMinVolatility
+// NEVER a gate, NEVER changes amount/bins/caps — strategy-shape only.
+export function isFastBidAskBonus(token_age_hours, volatility, cfg) {
+  if (!cfg?.fastBidAskBonusEnabled) return false;
+
+  const age = Number(token_age_hours);
+  if (!Number.isFinite(age) || age <= 0) return false; // missing/unknown age → no override
+
+  const vol = Number(volatility);
+  if (!Number.isFinite(vol) || vol <= 0) return false; // missing/unusable volatility → no override
+
+  const maxAge = Number.isFinite(Number(cfg?.fastBidAskMaxAgeHours))
+    ? Number(cfg.fastBidAskMaxAgeHours)
+    : 24;
+  const minVol = Number.isFinite(Number(cfg?.fastBidAskMinVolatility))
+    ? Number(cfg.fastBidAskMinVolatility)
+    : 3;
+
+  return age <= maxAge && vol >= minVol;
+}
+
 // ─── Deploy Position ───────────────────────────────────────────
 export async function deployPosition({
   pool_address,
@@ -560,6 +598,7 @@ export async function deployPosition({
   base_fee,
   volatility,
   volume_window, // optional: live volume metric for regime strategy pick (item b)
+  token_age_hours, // optional: pool/token age for fast bid-ask bonus override (item 1)
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
@@ -569,13 +608,30 @@ export async function deployPosition({
   //   1. explicit `strategy` (LLM/manual override) — always wins
   //   2. volume-regime pick — only when enabled AND no explicit strategy
   //   3. config.strategy.strategy — legacy default / fail-safe
+  //   then: fast bid-ask bonus override (item 1) — fresh+volatile forces
+  //   bid_ask, but ONLY when no explicit strategy was passed (override-wins
+  //   for the LLM/manual case is preserved) and the flag is on.
   let activeStrategy;
   if (strategy) {
-    activeStrategy = strategy; // override wins
-  } else if (config.strategy.volumeRegimeEnabled) {
-    activeStrategy = pickRegimeStrategy(volume_window, volatility, config.strategy);
+    activeStrategy = strategy; // explicit override wins — fast-BA never touches it
   } else {
-    activeStrategy = config.strategy.strategy; // legacy
+    if (config.strategy.volumeRegimeEnabled) {
+      activeStrategy = pickRegimeStrategy(volume_window, volatility, config.strategy);
+    } else {
+      activeStrategy = config.strategy.strategy; // legacy
+    }
+    // Item 1 — fast bid-ask "bonus stage": fresh + volatile → force bid_ask.
+    // No-op unless it actually changes the pick (typically when regime chose
+    // spot). FAIL-SAFE inside isFastBidAskBonus: missing age/volatility → false.
+    if (isFastBidAskBonus(token_age_hours, volatility, config.strategy)) {
+      if (activeStrategy !== "bid_ask") {
+        log(
+          "deploy",
+          `Fast bid-ask bonus: fresh(${token_age_hours}h)+volatile(${volatility}) overriding ${activeStrategy} -> bid_ask`,
+        );
+      }
+      activeStrategy = "bid_ask";
+    }
   }
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;

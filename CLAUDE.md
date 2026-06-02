@@ -68,7 +68,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 
 | Key | Section | Default |
 |-----|---------|---------|
-| minFeeActiveTvlRatio | screening | 0.05 |
+| minFeeActiveTvlRatio | screening | 0.06 |
 | minTvl / maxTvl | screening | 10k / 150k |
 | minVolume | screening | 500 |
 | minOrganic | screening | 60 |
@@ -81,7 +81,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | maxBundlersPct | screening | 30 |
 | maxTop10Pct | screening | 60 |
 | blockedLaunchpads | screening | [] |
-| minTokenAgeHours | screening | 24 |
+| minTokenAgeHours | screening | 12 |
 | maxTokenAgeHours | screening | 720 |
 | requireMintRenounced | screening | true |
 | requireFreezeRenounced | screening | true |
@@ -167,6 +167,36 @@ in the balanced band `[0.4, 0.6]` churns the active bin both directions → fees
 - After OKX enrichment, `getTopCandidates` re-sorts (only when flag on) so the bonus influences
   final ordering (the initial sort runs pre-enrichment when flow isn't yet attached → neutral there).
 - Tests: `scripts/test-feegen-symmetry.js` (17 assertions).
+
+### Intel adoption — fee/TVL high-preference + token-age sweet-spot (SCORE BONUSES, never gates)
+
+Community/yunus intel adopted RESPONSIBLY (evidence-based, anti-dormancy): the literal advice was
+a HARD fee/TVL floor at 0.20 and a HARD token-age band 12-48h. Both would starve the funnel
+(0.20 ⇒ permanent dormancy — we already had 0-deploy days at 0.08; 48h max ⇒ reject every mature
+pool). So both insights are captured as `scoreCandidate` SCORE BONUSES (re-ranking), NOT gates.
+
+- **`feeTvlHighBonus(pool, cfg)`** (exported, pure, unit-tested): linear ramp from
+  `feeTvlHighBonusFloor` (0.10) to `feeTvlHighBonusTarget` (0.20, the "king" line); 0 at/below
+  floor, full `feeTvlHighBonusWeight` (250) at/above target, capped above (no over-reward).
+  Reads `pool.fee_active_tvl_ratio` (present raw AND condensed).
+- **`tokenAgeSweetSpotBonus(pool, cfg)`** (exported, pure, unit-tested): flat full
+  `tokenAgeSweetSpotWeight` (200) inside `[tokenAgeSweetSpotLowHours, tokenAgeSweetSpotHighHours]`
+  (12-48h), 0 outside. Reads `pool.token_age_hours` (condensed) OR derives from
+  `pool.token_x.created_at` (raw).
+- **Hard floors stay modest (the anti-dormancy guarantee):** `minFeeActiveTvlRatio` base default
+  0.05→**0.06** (live overlay 0.08→**0.10**); `minTokenAgeHours` default 24→**12** (user-config
+  may go lower — currently 8); `maxTokenAgeHours` left generous (null/720, NOT slashed to 48).
+  The reject floor is NOT the bonus floor — a pool below 0.10 fee/TVL or outside 12-48h still
+  deploys, it just earns 0 bonus and ranks lower.
+- **Config (all default FALSE — opt-in, Bro enables after paper-soak):** `feeTvlHighBonusEnabled`,
+  `feeTvlHighBonusWeight` (250), `feeTvlHighBonusFloor` (0.10), `feeTvlHighBonusTarget` (0.20);
+  `tokenAgeSweetSpotBonusEnabled`, `tokenAgeSweetSpotWeight` (200), `tokenAgeSweetSpotLowHours` (12),
+  `tokenAgeSweetSpotHighHours` (48). All wired into `reloadScreeningThresholds`.
+- **FAIL-SAFE (anti-pattern #2):** missing/non-finite/negative input → 0 bonus (NEUTRAL, never
+  penalize, never reject). The final `getTopCandidates` re-sort fires when ANY of the three bonus
+  flags is on.
+- Tests: `scripts/test-feetvl-age-adopt.js` (25 assertions, incl. a dormancy-safety proof that a
+  blind 0.20 hard floor WOULD have rejected a mature/moderate pool that our ranking approach keeps).
 
 ---
 

@@ -197,6 +197,9 @@ export async function deployFromOrionVerdict(orionVerdict, candidate, context = 
   // override-wins: an explicit strategy would still win if one were ever
   // passed here in future.
   const volumeWindow = numberOrNull(pool.volume_window ?? pool.volume_24h ?? pool.volume);
+  // Item 1 — pool/token age for the fast bid-ask bonus-stage strategy override
+  // (deployPosition decides; this just supplies the metric). Optional/fail-safe.
+  const tokenAgeHours = numberOrNull(pool.token_age_hours ?? pool.age_hours);
   const strategy = config.strategy?.volumeRegimeEnabled
     ? undefined
     : (config.strategy?.strategy || "bid_ask");
@@ -224,6 +227,7 @@ export async function deployFromOrionVerdict(orionVerdict, candidate, context = 
     bins_above: 0,
     volatility,
     volume_window: volumeWindow,
+    token_age_hours: tokenAgeHours,
     base_mint: pool.base?.mint || pool.base_mint || null,
     bin_step: binStep,
     fee_tvl_ratio: numberOrNull(pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio),

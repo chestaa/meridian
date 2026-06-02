@@ -91,7 +91,11 @@ export const config = {
   // ─── Pool Screening Thresholds ───────────
   screening: {
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
-    minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
+    // Intel adoption — modest floor bump toward the fee/TVL "king" line (0.20)
+    // WITHOUT hard-gating it. Base default 0.05→0.06 (paper headroom kept); live
+    // overlay carries 0.10 (was 0.08). High fee/TVL is rewarded via the
+    // feeTvlHighBonus SCORE BONUS, not a punishing 0.20 reject floor (dormancy).
+    minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.06,
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
@@ -126,7 +130,7 @@ export const config = {
     maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
     allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
-    minTokenAgeHours:   u.minTokenAgeHours   ?? 24,  // skip rug-heavy <24h tokens (Cassiopeia gate)
+    minTokenAgeHours:   u.minTokenAgeHours   ?? 12,  // intel: catch 12-48h sweet-spot START (was 24; rug-heavy <12h still skipped). user-config may lower further (currently 8).
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? 720, // 30d — skip stale tokens (Cassiopeia gate)
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
     // ─── Cassiopeia Rug-Protection Base Gates (always-on, fail-closed) ───
@@ -158,6 +162,32 @@ export const config = {
     // 0 bonus (NEUTRAL, never penalize). Default OFF (opt-in).
     feeGenSymmetryBonusEnabled: u.feeGenSymmetryBonusEnabled ?? false,
     feeGenSymmetryWeight:       u.feeGenSymmetryWeight       ?? 300,
+    // ─── Intel adoption — fee/TVL HIGH-PREFERENCE score bonus (NEVER a gate) ───
+    // Community/yunus: "24h fee/TVL is KING, below ~20% doesn't cover IL." The
+    // literal advice = hard floor 0.20. We REFUSE to hard-gate 0.20 (we already
+    // had 0-deploy days at a 0.08 floor → 0.20 = permanent dormancy; yunus runs
+    // more sources/volume than us). We adopt the INSIGHT as a RANKING preference:
+    // linear ramp from feeTvlHighBonusFloor (0.10) to feeTvlHighBonusTarget (0.20,
+    // the "king" line), full weight at/above target. The actual reject floor stays
+    // modest (minFeeActiveTvlRatio — base 0.06, live overlay 0.10). FAIL-SAFE
+    // (anti-pattern #2): missing fee/TVL → 0 bonus (NEUTRAL, never penalize/reject).
+    // Default OFF (opt-in — Bro Dikta enables after paper-soak).
+    feeTvlHighBonusEnabled: u.feeTvlHighBonusEnabled ?? false,
+    feeTvlHighBonusWeight:  u.feeTvlHighBonusWeight  ?? 250,
+    feeTvlHighBonusFloor:   u.feeTvlHighBonusFloor   ?? 0.10,
+    feeTvlHighBonusTarget:  u.feeTvlHighBonusTarget  ?? 0.20,
+    // ─── Intel adoption — token-age SWEET-SPOT score bonus (NEVER a gate) ───
+    // Community: token-age sweet spot ~12-48h. The literal advice = REPLACE our
+    // 24-720h band with 12-48h. We REFUSE to slash maxTokenAgeHours to 48 (would
+    // reject every mature pool → mass dormancy). Instead: soft-PREFER pools in the
+    // [12,48]h band via flat full-weight bonus; mature pools get no age credit but
+    // still deploy. (Note: minTokenAgeHours hard floor already catches fresher
+    // pools — user-config currently 8h.) FAIL-SAFE (anti-pattern #2): missing age
+    // → 0 bonus (NEUTRAL). Default OFF (opt-in).
+    tokenAgeSweetSpotBonusEnabled: u.tokenAgeSweetSpotBonusEnabled ?? false,
+    tokenAgeSweetSpotWeight:       u.tokenAgeSweetSpotWeight       ?? 200,
+    tokenAgeSweetSpotLowHours:     u.tokenAgeSweetSpotLowHours      ?? 12,
+    tokenAgeSweetSpotHighHours:    u.tokenAgeSweetSpotHighHours     ?? 48,
     // ─── Deployability pre-filter (Cassiopeia, Lyra cost-cut) — NOT a risk gate ───
     // This bot deploys single-side SOL ONLY (executor.js refuses amount_x>0). Pools
     // quoted in anything but wSOL (USDC etc.) are UNDEPLOYABLE — judged then refused
@@ -282,6 +312,21 @@ export const config = {
     volumeRegimeEnabled:      u.volumeRegimeEnabled      ?? false,
     volumeRegimeHighThreshold: u.volumeRegimeHighThreshold ?? 50000,
     volumeRegimeMaxVolForSpot: u.volumeRegimeMaxVolForSpot ?? 3,
+    // ── Item 1 — "Fast bid-ask bonus stage" (intel @bengsharksol) ──
+    // Narrow OVERRIDE layered on top of the volume-regime picker: when a pool
+    // is FRESH (token_age_hours <= fastBidAskMaxAgeHours) AND volatile
+    // (volatility >= fastBidAskMinVolatility), force `bid_ask` so the position
+    // sits edge-weighted to catch the early/bonus-stage volatility burst.
+    // HONEST SCOPE: the Meteora SDK has NO custom per-bin weight — StrategyType
+    // .BidAsk *is* the edge-weighted shape. So this is a TIMING override, not a
+    // new distribution. It only changes anything when the regime picker would
+    // otherwise have chosen `spot` (high-volume fresh pool) — exactly the case
+    // where spot gets shredded by a bonus-stage pump. Default OFF — opt-in.
+    // FAIL-SAFE: missing/zero/non-finite age or volatility → no override
+    // (defer to regime picker; never silently flip).
+    fastBidAskBonusEnabled:  u.fastBidAskBonusEnabled  ?? false,
+    fastBidAskMaxAgeHours:   u.fastBidAskMaxAgeHours   ?? 24,
+    fastBidAskMinVolatility: u.fastBidAskMinVolatility ?? 3,
   },
 
   // ─── Scheduling ─────────────────────────
@@ -548,6 +593,14 @@ export function reloadScreeningThresholds() {
     if (fresh.maxTvlMcapRatio    != null) s.maxTvlMcapRatio = fresh.maxTvlMcapRatio;
     if (fresh.feeGenSymmetryBonusEnabled !== undefined) s.feeGenSymmetryBonusEnabled = fresh.feeGenSymmetryBonusEnabled;
     if (fresh.feeGenSymmetryWeight != null) s.feeGenSymmetryWeight = fresh.feeGenSymmetryWeight;
+    if (fresh.feeTvlHighBonusEnabled !== undefined) s.feeTvlHighBonusEnabled = fresh.feeTvlHighBonusEnabled;
+    if (fresh.feeTvlHighBonusWeight != null) s.feeTvlHighBonusWeight = fresh.feeTvlHighBonusWeight;
+    if (fresh.feeTvlHighBonusFloor  != null) s.feeTvlHighBonusFloor  = fresh.feeTvlHighBonusFloor;
+    if (fresh.feeTvlHighBonusTarget != null) s.feeTvlHighBonusTarget = fresh.feeTvlHighBonusTarget;
+    if (fresh.tokenAgeSweetSpotBonusEnabled !== undefined) s.tokenAgeSweetSpotBonusEnabled = fresh.tokenAgeSweetSpotBonusEnabled;
+    if (fresh.tokenAgeSweetSpotWeight    != null) s.tokenAgeSweetSpotWeight    = fresh.tokenAgeSweetSpotWeight;
+    if (fresh.tokenAgeSweetSpotLowHours  != null) s.tokenAgeSweetSpotLowHours  = fresh.tokenAgeSweetSpotLowHours;
+    if (fresh.tokenAgeSweetSpotHighHours != null) s.tokenAgeSweetSpotHighHours = fresh.tokenAgeSweetSpotHighHours;
     if (fresh.requireSolQuote     !== undefined) s.requireSolQuote = fresh.requireSolQuote;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;

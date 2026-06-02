@@ -85,7 +85,10 @@ export function scoreCandidate(pool, cfg) {
   const sourceCount = Array.isArray(pool.signal_sources) ? pool.signal_sources.length : 1;
   const multiSourceBonus = Math.max(0, sourceCount - 1) * 500;
   const symmetryBonus = feeGenSymmetryBonus(pool, cfg);
-  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100 + multiSourceBonus + symmetryBonus;
+  const feeTvlBonus = feeTvlHighBonus(pool, cfg);
+  const ageBonus = tokenAgeSweetSpotBonus(pool, cfg);
+  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100
+    + multiSourceBonus + symmetryBonus + feeTvlBonus + ageBonus;
 }
 
 /**
@@ -130,6 +133,93 @@ export function feeGenSymmetryBonus(pool, cfg) {
   // Triangular falloff: 1.0 at 0.5, 0.0 at band edges.
   const proximity = 1 - Math.abs(buyShare - MID) / (MID - LOW);
   return weight * proximity;
+}
+
+/**
+ * Intel adoption — fee/TVL HIGH-PREFERENCE SCORE BONUS (NEVER a gate).
+ *
+ * THESIS (community/yunus): "24h fee/TVL is KING — below ~20% it doesn't cover IL."
+ * The literal advice was a HARD floor at 0.20. We REFUSE to hard-gate at 0.20:
+ *   - We already saw 0-deploy days at a 0.08 floor (live overlay). A 0.20 floor
+ *     would near-certainly starve the funnel → permanent dormancy.
+ *   - yunus runs more sources / higher candidate volume; we cannot copy his floor
+ *     without his throughput. We adopt the INSIGHT (prefer high fee/TVL) as a
+ *     RANKING preference, while the actual reject floor stays modest
+ *     (minFeeActiveTvlRatio — base 0.06, live overlay recommends 0.10).
+ *
+ * SCORING: linear ramp from the floor (feeTvlHighBonusFloor, default 0.10) up to
+ * the "king" target (feeTvlHighBonusTarget, default 0.20). 0 bonus at/below floor,
+ * full feeTvlHighBonusWeight at/above target, proportional between. Pools ABOVE the
+ * king target keep full weight (capped) — no penalty for being extra-productive.
+ *
+ * FAIL-SAFE (anti-pattern #2): missing/non-finite/negative fee/TVL → 0 bonus
+ * (NEUTRAL — the hard floor in getRawPoolScreeningRejectReason already rejects
+ * pools with unknown fee/TVL; this bonus never penalizes, never rejects).
+ *
+ * @param {object} pool - reads pool.fee_active_tvl_ratio (present raw AND condensed).
+ * @param {object} cfg  - config.screening overlay.
+ * @returns {number} bonus points (>= 0). 0 when disabled / missing / at-or-below floor.
+ */
+export function feeTvlHighBonus(pool, cfg) {
+  if (!cfg || cfg.feeTvlHighBonusEnabled !== true) return 0;
+  const weight = numeric(cfg.feeTvlHighBonusWeight);
+  if (weight == null || weight <= 0) return 0;
+  const floor  = numeric(cfg.feeTvlHighBonusFloor);
+  const target = numeric(cfg.feeTvlHighBonusTarget);
+  if (floor == null || target == null || target <= floor) return 0;
+
+  const feeTvl = numeric(pool?.fee_active_tvl_ratio);
+  // Fail-safe neutral: no usable fee/TVL → no symmetry credit (never penalize).
+  if (feeTvl == null || feeTvl < 0) return 0;
+  if (feeTvl <= floor) return 0;                 // at/below floor → no preference credit
+  if (feeTvl >= target) return weight;           // king tier → full weight (capped)
+  // Linear ramp between floor and target.
+  return weight * ((feeTvl - floor) / (target - floor));
+}
+
+/**
+ * Intel adoption — token-age SWEET-SPOT SCORE BONUS (NEVER a gate).
+ *
+ * THESIS (community): the token-age sweet spot is ~12-48h. The literal advice was
+ * to REPLACE our 24-720h band with 12-48h. We REFUSE to slash maxTokenAgeHours to
+ * 48: that would reject EVERY mature pool (anything >2 days old) → mass dormancy.
+ * Instead we adopt the insight two ways:
+ *   1. Lower the hard floor minTokenAgeHours 24 → 12 (catch the sweet-spot START —
+ *      genuinely fresher pools that the 24h floor was rejecting).
+ *   2. This bonus soft-PREFERS pools inside the [12,48]h band without rejecting the
+ *      mature tail. Mature pools simply get no age credit; they still deploy.
+ *
+ * SCORING: full tokenAgeSweetSpotWeight inside the [low,high] band (default 12-48h),
+ * 0 outside. A flat plateau (not triangular) — every hour in the sweet spot is
+ * equally good; we do not micro-rank within the window.
+ *
+ * FAIL-SAFE (anti-pattern #2): missing/non-finite age → 0 bonus (NEUTRAL). Reads
+ * pool.token_age_hours (condensed) OR derives from pool.token_x.created_at (raw).
+ *
+ * @param {object} pool - reads pool.token_age_hours OR pool.token_x.created_at.
+ * @param {object} cfg  - config.screening overlay.
+ * @returns {number} bonus points (>= 0). 0 when disabled / missing / outside band.
+ */
+export function tokenAgeSweetSpotBonus(pool, cfg) {
+  if (!cfg || cfg.tokenAgeSweetSpotBonusEnabled !== true) return 0;
+  const weight = numeric(cfg.tokenAgeSweetSpotWeight);
+  if (weight == null || weight <= 0) return 0;
+  const low  = numeric(cfg.tokenAgeSweetSpotLowHours);
+  const high = numeric(cfg.tokenAgeSweetSpotHighHours);
+  if (low == null || high == null || high <= low) return 0;
+
+  let ageHours = numeric(pool?.token_age_hours);
+  if (ageHours == null) {
+    // Raw-pool path: derive from base token created_at (ms epoch).
+    const createdAt = numeric(pool?.token_x?.created_at);
+    if (createdAt != null && createdAt > 0) {
+      ageHours = (Date.now() - createdAt) / 3_600_000;
+    }
+  }
+  // Fail-safe neutral: no usable age → no credit (never penalize).
+  if (ageHours == null || ageHours < 0) return 0;
+  if (ageHours < low || ageHours > high) return 0;  // outside sweet spot → no credit
+  return weight;                                    // inside band → flat full weight
 }
 
 function numeric(value) {
@@ -1267,8 +1357,15 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // Item (a) — re-rank now that OKX flow (buy_vol/sell_vol) is enriched, so the
   // Fee-Gen-Token symmetry bonus (if enabled) can influence final ordering. The
   // earlier sort ran pre-enrichment when flow data wasn't yet attached. Pure
-  // re-order — adds/removes nothing, fail-safe neutral when the flag is off.
-  if (eligible.length > 1 && eff.feeGenSymmetryBonusEnabled === true) {
+  // re-order — adds/removes nothing, fail-safe neutral when all flags are off.
+  // Intel adoption — the fee/TVL high-preference and token-age sweet-spot bonuses
+  // also influence final ordering; their inputs (fee_active_tvl_ratio,
+  // token_age_hours) survive condensation, so a final re-rank keeps them honored
+  // after any enrichment-driven reorder. Pure re-order, never adds/removes a pool.
+  const reRankEnabled = eff.feeGenSymmetryBonusEnabled === true
+    || eff.feeTvlHighBonusEnabled === true
+    || eff.tokenAgeSweetSpotBonusEnabled === true;
+  if (eligible.length > 1 && reRankEnabled) {
     eligible.sort((a, b) => scoreCandidate(b, eff) - scoreCandidate(a, eff));
   }
 
