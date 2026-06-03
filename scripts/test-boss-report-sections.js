@@ -48,6 +48,7 @@ const mockUserConfig = {
   minOrganic: 65,                // evolved from 60
   minFeeActiveTvlRatio: 0.05,    // default
   _lastEvolved: "2026-05-15T10:30:00Z",
+  _positionsAtEvolution: 1,      // 4 perf records − 1 = 3 evaluated since
 };
 
 const mockTrades = [
@@ -102,6 +103,14 @@ console.log("\n[buildLessonsSection]");
   assert("states live close count (1) in plain language", text.includes("<b>1</b> posisi sungguhan"));
   assert("mentions tightened standards (minOrganic evolved)", text.includes("memperketat"));
   assert("includes last evolution timestamp", text.includes("2026-05-15"));
+  assert("clarifies date = last AUTO standard change (not last activity)", text.includes("Standar terakhir berubah otomatis"));
+  assert("shows positions evaluated since (4−1=3)", text.includes("3 posisi dievaluasi sejak itu"));
+  assert("reassures stale date is normal, not a dead engine", /normal, bukan berhenti/.test(text));
+
+  // No _positionsAtEvolution → falls back to non-counted reassurance, never errors
+  const noCount = buildLessonsSection(mockLessonsState, { ...mockUserConfig, _positionsAtEvolution: undefined });
+  assert("graceful when _positionsAtEvolution missing", noCount.includes("Standar terakhir berubah otomatis") && noCount.includes("tetap evaluasi"));
+
   assert("NO raw bin_step jargon", !/bin_step/.test(text));
   assert("NO raw fee_tvl_ratio jargon", !/fee_tvl_ratio/.test(text));
   assert("NO raw volatility= jargon", !/volatility=/.test(text));

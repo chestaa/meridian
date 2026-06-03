@@ -260,6 +260,11 @@ export function buildLessonsSection(lessonsState, userConfig = {}) {
   const minFeeRatio   = userConfig.minFeeActiveTvlRatio ?? DEFAULT_MIN_FEE_ACTIVE_TVL_RATIO;
   const lastEvolved   = userConfig._lastEvolved || null;
   const tightened     = (minOrganic !== DEFAULT_MIN_ORGANIC) || (minFeeRatio !== DEFAULT_MIN_FEE_ACTIVE_TVL_RATIO);
+  // Positions closed/evaluated since the last automatic threshold change.
+  // Bot re-evaluates every cycle; the date only moves when win/loss data
+  // justifies shifting a standard — a stale date ≠ a dead engine.
+  const posAtEvolution = Number.isFinite(userConfig._positionsAtEvolution) ? userConfig._positionsAtEvolution : null;
+  const evaluatedSince = (posAtEvolution !== null) ? Math.max(0, perf.length - posAtEvolution) : null;
 
   // Top 3 lessons by confidence desc, tie-break recency. Skip auto-evolved
   // bookkeeping entries here — those are summarised in one line below.
@@ -281,7 +286,14 @@ export function buildLessonsSection(lessonsState, userConfig = {}) {
     lines.push(`Bot sudah memperketat standar pemilihan pool sendiri agar lebih selektif.`);
   }
   if (lastEvolved) {
-    lines.push(`<i>Penyesuaian terakhir: ${lastEvolved.slice(0, 16).replace("T", " ")}</i>`);
+    const dateStr = lastEvolved.slice(0, 16).replace("T", " ");
+    if (evaluatedSince !== null && evaluatedSince > 0) {
+      // Make explicit: date = last AUTO threshold change, not last activity.
+      // Engine keeps evaluating; it just hasn't seen data significant enough to move a standard.
+      lines.push(`<i>Standar terakhir berubah otomatis: ${dateStr} · ${evaluatedSince} posisi dievaluasi sejak itu (data belum cukup beda buat geser standar — ini normal, bukan berhenti).</i>`);
+    } else {
+      lines.push(`<i>Standar terakhir berubah otomatis: ${dateStr} (bot tetap evaluasi tiap posisi ditutup; standar baru bergeser kalau data win/loss cukup beda).</i>`);
+    }
   }
   if (ranked.length > 0) {
     lines.push(`Pelajaran utama:`);
