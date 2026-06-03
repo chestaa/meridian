@@ -66,20 +66,53 @@ async function getSolBalance(pubkey, rpcUrl) {
   } catch { return null; }
 }
 
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+
 /**
- * Live SOL/USD price. Returns null on any failure — callers must render
- * "USD unavailable" rather than a wrong number (never show a stale/hardcoded
- * price). Uses Jupiter price API; falls back to null silently.
+ * Live SOL/USD price via a multi-source fallback chain. Returns null ONLY when
+ * EVERY source fails — callers then render "USD unavailable" rather than a
+ * wrong/stale/hardcoded number (never show a fabricated price).
+ *
+ * ROOT CAUSE (2026-06-03, Lyra): the old single source
+ * `lite-api.jup.ag/price/v2` now returns HTTP 404 ("Route not found") — Jupiter
+ * retired the v2 price route. The fetch fell through to null → "tidak tersedia".
+ * Jupiter price is now v3 and the response shape changed: the per-mint object
+ * carries `usdPrice` (v3) instead of `data[mint].price` (v2).
+ *
+ * Sources tried in order (first finite >0 wins):
+ *   1. Jupiter price v3  (lite-api.jup.ag/price/v3)  field: usdPrice
+ *   2. Jupiter price v3  (api.jup.ag/price/v3)        field: usdPrice  (mirror)
+ *   3. CoinGecko simple price                          field: solana.usd
  */
 async function getSolUsdPrice() {
-  const SOL_MINT = "So11111111111111111111111111111111111111112";
-  try {
-    const res = await fetch(`https://lite-api.jup.ag/price/v2?ids=${SOL_MINT}`);
-    if (!res.ok) return null;
-    const d = await res.json();
-    const px = Number(d?.data?.[SOL_MINT]?.price);
-    return Number.isFinite(px) && px > 0 ? px : null;
-  } catch { return null; }
+  const sources = [
+    {
+      name: "jup-v3-lite",
+      url: `https://lite-api.jup.ag/price/v3?ids=${SOL_MINT}`,
+      pick: (d) => Number(d?.[SOL_MINT]?.usdPrice),
+    },
+    {
+      name: "jup-v3-api",
+      url: `https://api.jup.ag/price/v3?ids=${SOL_MINT}`,
+      pick: (d) => Number(d?.[SOL_MINT]?.usdPrice),
+    },
+    {
+      name: "coingecko",
+      url: "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+      pick: (d) => Number(d?.solana?.usd),
+    },
+  ];
+
+  for (const src of sources) {
+    try {
+      const res = await fetch(src.url, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue;
+      const d = await res.json();
+      const px = src.pick(d);
+      if (Number.isFinite(px) && px > 0) return px;
+    } catch { /* try next source */ }
+  }
+  return null; // every source failed — caller renders "tidak tersedia"
 }
 
 async function sendTelegram(token, chatId, html) {
@@ -141,7 +174,7 @@ export function buildTradeSection(liveRecords, paperTrades, openCount = 0, windo
     ? (liveRecent.reduce((s, r) => s + (r.pnl_pct ?? 0), 0) / liveRecent.length)
     : null;
 
-  const lines = [`📊 Hasil Trading (uang sungguhan)`];
+  const lines = [`📊 Hasil Trading (real money)`];
   if (openCount > 0) lines.push(`▶️ Posisi aktif sekarang: <b>${openCount}</b>`);
 
   if (liveRecent.length > 0) {
@@ -162,7 +195,7 @@ export function buildTradeSection(liveRecords, paperTrades, openCount = 0, windo
   if (paper.length > 0) {
     const pnl = t => (t.final_fee_inclusive_pnl_pct ?? t.fee_inclusive_pnl_pct ?? t.final_pnl_pct ?? t.pnl_pct ?? 0);
     const pw = paper.filter(t => pnl(t) > 0).length;
-    lines.push(`<i>— Latihan simulasi (bukan uang asli): ${pw} menang / ${paper.length - pw} kalah, data lama mode uji coba —</i>`);
+    lines.push(`<i>— Latihan simulasi (bukan real money): ${pw} menang / ${paper.length - pw} kalah, data lama mode uji coba —</i>`);
   }
   return lines.join("\n");
 }
@@ -411,7 +444,7 @@ async function runBossReport() {
 
   // ─── build message ──────────────────────────────────────────────
   const modeEmoji = DRY_RUN ? "🔵" : "🟢";
-  const modeText  = DRY_RUN ? "Simulasi (aman, belum pakai uang beneran)" : "LIVE — uang sungguhan";
+  const modeText  = DRY_RUN ? "Simulasi (aman, belum pakai real money)" : "LIVE — real money";
 
   const balSection = buildBalanceSection(solBalance, solUsd, burnerPubkey);
 
