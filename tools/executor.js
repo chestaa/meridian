@@ -52,6 +52,31 @@ function numberOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * Pure SOL-coverage gate decision (Vega money-path). Returns a reject reason
+ * string, or null if coverage is OK. FAIL-CLOSED: a failed/unknown balance read
+ * (now `sol:null` from getWalletBalances, no longer the phantom sentinel 0) must
+ * NEVER be assumed sufficient — `null < x` is falsy in JS, so a naive
+ * `balance.sol < minRequired` would FAIL OPEN. Anti-pattern #2/#3: balance
+ * unknown ⇒ refuse, never assume funds.
+ *
+ * @param {object} balance  getWalletBalances() result (may carry error:true / sol:null)
+ * @param {number} amountY  SOL to deploy
+ * @param {number} gasReserve  SOL kept for gas
+ * @returns {string|null} reject reason, or null to allow
+ */
+export function solCoverageRejectReason(balance, amountY, gasReserve) {
+  const sol = Number(balance?.sol);
+  if (balance?.error || balance?.sol == null || !Number.isFinite(sol)) {
+    return `Balance read failed/unknown (${balance?.error_message || "no sol value"}) — refusing deploy. Cannot confirm SOL coverage; will not assume sufficient funds.`;
+  }
+  const minRequired = Number(amountY) + Number(gasReserve);
+  if (sol < minRequired) {
+    return `Insufficient SOL: have ${sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`;
+  }
+  return null;
+}
+
 function getVolatilityTimeframe(sourceTimeframe) {
   const source = String(sourceTimeframe || "").trim();
   const sourceMinutes = TIMEFRAME_MINUTES[source];
@@ -1043,13 +1068,8 @@ async function runSafetyChecks(name, args) {
       if (process.env.DRY_RUN !== "true") {
         const balance = await getWalletBalances();
         const gasReserve = config.management.gasReserve;
-        const minRequired = amountY + gasReserve;
-        if (balance.sol < minRequired) {
-          return {
-            pass: false,
-            reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
-          };
-        }
+        const reject = solCoverageRejectReason(balance, amountY, gasReserve);
+        if (reject) return { pass: false, reason: reject };
       }
 
       return { pass: true };

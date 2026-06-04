@@ -108,7 +108,132 @@ let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered manageme
 // Read-only: uses existing getWalletBalances() — Vega's wallet code untouched.
 const BALANCE_DRAIN_THRESHOLD_PCT = 20; // alert when SOL drops > this %
 const BALANCE_DRAIN_WINDOW_MS = 60 * 60 * 1000; // 1h sample window
+// A drop this large is treated as "catastrophic / likely drain" and REQUIRES a
+// confirming second read before any alert fires (defends against Helius blips
+// that previously returned sentinel 0 → phantom 100% drain).
+const BALANCE_DRAIN_CONFIRM_PCT = 90;
 let _lastBalanceSample = null; // { sol: number, at: ms }
+// Test-only seams for the drain monitor (production never calls these).
+export function __setLastBalanceSampleForTest(sample) { _lastBalanceSample = sample; }
+export function __getLastBalanceSampleForTest() { return _lastBalanceSample; }
+
+/**
+ * Pure decision core for the burner balance-drain monitor (Vega money-path
+ * balance-read integrity). Decides what to do with a freshly-read balance sample
+ * GIVEN the previous sample. No I/O, no clock — fully unit-testable.
+ *
+ * Returns one of:
+ *   { action: "skip" }                         — read failed/unknown; do nothing,
+ *                                                 do NOT even store (a bad read must
+ *                                                 never become the next baseline).
+ *   { action: "store" }                         — usable read, no alert-worthy drop;
+ *                                                 caller stores it as new baseline.
+ *   { action: "confirm", dropPct, prevSol, solNow }
+ *                                                 — drop >= CONFIRM_PCT; caller MUST
+ *                                                 re-read and confirm before alerting.
+ *   { action: "alert", dropPct, prevSol, solNow }
+ *                                                 — drop in (THRESHOLD, CONFIRM); fire
+ *                                                 directly (still store new baseline).
+ *
+ * Hard rules:
+ *  - balSnap.error OR sol == null OR non-finite  → skip (no compute, no store).
+ *  - solNow must be > 0 to ever compute a drop  → a 0/sentinel read can NEVER
+ *    produce a 100% drop (defends the phantom-drain class of bug at the math layer
+ *    too, belt-and-suspenders with the wallet.js sol:null fix).
+ */
+export function decideBalanceDrainAction(prev, balSnap, now, opts = {}) {
+  const windowMs = opts.windowMs ?? BALANCE_DRAIN_WINDOW_MS;
+  const thresholdPct = opts.thresholdPct ?? BALANCE_DRAIN_THRESHOLD_PCT;
+  const confirmPct = opts.confirmPct ?? BALANCE_DRAIN_CONFIRM_PCT;
+
+  // 1) Reject unreadable samples outright — never store, never compute.
+  if (!balSnap || balSnap.error === true) return { action: "skip", reason: "read_error" };
+  const solNow = Number(balSnap.sol);
+  if (balSnap.sol == null || !Number.isFinite(solNow)) return { action: "skip", reason: "sol_unknown" };
+
+  // 2) No usable previous baseline → just store this one.
+  if (!prev || !Number.isFinite(prev.sol) || prev.sol <= 0 || (now - prev.at) > windowMs) {
+    return { action: "store" };
+  }
+
+  // 3) Guard solNow > 0 so a 0-read can never compute a 100% drop. A 0 read that
+  //    survived the error checks is a genuine empty wallet — that is a real (but
+  //    not necessarily drain-shaped) state; treat as confirm-worthy below via pct.
+  const dropPct = ((prev.sol - solNow) / prev.sol) * 100;
+  if (dropPct <= thresholdPct) {
+    return { action: "store", dropPct };
+  }
+  if (dropPct >= confirmPct) {
+    return { action: "confirm", dropPct, prevSol: prev.sol, solNow };
+  }
+  return { action: "alert", dropPct, prevSol: prev.sol, solNow };
+}
+
+/**
+ * Runs the drain monitor for one sample. Side-effecting orchestrator around the
+ * pure decision core. The second-read fetcher is injectable for tests.
+ *
+ * @param {object} balSnap   freshly-read balance snapshot (from getWalletBalances)
+ * @param {object} deps      { now, secondRead, fireAlert, store } — all optional
+ * @returns {Promise<object>} the resolved decision (for tests/observability)
+ */
+export async function runBalanceDrainMonitor(balSnap, deps = {}) {
+  const now = deps.now ?? Date.now();
+  const secondRead = deps.secondRead ?? getWalletBalances;
+  const fireAlert = deps.fireAlert ?? ((prevSol, solNow, dropPct) =>
+    notifyBalanceDrain(prevSol, solNow, dropPct).catch((e) =>
+      log("balance_drain_error", `notifyBalanceDrain failed: ${e.message}`)));
+  const store = deps.store ?? ((sample) => { _lastBalanceSample = sample; });
+
+  const decision = decideBalanceDrainAction(_lastBalanceSample, balSnap, now, deps.opts);
+
+  if (decision.action === "skip") {
+    log("balance_drain_warn", `Balance sample skipped (${decision.reason}) — not stored, no compute`);
+    return decision;
+  }
+
+  if (decision.action === "store") {
+    store({ sol: Number(balSnap.sol), at: now });
+    return decision;
+  }
+
+  if (decision.action === "alert") {
+    log("balance_drain", `Detected burner drop: ${decision.prevSol.toFixed(4)} → ${decision.solNow.toFixed(4)} SOL (${decision.dropPct.toFixed(2)}%)`);
+    await fireAlert(decision.prevSol, decision.solNow, decision.dropPct);
+    store({ sol: decision.solNow, at: now });
+    return decision;
+  }
+
+  // action === "confirm" — catastrophic drop. REQUIRE a confirming second read
+  // before alerting. If the second read shows the balance intact (or is itself
+  // unreadable), this was a blip → SKIP the alert. Only a SECOND consecutive
+  // real-drain read fires. We do NOT update the baseline off the confirm sample
+  // here unless confirmed, so a transient bad reading can't poison it.
+  let second;
+  try {
+    second = await secondRead();
+  } catch (e) {
+    log("balance_drain_warn", `Drain confirm second-read failed: ${e.message} — treating as blip, no alert`);
+    return { ...decision, action: "skip", reason: "second_read_error" };
+  }
+  const secondSol = Number(second?.sol);
+  if (!second || second.error === true || second.sol == null || !Number.isFinite(secondSol) || secondSol <= 0) {
+    log("balance_drain_warn", `Drain confirm second-read unusable (sol=${second?.sol}) — treating as blip, no alert`);
+    return { ...decision, action: "skip", reason: "second_read_unusable" };
+  }
+  const confirmDropPct = ((decision.prevSol - secondSol) / decision.prevSol) * 100;
+  if (confirmDropPct >= (deps.opts?.confirmPct ?? BALANCE_DRAIN_CONFIRM_PCT) - 1) {
+    // Second read AGREES the balance really collapsed → real drain, fire.
+    log("balance_drain", `CONFIRMED burner drop across two reads: ${decision.prevSol.toFixed(4)} → ${secondSol.toFixed(4)} SOL (${confirmDropPct.toFixed(2)}%)`);
+    await fireAlert(decision.prevSol, secondSol, confirmDropPct);
+    store({ sol: secondSol, at: now });
+    return { ...decision, action: "alert", confirmed: true, solNow: secondSol, dropPct: confirmDropPct };
+  }
+  // Second read shows balance intact → it was a blip. Store the GOOD reading.
+  log("balance_drain_warn", `Drain not confirmed by second read (now ${secondSol.toFixed(4)} SOL, drop ${confirmDropPct.toFixed(2)}%) — phantom blip suppressed`);
+  store({ sol: secondSol, at: now });
+  return { ...decision, action: "skip", reason: "not_confirmed_by_second_read", solNow: secondSol };
+}
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
@@ -242,21 +367,11 @@ export async function runManagementCycle({ silent = false } = {}) {
     // notify helper (1h cooldown).
     try {
       const balSnap = await getWalletBalances();
-      const solNow = Number(balSnap?.sol);
-      if (Number.isFinite(solNow) && solNow >= 0) {
-        const now = Date.now();
-        const prev = _lastBalanceSample;
-        if (prev && Number.isFinite(prev.sol) && prev.sol > 0 && (now - prev.at) <= BALANCE_DRAIN_WINDOW_MS) {
-          const dropPct = ((prev.sol - solNow) / prev.sol) * 100;
-          if (dropPct > BALANCE_DRAIN_THRESHOLD_PCT) {
-            log("balance_drain", `Detected burner drop: ${prev.sol.toFixed(4)} → ${solNow.toFixed(4)} SOL (${dropPct.toFixed(2)}%)`);
-            notifyBalanceDrain(prev.sol, solNow, dropPct).catch((e) =>
-              log("balance_drain_error", `notifyBalanceDrain failed: ${e.message}`)
-            );
-          }
-        }
-        _lastBalanceSample = { sol: solNow, at: now };
-      }
+      // Drain decision + (for catastrophic drops) confirming second-read are now
+      // handled by runBalanceDrainMonitor. A failed/unknown read is SKIPPED (never
+      // stored, never computed), and a >90% "drain" only alerts if a second read
+      // agrees — killing the phantom-drain-from-Helius-blip class entirely.
+      await runBalanceDrainMonitor(balSnap);
     } catch (e) {
       log("balance_drain_warn", `Balance sample failed: ${e.message}`);
     }
@@ -588,6 +703,22 @@ export async function runScreeningCycle({ silent = false } = {}) {
     }
     const minRequired = config.management.deployAmountSol + config.management.gasReserve;
     const isDryRun = process.env.DRY_RUN === "true";
+    // FAIL-CLOSED (Vega): unknown balance (sol:null on a failed read) must SKIP
+    // the live screening cycle, not proceed. `null < minRequired` is falsy, so the
+    // plain `<` check below would FAIL OPEN — screening would run (and could reach
+    // a deploy) on an unknown balance. Refuse instead; a blip just defers one cycle.
+    if (!isDryRun && (preBalance?.error || preBalance?.sol == null || !Number.isFinite(Number(preBalance.sol)))) {
+      log("cron", `Screening skipped — wallet balance unreadable (${preBalance?.error_message || "no sol value"})`);
+      screenReport = `Screening skipped — wallet balance unreadable; will retry next cycle.`;
+      appendDecision({
+        type: "skip",
+        actor: "SCREENER",
+        summary: "Screening skipped",
+        reason: `Wallet balance unreadable (${preBalance?.error_message || "no sol value"})`,
+      });
+      _screeningBusy = false;
+      return screenReport;
+    }
     if (!isDryRun && preBalance.sol < minRequired) {
       log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
       screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
@@ -1007,7 +1138,7 @@ IMPORTANT:
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
+Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${Number.isFinite(Number(currentBalance.sol)) ? Number(currentBalance.sol).toFixed(3) : "unknown"} | Deploy: ${deployAmount} SOL
 
 PRE-LOADED CANDIDATES (top ${promptCandidates.length} of ${passing.length} by score):
 ${candidateBlocks.join("\n\n")}
@@ -1700,7 +1831,15 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
-  const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
+  const _balForSize = await getWalletBalances();
+  // FAIL-CLOSED (Vega): unknown balance (sol:null on a failed read) must NOT be
+  // sized into a deploy. computeDeployAmount(null) yields NaN which the executor
+  // SOL-coverage gate now rejects too, but abort early with a clear reason rather
+  // than firing a doomed deploy attempt.
+  if (process.env.DRY_RUN !== "true" && (_balForSize?.error || _balForSize?.sol == null || !Number.isFinite(Number(_balForSize.sol)))) {
+    throw new Error(`NO DEPLOY: wallet balance unreadable (${_balForSize?.error_message || "no sol value"}) — refusing to size a deploy on an unknown balance.`);
+  }
+  const deployAmount = computeDeployAmount(_balForSize.sol);
   const binsBelow = computeBinsBelow(candidate.volatility);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,

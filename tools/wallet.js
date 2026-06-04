@@ -52,30 +52,64 @@ function getJupiterReferralParams() {
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
  * Returns USD-denominated values provided by Helius.
  */
+/**
+ * Build the failure-shape return object. CRITICAL (Vega money-path integrity):
+ * on ANY read failure we return `sol: null` + `error: true`, NEVER the sentinel
+ * `sol: 0`. A real empty wallet ("balance truly 0") and a failed read ("could
+ * not read") must be TEGAS distinguishable by every money-path caller, otherwise
+ * a Helius blip masquerades as a 100% drain (phantom "BURNER BALANCE DRAIN") AND
+ * a deploy-gate could fail OPEN. Fail-closed per anti-pattern #2/#3.
+ *
+ * `tokens` stays `[]` (not null) so auto-swap callers (`.tokens?.find`) don't
+ * throw — they simply find nothing, which is the correct fail-closed behavior
+ * for an unreadable wallet. `sol_price`/`sol_usd`/`usdc`/`total_usd` are null
+ * (unknown), not 0 (a real value).
+ */
+function walletReadFailure(walletAddress, message) {
+  return {
+    wallet: walletAddress,
+    sol: null,
+    sol_price: null,
+    sol_usd: null,
+    usdc: null,
+    tokens: [],
+    total_usd: null,
+    error: true,
+    error_message: message,
+  };
+}
+
 export async function getWalletBalances() {
   let walletAddress;
   try {
     walletAddress = getWallet().publicKey.toString();
   } catch {
-    return { wallet: null, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Wallet not configured" };
+    return walletReadFailure(null, "Wallet not configured");
   }
 
   const HELIUS_KEY = process.env.HELIUS_API_KEY;
   if (!HELIUS_KEY) {
     log("wallet_error", "HELIUS_API_KEY not set in .env");
-    return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing" };
+    return walletReadFailure(walletAddress, "Helius API key missing");
   }
 
   try {
     const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
     const res = await fetch(url);
-    
+
     if (!res.ok) {
       throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
     }
 
     const data = await res.json();
-    const balances = data.balances || [];
+    // Distinguish "Helius returned no balances field" (read failure / malformed)
+    // from "wallet genuinely holds nothing". A successful 200 always carries a
+    // `balances` array; its ABSENCE means the response was unusable → fail-closed
+    // (sol: null), NOT a sentinel 0.
+    if (!Array.isArray(data.balances)) {
+      throw new Error("Helius response missing balances array");
+    }
+    const balances = data.balances;
 
     // ─── Find SOL and USDC ────────────────────────────────────
     const solEntry = balances.find(b => b.mint === config.tokens.SOL || b.symbol === "SOL");
@@ -105,16 +139,7 @@ export async function getWalletBalances() {
     };
   } catch (error) {
     log("wallet_error", error.message);
-    return {
-      wallet: walletAddress,
-      sol: 0,
-      sol_price: 0,
-      sol_usd: 0,
-      usdc: 0,
-      tokens: [],
-      total_usd: 0,
-      error: error.message,
-    };
+    return walletReadFailure(walletAddress, error.message);
   }
 }
 
