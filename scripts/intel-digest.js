@@ -323,7 +323,10 @@ const SYSTEM_PROMPT = [
   "and Discord. Your job is to extract ADVISORY suggestions for the human",
   "operator to review. You do NOT make changes; you only suggest.",
   "",
-  "Output ONLY valid JSON matching this schema:",
+  "Respond with ONLY a single JSON object — no markdown code fences, no prose",
+  "before or after, no ```json wrapper. The object MUST have exactly these two",
+  'top-level keys: "suggestions" (an array, may be empty) and "summary" (a string).',
+  "Each item in suggestions MUST have ALL of these keys:",
   "{",
   '  "suggestions": [',
   "    {",
@@ -338,6 +341,15 @@ const SYSTEM_PROMPT = [
   '  "summary": "<3-4 sentence overview of the intel landscape>"',
   "}",
   "",
+  "Example of a VALID response (shape only — do not copy the content):",
+  '{"suggestions":[{"category":"tech_tooling","title":"Evaluate model X",'
+    + '"detail":"Builders report X is cheaper for agent loops.","evidence":"\\"switched to X, cheaper\\"",'
+    + '"confidence":0.6,"advisory_action":"Benchmark X vs current model"}],'
+    + '"summary":"Builder cluster discusses cheaper tooling and onboarding friction."}',
+  "",
+  "If the intel contains nothing actionable, still return the object with an EMPTY",
+  'suggestions array and a summary explaining why — NEVER return prose or an empty reply.',
+  "",
   "Rules:",
   "- Extract: (1) new tech/tooling worth adopting, (2) strategy improvements",
   "  validated by the community, (3) bugs/pain others hit that we should preempt,",
@@ -347,6 +359,111 @@ const SYSTEM_PROMPT = [
   "- Prefer fewer, high-signal suggestions over many weak ones (max ~6).",
   "- Every suggestion is advisory. A human decides. You never apply anything.",
 ].join("\n");
+
+// JSON-schema for OpenRouter structured outputs. DeepSeek V4 Flash advertises
+// `structured_outputs` support (verified via OpenRouter /models), which GUARANTEES
+// the response shape — strictly stronger than `json_object` JSON-mode (which only
+// guarantees *valid* JSON, not the right keys). This is the core fix for the
+// intermittent-empty bug: the model could previously return valid JSON with no
+// `suggestions` key, silently yielding []. With a schema, the key is enforced.
+const RESPONSE_JSON_SCHEMA = {
+  type: "json_schema",
+  json_schema: {
+    name: "intel_digest",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["suggestions", "summary"],
+      properties: {
+        summary: { type: "string" },
+        suggestions: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["category", "title", "detail", "evidence", "confidence", "advisory_action"],
+            properties: {
+              category: { type: "string", enum: ["tech_tooling", "strategy", "preempt_bug", "competitor_move"] },
+              title: { type: "string" },
+              detail: { type: "string" },
+              evidence: { type: "string" },
+              confidence: { type: "number" },
+              advisory_action: { type: "string" },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
+/**
+ * Robust extractor: turn a raw model `content` string into an object with a
+ * `suggestions` array + `summary`, tolerating the ways a model strays from the
+ * contract even under structured outputs / JSON mode:
+ *   (a) clean JSON                                  → parse directly
+ *   (b) JSON wrapped in ```json ... ``` fences      → strip the fence, parse
+ *   (c) prose before/after a JSON object            → extract the {...} block
+ *   (d) alternate key names (recommendations/items) → normalize to suggestions
+ *   (e) no JSON at all                              → { ok:false } so caller can
+ *       retry once / log raw (NEVER silent []).
+ *
+ * Pure + exported for TDD. Returns { ok, obj, source } where source describes
+ * which path succeeded (for debug logging).
+ */
+export function extractDigestJson(content) {
+  const raw = String(content ?? "");
+  if (!raw.trim()) return { ok: false, obj: null, source: "empty" };
+
+  const tryParse = (str, source) => {
+    try {
+      const o = JSON.parse(str);
+      if (o && typeof o === "object" && !Array.isArray(o)) return { ok: true, obj: o, source };
+    } catch { /* fall through */ }
+    return null;
+  };
+
+  // (a) clean parse.
+  let r = tryParse(raw.trim(), "clean");
+  if (r) return normalizeDigestObj(r);
+
+  // (b) strip a fenced block: ```json\n{...}\n``` or ```\n{...}\n```
+  const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) {
+    r = tryParse(fence[1].trim(), "fenced");
+    if (r) return normalizeDigestObj(r);
+  }
+
+  // (c) first balanced {...} block anywhere in prose. Greedy match to the LAST
+  // closing brace catches a complete top-level object even with trailing prose.
+  const block = raw.match(/\{[\s\S]*\}/);
+  if (block) {
+    r = tryParse(block[0], "block");
+    if (r) return normalizeDigestObj(r);
+  }
+
+  return { ok: false, obj: null, source: "unparseable" };
+}
+
+/** Normalize alternate shapes onto { suggestions:[], summary:"" }. */
+function normalizeDigestObj({ obj, source }) {
+  const sug = obj.suggestions
+    ?? obj.recommendations
+    ?? obj.items
+    ?? obj.results
+    ?? null;
+  const out = {
+    suggestions: Array.isArray(sug) ? sug : [],
+    summary: typeof obj.summary === "string" ? obj.summary
+      : (typeof obj.overview === "string" ? obj.overview : ""),
+  };
+  // ok only if we actually recovered the contractual shape (an array present,
+  // even if empty IS valid — the model legitimately found nothing). A wholly
+  // foreign object with neither key present is treated as a miss → retry/log.
+  const hadKey = Array.isArray(sug) || typeof obj.summary === "string" || typeof obj.overview === "string";
+  return { ok: hadKey, obj: out, source };
+}
 
 function todayStamp() {
   return new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
@@ -480,34 +597,68 @@ export async function runDigest({ intelDir = INTEL_DIR, dryLlm = false, crawl = 
     { role: "user", content: `# Crawled intel (bounded)\n${corpus}` },
   ];
 
-  const response = await getClient().chat.completions.create({
-    model: MODEL,
-    messages,
-    temperature: 0.2,
-    max_tokens: MAX_OUTPUT_TOKENS,
-    response_format: { type: "json_object" },
-  });
+  // One bounded call + at most ONE retry on a parse/shape miss (Lyra cost note:
+  // digest runs 1x/day; a single retry on the rare miss is ~$0.0015 extra, NOT
+  // a loop). Attempt #1 uses structured outputs (schema-enforced); the retry
+  // falls back to json_object JSON-mode in case a transient schema rejection /
+  // provider quirk is what poisoned the first response.
+  let usage = {};
+  let finishReason = null;
+  let content = "";
+  let extracted = { ok: false, obj: null, source: "no_call" };
+  let attempts = 0;
+  const rawPreviews = [];
 
-  const usage = response.usage || {};
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    attempts = attempt;
+    const useSchema = attempt === 1; // strong first, lenient fallback
+    let response;
+    try {
+      response = await getClient().chat.completions.create({
+        model: MODEL,
+        messages,
+        temperature: attempt === 1 ? 0.2 : 0.0, // tighter on retry
+        max_tokens: MAX_OUTPUT_TOKENS,
+        response_format: useSchema ? RESPONSE_JSON_SCHEMA : { type: "json_object" },
+      });
+    } catch (e) {
+      // A 400 "response_format not supported" (or any schema rejection) on the
+      // FIRST attempt should not waste the run — fall straight to the lenient
+      // json_object retry rather than aborting.
+      rawPreviews.push(`attempt${attempt} request_error: ${String(e?.message || e).slice(0, 200)}`);
+      if (attempt === 1) continue;
+      throw e;
+    }
+
+    const u = response.usage || {};
+    // Accumulate usage across attempts so cost/audit reflects the real spend.
+    usage = {
+      prompt_tokens: (usage.prompt_tokens || 0) + (u.prompt_tokens || 0),
+      completion_tokens: (usage.completion_tokens || 0) + (u.completion_tokens || 0),
+      total_tokens: (usage.total_tokens || 0) + (u.total_tokens || 0),
+    };
+    finishReason = response.choices?.[0]?.finish_reason || finishReason;
+    content = response.choices?.[0]?.message?.content || "";
+
+    extracted = extractDigestJson(content);
+    if (extracted.ok) break; // got the contractual shape → stop, no extra spend
+    rawPreviews.push(`attempt${attempt}(${extracted.source}): ${content.slice(0, 200)}`);
+  }
+
   recordLlmUsage({
     agentType: "ORION_INTEL_DIGEST",
     model: MODEL,
-    step: 1,
-    finishReason: response.choices?.[0]?.finish_reason || null,
+    step: attempts,
+    finishReason,
     toolCalls: 0,
     usage,
   });
   base.usage = usage;
   base.cost_usd = computeCost(MODEL, usage);
+  base.parse_attempts = attempts;
+  base.parse_source = extracted.source;
 
-  const content = response.choices?.[0]?.message?.content || "";
-  let parsed = {};
-  try { parsed = JSON.parse(content); }
-  catch {
-    // One lenient salvage attempt: pull the first {...} block.
-    const m = content.match(/\{[\s\S]*\}/);
-    if (m) { try { parsed = JSON.parse(m[0]); } catch { /* ignore */ } }
-  }
+  const parsed = extracted.obj || {};
 
   const rawSuggestions = Array.isArray(parsed?.suggestions)
     ? parsed.suggestions.slice(0, 8).map((s) => ({
@@ -528,10 +679,19 @@ export async function runDigest({ intelDir = INTEL_DIR, dryLlm = false, crawl = 
 
   base.summary = String(parsed?.summary || "").slice(0, 1000);
   if (!base.suggestions.length && !base.summary) {
-    base.summary = dropped.length
-      ? `Model returned ${dropped.length} suggestion(s) but all duplicate features Meridian already has.`
-      : "Model returned no parseable suggestions.";
-    base.raw_preview = content.slice(0, 500);
+    if (!extracted.ok) {
+      // Genuine parse/shape failure after retry — NEVER silent. Surface that the
+      // model output was unparseable + keep the raw previews so Orion/Lyra can
+      // debug the next morning instead of staring at an empty [].
+      base.summary = `Model output could not be parsed into the required schema after `
+        + `${attempts} attempt(s) (last source: ${extracted.source}). Raw response logged for debug.`;
+      base.parse_failed = true;
+    } else {
+      base.summary = dropped.length
+        ? `Model returned ${dropped.length} suggestion(s) but all duplicate features Meridian already has.`
+        : "Model parsed cleanly but extracted no actionable suggestions (empty intel landscape).";
+    }
+    base.raw_preview = (rawPreviews.length ? rawPreviews.join("\n---\n") : content).slice(0, 1000);
   }
   return base;
 }
@@ -599,4 +759,4 @@ if (isMain) {
   })();
 }
 
-export { SYSTEM_PROMPT, renderMarkdown, topSuggestionsForTelegram, MODEL, MAX_INPUT_CHARS };
+export { SYSTEM_PROMPT, renderMarkdown, topSuggestionsForTelegram, MODEL, MAX_INPUT_CHARS, RESPONSE_JSON_SCHEMA };

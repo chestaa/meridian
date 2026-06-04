@@ -144,7 +144,12 @@ const digest = await runDigest({ intelDir });
 check("LLM was called exactly once", capturedPayload !== null);
 check("model is DeepSeek V4 Flash", capturedPayload.model === "deepseek/deepseek-v4-flash");
 check("output capped (max_tokens set)", typeof capturedPayload.max_tokens === "number" && capturedPayload.max_tokens <= 1200);
-check("requests json_object format", capturedPayload.response_format?.type === "json_object");
+// Attempt #1 now requests SCHEMA-ENFORCED structured outputs (json_schema), which
+// GUARANTEES the {suggestions, summary} shape — strictly stronger than json_object
+// JSON-mode. This is the fix for the intermittent-empty-digest bug (model could
+// return valid JSON with no `suggestions` key under plain json_object).
+check("requests structured-output json_schema format", capturedPayload.response_format?.type === "json_schema");
+check("json_schema enforces suggestions+summary", capturedPayload.response_format?.json_schema?.schema?.required?.includes("suggestions"));
 check("digest advisory_only flag true", digest.advisory_only === true);
 // Dedup-vs-existing now filters suggestions that re-propose live features. The
 // mock returns 3 (MiMo tech_tooling + Fees/MC gate + RPC backoff). Fees/MC is
