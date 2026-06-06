@@ -45,11 +45,26 @@ function pushSnapshot(snapshotJson) {
   sh('git add status-snapshot.json', gitOpts);
   sh(`git -c user.name=meridian-snapshot -c user.email=snapshot@meridian.local commit -m "snapshot: ${new Date().toISOString()}"`, gitOpts);
 
-  const pushCmd = useFlock
-    ? `flock -n ${LOCKFILE} git push --force-with-lease origin status`
-    : `git push --force-with-lease origin status`;
-  sh(pushCmd, gitOpts);
-  console.log('[snapshot] pushed to status branch');
+  // Hardening (Draco 2026-06-06): the snapshot push races the autopull cron for
+  // the git index lock. `flock -n` aborted instantly on contention → execSync
+  // throws → systemd marks the oneshot `failed` → false-alarm OnFailure alert.
+  // Fix: `flock -w 30` blocks up to 30s for the lock instead of bailing, AND we
+  // retry the push once on transient failure (e.g. force-with-lease loses to a
+  // concurrent autopull reset — refetch remote status then re-push).
+  const pushBase = 'git push --force-with-lease origin status';
+  const pushCmd = useFlock ? `flock -w 30 ${LOCKFILE} ${pushBase}` : pushBase;
+
+  try {
+    sh(pushCmd, gitOpts);
+    console.log('[snapshot] pushed to status branch');
+  } catch (firstErr) {
+    console.warn(`[snapshot] push attempt 1 failed (${firstErr.message.split('\n')[0]}), retrying once`);
+    // Refresh local view of the remote status branch so force-with-lease has a
+    // current lease base, then re-push. This recovers from a lost lease race.
+    try { sh('git fetch origin status', gitOpts); } catch { /* best-effort */ }
+    sh(pushCmd, gitOpts);
+    console.log('[snapshot] pushed to status branch (retry)');
+  }
 }
 
 async function main() {
