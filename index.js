@@ -2389,7 +2389,11 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
   if (pool.is_wash) return "wash trading was flagged";
   if (pool.is_rugpull && smartWalletCount === 0) return "rugpull risk was flagged and no smart wallets offset it";
   if (pool.is_pvp && smartWalletCount === 0) return "PVP symbol conflict and no smart-wallet confirmation";
-  if (Number.isFinite(globalFeesSol) && globalFeesSol < config.screening.minTokenFeesSol) {
+  // FAIL-CLOSED (anti-pattern #2): missing/null/NaN/non-finite fee data → SKIP, never treat as pass.
+  if (!Number.isFinite(globalFeesSol)) {
+    return "token_fees_unknown: no valid global fee data to verify minimum";
+  }
+  if (globalFeesSol < config.screening.minTokenFeesSol) {
     return `token fees ${globalFeesSol} SOL below minimum ${config.screening.minTokenFeesSol} SOL`;
   }
   if (Number.isFinite(top10Pct) && top10Pct > config.screening.maxTop10Pct) {

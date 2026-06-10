@@ -128,7 +128,8 @@ export async function deployerCheck(poolAddress) {
 // Stage 6: Global fees check — priority + jito tips via Jupiter ChainInsight API
 // Reads minTokenFeesSol from user-config.json (same threshold executor.js uses before deploy)
 export async function feesCheck(mint) {
-  if (!mint) return { pass: true, global_fees_sol: null };
+  // FAIL-CLOSED (anti-pattern #2): missing data = REJECT, never default to pass.
+  if (!mint) return { pass: false, reason: "fees_data_missing: no mint to check", global_fees_sol: null };
 
   let minFeesSol = 15;
   try {
@@ -144,17 +145,19 @@ export async function feesCheck(mint) {
     const token = tokens.find(t => t.id === mint) || tokens[0];
     const globalFees = token?.fees != null ? parseFloat(token.fees) : null;
 
-    if (globalFees === null) {
-      console.warn(`  [fees] No fee data for ${mint} — passing`);
-      return { pass: true, global_fees_sol: null };
+    // FAIL-CLOSED: null/undefined/NaN/non-finite fee data → REJECT (can't verify the floor).
+    if (globalFees === null || !Number.isFinite(globalFees)) {
+      console.warn(`  [fees] No/invalid fee data for ${mint} — REJECT (fail-closed)`);
+      return { pass: false, reason: "token_fees_unknown: no valid global fee data", global_fees_sol: null };
     }
     if (globalFees < minFeesSol) {
-      return { pass: false, reason: `global fees too low: ${globalFees.toFixed(2)} SOL < ${minFeesSol} SOL threshold` };
+      return { pass: false, reason: `global fees too low: ${globalFees.toFixed(2)} SOL < ${minFeesSol} SOL threshold`, global_fees_sol: globalFees };
     }
     return { pass: true, global_fees_sol: globalFees };
   } catch (e) {
-    console.warn(`  [fees] Jupiter API error: ${e.message} — passing`);
-    return { pass: true, global_fees_sol: null };
+    // FAIL-CLOSED: API error / unreachable → can't verify → REJECT, never default to pass.
+    console.warn(`  [fees] Jupiter API error: ${e.message} — REJECT (fail-closed)`);
+    return { pass: false, reason: `token_fees_unknown: fee API error (${e.message})`, global_fees_sol: null };
   }
 }
 

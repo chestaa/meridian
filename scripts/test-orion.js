@@ -128,24 +128,44 @@ check("empty input returns []", Array.isArray(empty) && empty.length === 0);
 // recalibrated floor as a fixed contract constant and verify the gate predicate.
 const FLOOR = 15; // recalibrated default (config.js minTokenFeesSol ?? 15)
 
-// Pure mirror of the index.js gate predicate: reject iff finite AND below floor.
-const feeBelowFloor = (feesSol, floor = FLOOR) => {
+// Pure mirror of the index.js getLoneCandidateSkipReason fee gate.
+// FAIL-CLOSED (anti-pattern #2): missing/null/NaN/non-finite fee data → SKIP
+// (we cannot verify the floor → reject, never treat as pass). Returns a skip
+// reason string when the candidate must be skipped, else null.
+const feeSkipReason = (feesSol, floor = FLOOR) => {
   const n = Number(feesSol);
-  return Number.isFinite(n) && n < floor;
+  if (!Number.isFinite(n)) return "token_fees_unknown: no valid global fee data to verify minimum";
+  if (n < floor) return `token fees ${n} SOL below minimum ${floor} SOL`;
+  return null;
 };
-check("fees 16 → above floor 15 (PASS gate)", feeBelowFloor(16) === false);
-check("fees 14 → below floor 15 (SKIP)", feeBelowFloor(14) === true);
-check("fees 9.81 (PARQ-class) → still below floor 15 (SKIP, by design)", feeBelowFloor(9.81) === true);
-check("fees exactly 15 → at floor, not below (PASS gate)", feeBelowFloor(15) === false);
-check("fees 30 (old floor) → above new floor 15 (PASS gate)", feeBelowFloor(30) === false);
-// Anti-pattern #2: missing/non-finite fee data must NOT register as "below floor"
-// here — at this lone-candidate path the gate is finite-guarded (fail-open), so
-// fail-closed enforcement lives upstream (pre-checks feesCheck / SCREENER list).
-check("fees NaN → gate predicate false (finite-guarded; fail-closed lives upstream)", feeBelowFloor(NaN) === false);
+// Valid-data contract is UNCHANGED by the fail-closed fix (>=15 pass, <15 skip).
+check("fees 16 → above floor 15 (PASS gate)", feeSkipReason(16) === null);
+check("fees 14 → below floor 15 (SKIP)", /below minimum/.test(feeSkipReason(14)));
+check("fees 9.81 (PARQ-class) → still below floor 15 (SKIP, by design)", /below minimum/.test(feeSkipReason(9.81)));
+check("fees exactly 15 → at floor, not below (PASS gate)", feeSkipReason(15) === null);
+check("fees 30 (old floor) → above new floor 15 (PASS gate)", feeSkipReason(30) === null);
+// Anti-pattern #2 fail-closed: NON-FINITE fee data (undefined/NaN/Infinity) → SKIP
+// with token_fees_unknown. (This path was fail-OPEN — Orion flagged it; now fixed.)
+// Either way the candidate is REJECTED — never silently treated as satisfying the floor.
+check("fees NaN → SKIP token_fees_unknown (fail-closed)", /token_fees_unknown/.test(feeSkipReason(NaN)));
+check("fees undefined → SKIP token_fees_unknown (fail-closed)", /token_fees_unknown/.test(feeSkipReason(undefined)));
+check("fees Infinity → SKIP token_fees_unknown (non-finite, fail-closed)", /token_fees_unknown/.test(feeSkipReason(Infinity)));
+// NOTE: literal null coerces via Number(null)=0 → a real "0 SOL fees" reading, which is
+// genuinely below the floor → SKIP "below minimum". Still REJECTED (correct — 0 fees =
+// dormant token), just not the unknown-data branch. The bug was never about a real 0.
+check("fees null → Number(null)=0 → SKIP below minimum (still rejected, not a silent pass)", /below minimum/.test(feeSkipReason(null)));
 
 // Verify config.js code default is 15 by parsing the source (override-proof).
 const cfgSrc = await import("node:fs").then(fs => fs.readFileSync(new URL("../config.js", import.meta.url), "utf8"));
 check("config.js default literal is `?? 15`", /minTokenFeesSol:\s*u\.minTokenFeesSol\s*\?\?\s*15\b/.test(cfgSrc));
+
+// Lock the actual index.js fail-closed guard in source (mirror predicate above
+// could drift; this asserts the real code rejects non-finite fee data first).
+const idxSrc = await import("node:fs").then(fs => fs.readFileSync(new URL("../index.js", import.meta.url), "utf8"));
+check(
+  "index.js getLoneCandidateSkipReason rejects non-finite fee BEFORE the floor check (fail-closed)",
+  /if\s*\(!Number\.isFinite\(globalFeesSol\)\)\s*\{\s*\n?\s*return\s+["']token_fees_unknown/.test(idxSrc)
+);
 
 console.log(`\n${passed} assertions passed.`);
 
