@@ -130,10 +130,10 @@ export async function deployerCheck(poolAddress) {
 export async function feesCheck(mint) {
   if (!mint) return { pass: true, global_fees_sol: null };
 
-  let minFeesSol = 30;
+  let minFeesSol = 15;
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, "user-config.json"), "utf8"));
-    minFeesSol = cfg.screening?.minTokenFeesSol ?? cfg.minTokenFeesSol ?? 30;
+    minFeesSol = cfg.screening?.minTokenFeesSol ?? cfg.minTokenFeesSol ?? 15;
   } catch { /* use default */ }
 
   try {

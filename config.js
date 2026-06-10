@@ -112,7 +112,7 @@ export const config = {
     maxBinStep:        u.maxBinStep        ?? 125,
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
-    minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
+    minTokenFeesSol:   u.minTokenFeesSol   ?? 15,  // global fees paid (priority+jito tips). below = bundled/scam. recalibrated 30→15 for micro-cap target ($5-80k mcap structurally can't hit 30 SOL global fees)
     useDiscordSignals: u.useDiscordSignals ?? false,
     discordSignalMode: u.discordSignalMode ?? "merge", // merge | only
     discordSource: u.discordSource ?? "meteoraidn_ranked", // meteoraidn_ranked (real local) | hivemind (legacy 404 phantom)

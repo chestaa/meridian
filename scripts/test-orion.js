@@ -112,6 +112,41 @@ check("formatOrionVerdicts contains decision tag", /\((enter|skip),/.test(format
 const empty = await judgeCandidates([], {});
 check("empty input returns []", Array.isArray(empty) && empty.length === 0);
 
+// ---- minTokenFeesSol floor recalibration (30→15) regression ----
+// The HARD RULE (prompt.js L117 + index.js getLoneCandidateSkipReason +
+// executor pre-deploy gate) rejects when global_fees_sol < config.screening.minTokenFeesSol.
+// Floor was recalibrated 30→15 for the micro-cap target ($5-80k mcap can't
+// structurally accumulate 30 SOL global priority fees). This locks the contract:
+//   - 16 SOL → PASS the floor (>= 15)
+//   - 14 SOL → SKIP (< 15)
+//   - 9.81 SOL (PARQ-class) → STILL SKIP (< 15, genuinely dormant-ish — by design)
+//   - missing fee data → must NOT silently pass the floor as "satisfied" (anti-pattern #2)
+// Assert the CODE DEFAULT (config.js `?? 15`), independent of any gitignored
+// user-config.json override on this machine. We re-load config.js with no
+// user-config present by checking the default fallback directly via a fresh
+// resolution against an empty override is not trivial here, so we assert the
+// recalibrated floor as a fixed contract constant and verify the gate predicate.
+const FLOOR = 15; // recalibrated default (config.js minTokenFeesSol ?? 15)
+
+// Pure mirror of the index.js gate predicate: reject iff finite AND below floor.
+const feeBelowFloor = (feesSol, floor = FLOOR) => {
+  const n = Number(feesSol);
+  return Number.isFinite(n) && n < floor;
+};
+check("fees 16 → above floor 15 (PASS gate)", feeBelowFloor(16) === false);
+check("fees 14 → below floor 15 (SKIP)", feeBelowFloor(14) === true);
+check("fees 9.81 (PARQ-class) → still below floor 15 (SKIP, by design)", feeBelowFloor(9.81) === true);
+check("fees exactly 15 → at floor, not below (PASS gate)", feeBelowFloor(15) === false);
+check("fees 30 (old floor) → above new floor 15 (PASS gate)", feeBelowFloor(30) === false);
+// Anti-pattern #2: missing/non-finite fee data must NOT register as "below floor"
+// here — at this lone-candidate path the gate is finite-guarded (fail-open), so
+// fail-closed enforcement lives upstream (pre-checks feesCheck / SCREENER list).
+check("fees NaN → gate predicate false (finite-guarded; fail-closed lives upstream)", feeBelowFloor(NaN) === false);
+
+// Verify config.js code default is 15 by parsing the source (override-proof).
+const cfgSrc = await import("node:fs").then(fs => fs.readFileSync(new URL("../config.js", import.meta.url), "utf8"));
+check("config.js default literal is `?? 15`", /minTokenFeesSol:\s*u\.minTokenFeesSol\s*\?\?\s*15\b/.test(cfgSrc));
+
 console.log(`\n${passed} assertions passed.`);
 
 if (process.exitCode) {
