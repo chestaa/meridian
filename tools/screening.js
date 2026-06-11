@@ -8,8 +8,18 @@ import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.
 import { fetchSolscanTrending } from "./sources/solscan-trending.js";
 import { fetchPumpfunGraduated } from "./sources/pumpfun-graduated.js";
 import { fetchDiscordMeteoraIdnRanked } from "./sources/discord-meteoraidn.js";
+import { getTokenHolderCount } from "./token.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
+
+// Holder-count enrich cache (Cassiopeia — enrich-before-gate for signal pools).
+// Signal sources (discord/solscan/pumpfun) often arrive WITHOUT base_token_holders
+// because the upstream cross-ref didn't carry it. Rather than killing them at the
+// holder floor on a DATA-MISSING (not a real low count), we fetch the real count
+// once per mint and let the floor judge the real number. Cached by mint with TTL
+// so the same mint isn't re-fetched every screening cycle.
+const HOLDER_COUNT_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min — count moves slowly
+const _holderCountCache = new Map(); // mint -> { count: number|null, ts: number }
 
 // Wrapped SOL mint. We deploy single-side SOL ONLY (executor.js refuses
 // amount_x>0), so any pool quoted in something else (USDC, etc.) is
@@ -391,7 +401,12 @@ export function getRawPoolScreeningRejectReason(pool, s) {
 
   if (mcap == null || mcap < s.minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${s.minMcap}`;
   if (mcap > s.maxMcap) return `mcap ${mcap} above maxMcap ${s.maxMcap}`;
-  if (holders == null || holders < s.minHolders) return `holders ${holders ?? "unknown"} below minHolders ${s.minHolders}`;
+  // Fail-closed (anti-pattern #2): null/0 holder count = DATA-MISSING, reject as
+  // "holders_unknown" so it's distinguishable from a genuine sub-floor count.
+  // After enrichHolderCountsBeforeGate has run, a still-null count means enrich
+  // failed (API down/no count) — we reject, never default to a safe value.
+  if (holders == null || holders === 0) return "holders_unknown";
+  if (holders < s.minHolders) return `holders ${holders} below minHolders ${s.minHolders}`;
   if (volume == null || volume < s.minVolume) return `volume ${volume ?? "unknown"} below minVolume ${s.minVolume}`;
   if (tvl == null || tvl < s.minTvl) return `TVL ${tvl ?? "unknown"} below minTvl ${s.minTvl}`;
   if (s.maxTvl != null && tvl > s.maxTvl) return `TVL ${tvl} above maxTvl ${s.maxTvl}`;
@@ -627,6 +642,80 @@ async function enrichPvpRisk(pools) {
  * Fetch pools from the Meteora Pool Discovery API.
  * Returns condensed data optimized for LLM consumption (saves tokens).
  */
+/**
+ * Cassiopeia — enrich-before-gate for the holder floor.
+ *
+ * Signal pools (discord/solscan/pumpfun) frequently arrive with
+ * base_token_holders null/0 because the upstream source didn't carry the field
+ * — that is DATA-MISSING, not a genuine low holder count. Killing them at the
+ * holder floor (getRawPoolScreeningRejectReason) before any other gate runs was
+ * the dominant choke point (69 reject "holders 0" / 4 dry deploy days). This
+ * pass gives such pools a CHANCE to be judged on a REAL number — it does NOT
+ * lower the floor and does NOT bypass the gate.
+ *
+ * Order (Lyra cost-aware): we only fetch for a pool when it would clear EVERY
+ * OTHER gate with the holder floor temporarily set to 0. If a pool would die on
+ * mcap / volume / tvl / age / etc (all no-API checks), we never spend a holder
+ * fetch on it. Survivors get one cheap assets/search holderCount fetch (cached
+ * per mint, 30-min TTL).
+ *
+ * FAIL-CLOSED (anti-pattern #2): if enrichment fails or returns no usable count,
+ * base_token_holders stays null and the real holder gate rejects it as
+ * "holders unknown". Enrich = a chance to GET data, never a pass without it.
+ *
+ * Mutates pools in place (sets base_token_holders + _holders_enriched marker).
+ * The injectable fetchCount lets tests run without hitting the live API.
+ */
+async function enrichHolderCountsBeforeGate(rawPools, s, fetchCount = getTokenHolderCount) {
+  const needsEnrich = rawPools.filter((pool) => {
+    const holders = numeric(pool?.base_token_holders);
+    if (holders != null && holders > 0) return false; // already have a real count
+    const mint = pool?.token_x?.address || pool?.base_mint || null;
+    if (!mint) return false; // no mint → nothing to fetch → gate rejects as unknown
+    // Lyra cost-aware: only spend a fetch on pools that clear every OTHER gate.
+    // Probe with a passing-sentinel holder count so the holder gate itself is
+    // neutralized for the probe (every gate EXCEPT the holder floor still
+    // applies). A pool that dies on mcap/volume/tvl/age (all no-API) is dropped
+    // here for free — no fetch wasted on a pool that can't deploy anyway.
+    const probe = { ...pool, base_token_holders: Math.max(1, numeric(s.minHolders) || 1) };
+    return getRawPoolScreeningRejectReason(probe, s) === null;
+  });
+
+  if (needsEnrich.length === 0) return;
+
+  const now = Date.now();
+  await Promise.all(
+    needsEnrich.map(async (pool) => {
+      const mint = pool.token_x?.address || pool.base_mint;
+      let count = null;
+      const cached = _holderCountCache.get(mint);
+      if (cached && now - cached.ts < HOLDER_COUNT_CACHE_TTL_MS) {
+        count = cached.count;
+      } else {
+        try {
+          count = await fetchCount({ mint });
+        } catch (error) {
+          count = null; // fail-closed — null flows through to the gate as unknown
+          log("screening", `Holder enrich failed for ${pool.name || mint}: ${error.message}`);
+        }
+        _holderCountCache.set(mint, { count, ts: now });
+      }
+      pool._holders_enriched = true;
+      if (Number.isFinite(count) && count > 0) {
+        pool.base_token_holders = count;
+        log("screening", `Holder enrich: ${pool.name || mint} → ${count} holders (gate evaluates real number)`);
+      }
+      // count null/0 → leave base_token_holders as-is (null) → gate rejects unknown.
+    })
+  );
+}
+
+// Testable seam — exposes the holder enrich pass with an injectable fetcher so
+// scripts can verify enrich-before-gate without hitting the live API.
+export function __enrichHolderCountsBeforeGateForTests(rawPools, s, fetchCount) {
+  return enrichHolderCountsBeforeGate(rawPools, s, fetchCount);
+}
+
 export async function discoverPools({
   page_size = 50,
 } = {}) {
@@ -824,6 +913,16 @@ export async function discoverPools({
   rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
   // Item 3 — rescue stale vol≤0 readings before the volatility gate rejects them.
   rawPools = await refetchVolatilityForUnusable(rawPools);
+
+  // Cassiopeia — enrich-before-gate: signal pools (discord/solscan/pumpfun) often
+  // arrive with holders null/0 (source didn't carry it, NOT a real low count).
+  // Fetch the real count for pools that clear every OTHER cheap gate, so the
+  // holder floor judges a REAL number. Floor stays 500; enrich is NOT a bypass
+  // (fail → holders stays null → gate rejects "holders unknown"). Lyra-aware:
+  // no fetch is spent on a pool that would die on mcap/volume/tvl/age anyway.
+  if (s.enrichHolderCountBeforeGate !== false) {
+    await enrichHolderCountsBeforeGate(rawPools, s);
+  }
 
   const filteredExamples = [];
   const thresholdedRawPools = rawPools.filter((pool) => {

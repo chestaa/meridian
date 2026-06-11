@@ -151,6 +151,15 @@ export const config = {
     // Reject reasons: tvl_mcap_ratio_too_high, tvl_mcap_ratio_unknown.
     tvlMcapGateEnabled: u.tvlMcapGateEnabled ?? true,
     maxTvlMcapRatio:    u.maxTvlMcapRatio    ?? 0.2,
+    // ─── Enrich-before-gate for the holder floor (Cassiopeia) ───
+    // Signal pools (discord/solscan/pumpfun) often arrive with holders null/0
+    // because the source didn't carry the field — DATA-MISSING, not a real low
+    // count. When true, fetch the real holder count (assets/search holderCount,
+    // cached) for pools that clear every OTHER cheap gate, so the floor judges a
+    // REAL number. Floor (minHolders) is UNCHANGED. NOT a bypass: enrich failure
+    // → holders stays null → gate rejects "holders_unknown" (fail-closed,
+    // anti-pattern #2). Set false to restore legacy hard-reject-on-missing.
+    enrichHolderCountBeforeGate: u.enrichHolderCountBeforeGate ?? true,
     // ─── Item (a) Fee-Gen-Token signal — balanced two-sided flow (SCORE BONUS ONLY) ───
     // NEVER a gate (dormancy risk — a one-sided pump can still be a fine LP).
     // Pool Discovery API exposes NO per-side fee field (verified live: only aggregate
@@ -591,6 +600,7 @@ export function reloadScreeningThresholds() {
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
     if (fresh.tvlMcapGateEnabled !== undefined) s.tvlMcapGateEnabled = fresh.tvlMcapGateEnabled;
     if (fresh.maxTvlMcapRatio    != null) s.maxTvlMcapRatio = fresh.maxTvlMcapRatio;
+    if (fresh.enrichHolderCountBeforeGate !== undefined) s.enrichHolderCountBeforeGate = fresh.enrichHolderCountBeforeGate;
     if (fresh.feeGenSymmetryBonusEnabled !== undefined) s.feeGenSymmetryBonusEnabled = fresh.feeGenSymmetryBonusEnabled;
     if (fresh.feeGenSymmetryWeight != null) s.feeGenSymmetryWeight = fresh.feeGenSymmetryWeight;
     if (fresh.feeTvlHighBonusEnabled !== undefined) s.feeTvlHighBonusEnabled = fresh.feeTvlHighBonusEnabled;

@@ -85,6 +85,31 @@ export async function getTokenInfo({ query }) {
 }
 
 /**
+ * Get the TOTAL holder population count for a token mint.
+ *
+ * Cassiopeia note: this is intentionally NOT getTokenHolders(). getTokenHolders
+ * fetches the top-100 *distribution* (capped at 100 rows) and cannot report a
+ * population count above 100 — useless for a 500-holder floor gate. The real
+ * total count lives in Jupiter assets/search as `holderCount` (same field
+ * getTokenInfo already consumes). This is one cheap fetch, not the heavy
+ * distribution+OKX+smart-wallet pipeline of getTokenHolders.
+ *
+ * Returns a finite count, or null when the API gave us no usable number.
+ * Caller is responsible for fail-closed handling (null → reject, never default).
+ */
+export async function getTokenHolderCount({ mint }) {
+  if (!mint) return null;
+  const res = await fetch(`${DATAPI_BASE}/assets/search?query=${encodeURIComponent(mint)}`);
+  if (!res.ok) throw new Error(`assets/search ${res.status}`);
+  const data = await res.json();
+  const arr = Array.isArray(data) ? data : [data];
+  // Prefer the exact-mint hit; fall back to first result only if id matches.
+  const hit = arr.find((t) => t?.id === mint) || null;
+  const count = Number(hit?.holderCount);
+  return Number.isFinite(count) ? count : null;
+}
+
+/**
  * Get holder distribution for a token mint.
  * Fetches top 100 holders — caller decides how many to display.
  */
