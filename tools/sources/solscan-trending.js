@@ -1,5 +1,5 @@
 import { log } from "../../logger.js";
-import { findDlmmPoolForMint, numeric } from "./meteora-crossref.js";
+import { findDlmmPoolForMint, numeric, volumeScalar } from "./meteora-crossref.js";
 
 /**
  * Phase D — Solscan/Birdeye trending source (LOCAL).
@@ -85,7 +85,12 @@ function normalizePool(meteoraPool, birdeyeToken, mint) {
   const quote = baseIsX ? tokenY : tokenX;
 
   const tvl = numeric(meteoraPool.tvl ?? meteoraPool.active_tvl ?? birdeyeToken?.liquidity);
-  const volume = numeric(meteoraPool.volume ?? birdeyeToken?.volume24hUSD ?? birdeyeToken?.volume24h);
+  // Cross-ref Meteora volume is a per-window OBJECT (volumeScalar resolves the
+  // shortest finite window); only if that's unresolvable do we fall back to the
+  // Birdeye scalar. Fail-closed → null when neither is usable.
+  const volume =
+    volumeScalar(meteoraPool.volume) ??
+    numeric(birdeyeToken?.volume24hUSD ?? birdeyeToken?.volume24h);
   const feeActiveTvlRatio = numeric(meteoraPool.fee_active_tvl_ratio);
   const volatility = numeric(meteoraPool.volatility);
   const binStep = numeric(meteoraPool.dlmm_params?.bin_step ?? meteoraPool.bin_step);

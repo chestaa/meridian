@@ -1,5 +1,5 @@
 import { log } from "../../logger.js";
-import { numeric } from "./meteora-crossref.js";
+import { numeric, volumeScalar } from "./meteora-crossref.js";
 
 /**
  * Discord MeteoraIDN ranked-digest source (LOCAL) — Sirius 🐺.
@@ -214,7 +214,9 @@ function normalizePool(meteoraPool, digestEntry) {
 
   const m = digestEntry.metrics || {};
   const tvl = numeric(meteoraPool.tvl ?? meteoraPool.active_tvl) ?? m.tvl;
-  const volume = numeric(meteoraPool.volume);
+  // Cross-ref endpoint returns volume as a per-window OBJECT; volumeScalar picks
+  // the shortest finite window (or passes a scalar through). Fail-closed → null.
+  const volume = volumeScalar(meteoraPool.volume);
   const feeActiveTvlRatio = numeric(meteoraPool.fee_active_tvl_ratio);
   const volatility = numeric(meteoraPool.volatility);
   const binStep = numeric(meteoraPool.dlmm_params?.bin_step ?? meteoraPool.bin_step) ?? m.bin_step;

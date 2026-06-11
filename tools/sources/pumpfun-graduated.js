@@ -1,6 +1,6 @@
 import { log } from "../../logger.js";
 import { config } from "../../config.js";
-import { findDlmmPoolForMint, numeric } from "./meteora-crossref.js";
+import { findDlmmPoolForMint, numeric, volumeScalar } from "./meteora-crossref.js";
 
 /**
  * Phase B — Pump.fun graduated-token source (LOCAL).
@@ -92,7 +92,9 @@ function normalizePool(meteoraPool, coin, mint, graduatedAtMs) {
   const quote = baseIsX ? tokenY : tokenX;
 
   const tvl = numeric(meteoraPool.tvl ?? meteoraPool.active_tvl);
-  const volume = numeric(meteoraPool.volume);
+  // Cross-ref endpoint returns volume as a per-window OBJECT; volumeScalar picks
+  // the shortest finite window (or passes a scalar through). Fail-closed → null.
+  const volume = volumeScalar(meteoraPool.volume);
   const feeActiveTvlRatio = numeric(meteoraPool.fee_active_tvl_ratio);
   const volatility = numeric(meteoraPool.volatility);
   const binStep = numeric(meteoraPool.dlmm_params?.bin_step ?? meteoraPool.bin_step);
