@@ -1,5 +1,5 @@
 import { log } from "../../logger.js";
-import { numeric, volumeScalar } from "./meteora-crossref.js";
+import { numeric, crossrefPoolFields } from "./meteora-crossref.js";
 
 /**
  * Discord MeteoraIDN ranked-digest source (LOCAL) — Sirius 🐺.
@@ -213,17 +213,20 @@ function normalizePool(meteoraPool, digestEntry) {
   const quote = baseIsX ? tokenY : tokenX;
 
   const m = digestEntry.metrics || {};
-  const tvl = numeric(meteoraPool.tvl ?? meteoraPool.active_tvl) ?? m.tvl;
-  // Cross-ref endpoint returns volume as a per-window OBJECT; volumeScalar picks
-  // the shortest finite window (or passes a scalar through). Fail-closed → null.
-  const volume = volumeScalar(meteoraPool.volume);
-  const feeActiveTvlRatio = numeric(meteoraPool.fee_active_tvl_ratio);
-  const volatility = numeric(meteoraPool.volatility);
-  const binStep = numeric(meteoraPool.dlmm_params?.bin_step ?? meteoraPool.bin_step) ?? m.bin_step;
-  const holders = numeric(meteoraPool.base_token_holders ?? base?.holder_count);
+  // Resolve ALL gate-read fields through the shared cross-ref shape mapper:
+  // window-objects (volume, fee_tvl_ratio→fee_active_tvl_ratio slot) → shortest
+  // finite window; bin_step from pool_config; holders from token.holders; etc.
+  // Fail-closed → null when unresolvable (anti-pattern #2). See meteora-crossref.js.
+  const f = crossrefPoolFields(meteoraPool, base);
+  const tvl = f.tvl ?? numeric(m.tvl);
+  const volume = f.volume;
+  const feeActiveTvlRatio = f.feeActiveTvlRatio;
+  const volatility = f.volatility;
+  const binStep = f.binStep ?? numeric(m.bin_step);
+  const holders = f.holders;
   const createdAt = numeric(base?.created_at);
   const tokenAgeHours = createdAt != null ? Math.floor((Date.now() - createdAt) / 3_600_000) : null;
-  const marketCap = numeric(base?.market_cap) ?? m.fdv;
+  const marketCap = f.marketCap ?? numeric(m.fdv);
 
   return {
     // ── Meteora-raw top-level (consumed by reject-reason + condensePool) ──

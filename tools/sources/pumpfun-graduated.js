@@ -1,6 +1,6 @@
 import { log } from "../../logger.js";
 import { config } from "../../config.js";
-import { findDlmmPoolForMint, numeric, volumeScalar } from "./meteora-crossref.js";
+import { findDlmmPoolForMint, numeric, crossrefPoolFields } from "./meteora-crossref.js";
 
 /**
  * Phase B — Pump.fun graduated-token source (LOCAL).
@@ -91,14 +91,17 @@ function normalizePool(meteoraPool, coin, mint, graduatedAtMs) {
   const base = baseIsX ? tokenX : tokenY;
   const quote = baseIsX ? tokenY : tokenX;
 
-  const tvl = numeric(meteoraPool.tvl ?? meteoraPool.active_tvl);
-  // Cross-ref endpoint returns volume as a per-window OBJECT; volumeScalar picks
-  // the shortest finite window (or passes a scalar through). Fail-closed → null.
-  const volume = volumeScalar(meteoraPool.volume);
-  const feeActiveTvlRatio = numeric(meteoraPool.fee_active_tvl_ratio);
-  const volatility = numeric(meteoraPool.volatility);
-  const binStep = numeric(meteoraPool.dlmm_params?.bin_step ?? meteoraPool.bin_step);
-  const holders = numeric(meteoraPool.base_token_holders ?? base?.holder_count);
+  // Resolve ALL gate-read fields through the shared cross-ref shape mapper
+  // (window-objects → shortest finite window, pool_config.bin_step, token.holders,
+  // fee_tvl_ratio→fee_active_tvl_ratio slot). Fail-closed → null when unresolvable
+  // (anti-pattern #2). See meteora-crossref.js.
+  const f = crossrefPoolFields(meteoraPool, base);
+  const tvl = f.tvl;
+  const volume = f.volume;
+  const feeActiveTvlRatio = f.feeActiveTvlRatio;
+  const volatility = f.volatility;
+  const binStep = f.binStep;
+  const holders = f.holders;
   const createdAt = numeric(base?.created_at) ?? graduatedAtMs;
   const tokenAgeHours = createdAt != null ? Math.floor((Date.now() - createdAt) / 3_600_000) : null;
   const gradAgeHours = graduatedAtMs != null ? Math.floor((Date.now() - graduatedAtMs) / 3_600_000) : null;

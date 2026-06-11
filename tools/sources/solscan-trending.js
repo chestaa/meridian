@@ -1,5 +1,5 @@
 import { log } from "../../logger.js";
-import { findDlmmPoolForMint, numeric, volumeScalar } from "./meteora-crossref.js";
+import { findDlmmPoolForMint, numeric, crossrefPoolFields } from "./meteora-crossref.js";
 
 /**
  * Phase D — Solscan/Birdeye trending source (LOCAL).
@@ -84,19 +84,17 @@ function normalizePool(meteoraPool, birdeyeToken, mint) {
   const base = baseIsX ? tokenX : tokenY;
   const quote = baseIsX ? tokenY : tokenX;
 
-  const tvl = numeric(meteoraPool.tvl ?? meteoraPool.active_tvl ?? birdeyeToken?.liquidity);
-  // Cross-ref Meteora volume is a per-window OBJECT (volumeScalar resolves the
-  // shortest finite window); only if that's unresolvable do we fall back to the
-  // Birdeye scalar. Fail-closed → null when neither is usable.
-  const volume =
-    volumeScalar(meteoraPool.volume) ??
-    numeric(birdeyeToken?.volume24hUSD ?? birdeyeToken?.volume24h);
-  const feeActiveTvlRatio = numeric(meteoraPool.fee_active_tvl_ratio);
-  const volatility = numeric(meteoraPool.volatility);
-  const binStep = numeric(meteoraPool.dlmm_params?.bin_step ?? meteoraPool.bin_step);
-  const holders = numeric(
-    meteoraPool.base_token_holders ?? base?.holder_count ?? birdeyeToken?.holder
-  );
+  // Resolve ALL gate-read fields through the shared cross-ref shape mapper
+  // (window-objects → shortest finite window, pool_config.bin_step, token.holders,
+  // fee_tvl_ratio→fee_active_tvl_ratio slot). Birdeye scalars fill gaps only when
+  // the Meteora value is unresolvable. Fail-closed → null. See meteora-crossref.js.
+  const f = crossrefPoolFields(meteoraPool, base);
+  const tvl = f.tvl ?? numeric(birdeyeToken?.liquidity);
+  const volume = f.volume ?? numeric(birdeyeToken?.volume24hUSD ?? birdeyeToken?.volume24h);
+  const feeActiveTvlRatio = f.feeActiveTvlRatio;
+  const volatility = f.volatility;
+  const binStep = f.binStep;
+  const holders = f.holders ?? numeric(birdeyeToken?.holder);
   const createdAt = numeric(base?.created_at);
   const tokenAgeHours = createdAt != null ? Math.floor((Date.now() - createdAt) / 3_600_000) : null;
 
