@@ -859,6 +859,99 @@ export function __enrichHolderCountsBeforeGateForTests(rawPools, s, fetchCount) 
  *
  * Mutates pools in place. Injectable fetchDetail lets tests run without the live API.
  */
+// SINGLE SOURCE OF TRUTH for the enrich-before-gate probe (Cassiopeia 2026-06-11,
+// catch-22 close). enrichNativeDetailBeforeGate back-fills NINE fields from the
+// native detail fetch (see the fill block below). The cost-probe that decides
+// whether the fetch is WORTH spending must therefore treat ALL nine as
+// "will-be-filled" — i.e. sentinel every field the fetch can plug, NOT just the
+// structural-gap pair (volatility/organic). The original probe only sentinelled
+// vol+organic, so a signal pool genuinely missing created_at (no `created_at` on
+// the cross-ref endpoint) was rejected by the AGE gate INSIDE the probe → fetch
+// skipped → created_at never back-filled → pool never reached the judge. A
+// chicken-and-egg: the probe gated a field the fetch was about to fill.
+//
+// `buildEnrichProbe` is co-located with the fill block on purpose — if a tenth
+// field is ever added to the back-fill, it MUST also be sentinelled here (a probe
+// field that the fill writes but the probe gates = a brand-new catch-22). Each
+// sentinel is OPTIMISTIC (a value that clears the gate), applied ONLY where the
+// real field is genuinely missing — a present real value is used as-is so a pool
+// that truly dies on a cheap, already-available field (e.g. real mcap below floor)
+// is still dropped for free, no fetch wasted (Lyra cost order preserved).
+//
+// FAIL-CLOSED is NOT weakened: the sentinel lives ONLY in the probe (the
+// worth-fetching decision). After the fetch RUNS, the real gate re-evaluates the
+// ACTUAL data — a field the native detail genuinely lacks (or a failed fetch)
+// stays null and the gate rejects it (created_at→age reject / volatility_unknown /
+// organic_unknown / holders_unknown / fee/tvl-unknown / …). Probe optimistic,
+// real-eval fail-closed (anti-pattern #2).
+function buildEnrichProbe(pool, s) {
+  const tx = pool?.token_x || {};
+  // An optimistic created_at = "old enough AND young enough" — squarely inside any
+  // [minTokenAgeHours, maxTokenAgeHours] band so the probe never gates on an age
+  // the fetch is about to supply. Midpoint of the band when both bounds exist;
+  // otherwise just clear whichever single bound is set.
+  const ageProbeCreatedAt = (() => {
+    const minH = numeric(s?.minTokenAgeHours);
+    const maxH = numeric(s?.maxTokenAgeHours);
+    const now = Date.now();
+    if (minH != null && maxH != null) return now - ((minH + maxH) / 2) * 3_600_000;
+    if (minH != null) return now - (minH + 1) * 3_600_000; // just past the min-age floor
+    if (maxH != null) return now - 1 * 3_600_000;          // recent, but a real ts
+    return now - 100 * 3_600_000;                          // no band → any plausible ts
+  })();
+
+  // CRITICAL: use strictNumeric (NOT numeric) for the missing-test. numeric(null)
+  // === 0 (Number(null) coerces to 0), so `numeric(x) == null` is ALWAYS false and
+  // would skip the sentinel for a genuinely-absent field — the exact coercion bug
+  // that hid the created_at catch-22. strictNumeric returns null for null/undefined
+  // and tells a real 0 apart from "absent". A real 0 is NOT sentinelled on purpose:
+  // the real gate rejects it (e.g. tvl 0 < minTvl), so the probe rejects it too →
+  // no fetch wasted on a genuinely-doomed pool (Lyra cost order preserved).
+  const probe = {
+    ...pool,
+    // Structural-gap pair (the primary target of the fetch).
+    volatility: strictNumeric(pool?.volatility) == null ? 1 : pool.volatility,
+    // Opportunistic back-fill fields — all gated by getRawPoolScreeningRejectReason,
+    // so all must be sentinelled here when genuinely missing.
+    tvl: strictNumeric(pool?.tvl ?? pool?.active_tvl) == null
+      ? Math.max(numeric(s?.minTvl) || 0, 1)
+      : pool.tvl,
+    volume: strictNumeric(pool?.volume) == null
+      ? Math.max(numeric(s?.minVolume) || 0, 1)
+      : pool.volume,
+    fee_active_tvl_ratio: strictNumeric(pool?.fee_active_tvl_ratio) == null
+      ? Math.max(numeric(s?.minFeeActiveTvlRatio) || 0, 0.0001)
+      : pool.fee_active_tvl_ratio,
+    base_token_holders:
+      strictNumeric(pool?.base_token_holders) == null || strictNumeric(pool?.base_token_holders) === 0
+        ? Math.max(numeric(s?.minHolders) || 0, 1)
+        : pool.base_token_holders,
+    dlmm_params: {
+      ...(pool?.dlmm_params || {}),
+      bin_step: strictNumeric(pool?.dlmm_params?.bin_step) == null
+        ? Math.max(numeric(s?.minBinStep) || 0, 1)
+        : pool.dlmm_params.bin_step,
+    },
+    token_x: {
+      ...tx,
+      organic_score: strictNumeric(tx?.organic_score) == null
+        ? Math.max(0, numeric(s?.minOrganic) || 0)
+        : tx.organic_score,
+      market_cap: strictNumeric(tx?.market_cap) == null
+        ? Math.max(numeric(s?.minMcap) || 0, 1)
+        : tx.market_cap,
+      created_at: strictNumeric(tx?.created_at) == null ? ageProbeCreatedAt : tx.created_at,
+    },
+  };
+  return probe;
+}
+
+// Testable seam — lets the test suite assert the probe sentinels every back-fill
+// field (catch-22 regression guard) without invoking the live fetch path.
+export function __buildEnrichProbeForTests(pool, s) {
+  return buildEnrichProbe(pool, s);
+}
+
 async function enrichNativeDetailBeforeGate(rawPools, s, fetchDetail = fetchPoolDiscoveryDetail) {
   // A pool needs native enrich only if a STRUCTURAL-GAP field is missing. Native
   // discovery pools (Meteora-origin) already carry both → never re-fetched.
@@ -875,23 +968,14 @@ async function enrichNativeDetailBeforeGate(rawPools, s, fetchDetail = fetchPool
     if (!pool?.pool_address) return false;     // no address → can't fetch detail → gate rejects unknown
     if (!isMissingGapField(pool)) return false; // already has both → nothing to fetch
     // Lyra cost-aware: only spend a native detail fetch on a pool that would clear
-    // every OTHER gate once the two gaps are filled. Probe with passing sentinels
-    // for ONLY the MISSING gap fields; every other gate (mcap/volume/tvl/holders/
-    // bin_step/fee/age — all already-available, no API) still applies. A pool that
-    // dies on a cheap gate is dropped here for free — no native fetch wasted.
-    const volMissing = strictNumeric(pool?.volatility) == null;
-    const organicMissing = strictNumeric(pool?.token_x?.organic_score) == null;
-    const probe = {
-      ...pool,
-      volatility: volMissing ? 1 : pool.volatility,
-      token_x: {
-        ...(pool?.token_x || {}),
-        organic_score: organicMissing
-          ? Math.max(0, numeric(s.minOrganic) || 0)
-          : pool.token_x.organic_score,
-      },
-    };
-    return getRawPoolScreeningRejectReason(probe, s) === null;
+    // every gate ONCE THE FETCH HAS FILLED EVERY FIELD IT CAN. buildEnrichProbe
+    // sentinels ALL nine back-fill fields (optimistic, only where genuinely
+    // missing). Gates on fields the fetch CANNOT fill — and on real present values
+    // (e.g. a real mcap below floor) — still fire here, dropping doomed pools for
+    // free, no native fetch wasted. This is the catch-22 close: previously only
+    // vol+organic were sentinelled, so a missing created_at (which the fetch fills)
+    // was age-rejected in the probe and the fetch was wrongly skipped.
+    return getRawPoolScreeningRejectReason(buildEnrichProbe(pool, s), s) === null;
   });
 
   if (needsEnrich.length === 0) return;
@@ -940,34 +1024,42 @@ async function enrichNativeDetailBeforeGate(rawPools, s, fetchDetail = fetchPool
       // pool is STILL missing the field. Never overwrite an existing value. These
       // are not the primary target but plugging them costs nothing and keeps a
       // cross-ref pool from dying on a different gap on the next iteration.
-      if (numeric(pool.fee_active_tvl_ratio) == null) {
+      //
+      // strictNumeric for the missing-test (CATCH-22 fix, Cassiopeia 2026-06-11):
+      // numeric(null) === 0, so `numeric(pool.X) == null` is ALWAYS false for a
+      // genuinely-absent field — created_at/mcap/fee/tvl/volume/bin_step were
+      // therefore NEVER back-filled when truly null (e.g. a signal pool with no
+      // created_at), and real-eval then age-rejected the pool. strictNumeric tells a
+      // genuine 0 (don't overwrite — honest reading) apart from absent (fill it).
+      // The WRITTEN value still uses numeric() (honest read of the detail scalar).
+      if (strictNumeric(pool.fee_active_tvl_ratio) == null) {
         const f = numeric(detail.fee_active_tvl_ratio);
         if (f != null) { pool.fee_active_tvl_ratio = f; filled.push(`fee/tvl=${f.toFixed(4)}`); }
       }
-      if (numeric(pool.token_x?.market_cap) == null && numeric(detail.token_x?.market_cap) != null) {
+      if (strictNumeric(pool.token_x?.market_cap) == null && numeric(detail.token_x?.market_cap) != null) {
         if (!pool.token_x) pool.token_x = {};
         pool.token_x.market_cap = numeric(detail.token_x.market_cap);
         filled.push("mcap");
       }
-      if (numeric(pool.token_x?.created_at) == null && numeric(detail.token_x?.created_at) != null) {
+      if (strictNumeric(pool.token_x?.created_at) == null && numeric(detail.token_x?.created_at) != null) {
         if (!pool.token_x) pool.token_x = {};
         pool.token_x.created_at = numeric(detail.token_x.created_at);
         pool.base_token_created_at = pool.token_x.created_at;
         filled.push("created_at");
       }
-      if (numeric(pool.base_token_holders) == null || numeric(pool.base_token_holders) === 0) {
+      if (strictNumeric(pool.base_token_holders) == null || strictNumeric(pool.base_token_holders) === 0) {
         const h = numeric(detail.base_token_holders);
         if (h != null && h > 0) { pool.base_token_holders = h; filled.push(`holders=${h}`); }
       }
-      if (numeric(pool.tvl) == null) {
+      if (strictNumeric(pool.tvl) == null) {
         const t = numeric(detail.tvl ?? detail.active_tvl);
         if (t != null) { pool.tvl = t; filled.push("tvl"); }
       }
-      if (numeric(pool.volume) == null) {
+      if (strictNumeric(pool.volume) == null) {
         const vol = numeric(detail.volume);
         if (vol != null) { pool.volume = vol; filled.push("volume"); }
       }
-      if (numeric(pool.dlmm_params?.bin_step) == null) {
+      if (strictNumeric(pool.dlmm_params?.bin_step) == null) {
         const b = numeric(detail.dlmm_params?.bin_step);
         if (b != null) { pool.dlmm_params = { ...(pool.dlmm_params || {}), bin_step: b }; filled.push("bin_step"); }
       }

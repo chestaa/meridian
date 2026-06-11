@@ -28,6 +28,7 @@
 import assert from "node:assert";
 import {
   __enrichNativeDetailBeforeGateForTests,
+  __buildEnrichProbeForTests,
   getRawPoolScreeningRejectReason,
 } from "../tools/screening.js";
 
@@ -252,6 +253,139 @@ console.log("\n[10] reject-reason split regression — null vs genuine-low are D
   const r4 = getRawPoolScreeningRejectReason(deadVol, S);
   ok(typeof r4 === "string" && r4.includes("unusable") && r4 !== "volatility_unknown",
     `volatility 0 → "...is unusable" (genuine), distinct from volatility_unknown (got: ${r4})`);
+}
+
+// ── CATCH-22 CLOSE (Cassiopeia 2026-06-11) ──────────────────────────────────
+// The probe that decides "is the native fetch worth spending?" used to sentinel
+// ONLY volatility+organic. But enrichNativeDetailBeforeGate ALSO back-fills
+// created_at, mcap, tvl, volume, fee/tvl, holders, bin_step. A live overlay with
+// an ACTIVE token-age band + a signal pool with NO created_at (structural gap on
+// the cross-ref endpoint) → the AGE gate fired INSIDE the probe → fetch skipped →
+// created_at never filled → pool never reached the judge. These tests pin the fix:
+// the probe must sentinel EVERY field the fetch can fill, while real-eval after the
+// fetch stays fail-closed.
+
+// Live-overlay thresholds WITH an active age band (the production condition Draco
+// hit — S above has age null, which is why the bug never surfaced in [1]-[10]).
+const S_AGE = { ...S, minTokenAgeHours: 8, maxTokenAgeHours: 720, minOrganic: 75 };
+
+// A signal pool with the FULL structural-gap profile of the 5 stuck pools
+// (清正/CHANCE/1-SOL/Bountywork/PARQ): missing created_at AND volatility AND
+// organic, but clearing every cheap gate once the fetch fills them.
+function structuralGapPool({ addr = "P_STUCK", name = "STUCK-SOL", mcap = 1_000_000 } = {}) {
+  return {
+    pool_address: addr,
+    name,
+    pool_type: "dlmm",
+    discord_signal: true,
+    signal_source: "discord_meteoraidn",
+    tvl: 50_000,
+    volume: 20_000,
+    fee_active_tvl_ratio: 0.10,
+    volatility: null,                 // structural gap
+    base_token_holders: 800,
+    dlmm_params: { bin_step: 100 },
+    token_x: {
+      symbol: name.split("-")[0],
+      address: "Mint" + addr,
+      organic_score: null,            // structural gap
+      market_cap: mcap,
+      created_at: null,               // ← THE catch-22 field (missing on cross-ref)
+    },
+    token_y: { symbol: "SOL", address: "So111", organic_score: 0 },
+    base_mint: "Mint" + addr,
+  };
+}
+
+console.log("\n[11] CATCH-22: missing created_at + active age band → probe CLEARS (regression)");
+{
+  // PRE-FIX this returned a token-age reject (createdAt null → age gate) and the
+  // fetch was skipped. The probe must now sentinel created_at and clear.
+  const p = structuralGapPool({ addr: "P_AGE22" });
+  const probe = __buildEnrichProbeForTests(p, S_AGE);
+  ok(getRawPoolScreeningRejectReason(probe, S_AGE) === null,
+    "probe with missing created_at + active age band CLEARS (catch-22 closed)");
+}
+
+console.log("\n[11b] CATCH-22 end-to-end: stuck signal pool → fetch FIRES → reaches judge");
+{
+  const p = structuralGapPool({ addr: "P_E2E" });
+  let calls = 0;
+  await __enrichNativeDetailBeforeGateForTests([p], S_AGE, async ({ poolAddress }) => {
+    calls++;
+    assert.strictEqual(poolAddress, "P_E2E");
+    return {
+      volatility: 4.5,
+      token_x: { organic_score: 80, created_at: Date.now() - 100 * 3_600_000 },
+    };
+  });
+  ok(calls === 1, "native fetch FIRES for a stuck pool (was skipped pre-fix — the catch-22)");
+  ok(p.volatility === 4.5 && p.token_x.organic_score === 80 && Number.isFinite(p.token_x.created_at),
+    "back-fill wrote volatility + organic + created_at");
+  ok(getRawPoolScreeningRejectReason(p, S_AGE) === null,
+    "real-eval PASSES after back-fill → clean signal pool WOULD REACH THE JUDGE");
+}
+
+console.log("\n[12] FAIL-CLOSED preserved: fetch returns NO created_at → age reject (real-eval)");
+{
+  // The probe is optimistic, but if the native detail genuinely lacks created_at,
+  // real-eval must STILL reject on age (sentinel ≠ bypass).
+  const p = structuralGapPool({ addr: "P_NOAGE" });
+  await __enrichNativeDetailBeforeGateForTests([p], S_AGE, async () => ({
+    volatility: 4.5,
+    token_x: { organic_score: 80 /* created_at absent */ },
+  }));
+  ok(p.token_x.created_at == null, "no created_at written (native genuinely lacked it)");
+  const r = getRawPoolScreeningRejectReason(p, S_AGE);
+  ok(typeof r === "string" && r.includes("token age"),
+    `real-eval fail-closed: missing created_at → age reject (got: ${r}) — sentinel was probe-only`);
+}
+
+console.log("\n[12b] FAIL-CLOSED: probe clears but enrich FAILS → vol/organic_unknown (real-eval)");
+{
+  const p = structuralGapPool({ addr: "P_ENRICHFAIL" });
+  await __enrichNativeDetailBeforeGateForTests([p], S_AGE, async () => { throw new Error("API down"); });
+  const r = getRawPoolScreeningRejectReason(p, S_AGE);
+  ok(r === "volatility_unknown" || r === "organic_unknown",
+    `enrich failure after a cleared probe still fail-closed → ${r} (NOT a pass)`);
+}
+
+console.log("\n[13] Lyra cost: real mcap below floor + missing gaps → probe REJECTS → no fetch");
+{
+  // mcap is genuinely present and below floor — the probe must NOT sentinel a
+  // present real value, so the cheap gate still drops the pool for free.
+  const p = structuralGapPool({ addr: "P_REALMCAP", mcap: 1000 });
+  let calls = 0;
+  await __enrichNativeDetailBeforeGateForTests([p], S_AGE, async () => { calls++; return {}; });
+  ok(calls === 0, "real mcap below floor → probe rejects → NO native fetch (cost preserved)");
+  ok(getRawPoolScreeningRejectReason(p, S_AGE).includes("mcap"), "still rejected on the real mcap gate");
+}
+
+console.log("\n[14] AUDIT: probe sentinels EVERY back-fill field (tenth-field catch-22 guard)");
+{
+  // A pool missing ALL nine back-fill fields, but clearing the gates the fetch
+  // can't help (no critical warnings etc). With an active age band. If ANY
+  // back-fill field is left un-sentinelled in the probe, this asserts and points
+  // at the exact gate — the guard that makes a future catch-22 fail loudly here
+  // rather than silently in production.
+  const bare = {
+    pool_address: "P_AUDIT",
+    name: "AUDIT-SOL",
+    pool_type: "dlmm",
+    discord_signal: true,
+    volatility: null,
+    base_token_holders: null,
+    tvl: null,
+    volume: null,
+    fee_active_tvl_ratio: null,
+    dlmm_params: { bin_step: null },
+    token_x: { organic_score: null, market_cap: null, created_at: null },
+    token_y: { symbol: "SOL", address: "So111", organic_score: 0 },
+  };
+  const probe = __buildEnrichProbeForTests(bare, S_AGE);
+  const r = getRawPoolScreeningRejectReason(probe, S_AGE);
+  ok(r === null,
+    `probe with ALL back-fill fields missing CLEARS — every back-fill field is sentinelled (got: ${r ?? "null"})`);
 }
 
 console.log(`\n${pass} assertions passed, 0 failed.`);
