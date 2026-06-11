@@ -21,6 +21,21 @@ const DATAPI_JUP = "https://datapi.jup.ag/v1";
 const HOLDER_COUNT_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min — count moves slowly
 const _holderCountCache = new Map(); // mint -> { count: number|null, ts: number }
 
+// Native-detail enrich cache (Cassiopeia — enrich-before-gate for cross-ref pools).
+// Cross-ref signal pools (discord/solscan/pumpfun via dlmm.datapi.meteora.ag) arrive
+// WITHOUT volatility + organic_score: those fields are a STRUCTURAL GAP on the
+// cross-ref endpoint (confirmed by Sirius's exhaustive shape audit — see
+// meteora-crossref.js header). They are NOT real zeros; the cross-ref index simply
+// never carried them, so the pools died at the volatility/organic gates on
+// DATA-MISSING. The NATIVE Pool-Discovery detail endpoint
+// (pool-discovery-api.datapi.meteora.ag, queried by pool_address) DOES expose them
+// as proper scalars (verified live: volatility/organic_score/fee_active_tvl_ratio/
+// created_at/market_cap all present). One native detail fetch per surviving pool
+// fills every gap at once. Cached by pool_address with TTL so the same pool isn't
+// re-fetched every cycle. Vol moves on the 5-30m feed → keep this TTL short.
+const NATIVE_DETAIL_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min — volatility is time-sensitive
+const _nativeDetailCache = new Map(); // pool_address -> { detail: object|null, ts: number }
+
 // Wrapped SOL mint. We deploy single-side SOL ONLY (executor.js refuses
 // amount_x>0), so any pool quoted in something else (USDC, etc.) is
 // undeployable. Used by solQuoteRejectReason() to cut undeployable waste
@@ -237,6 +252,24 @@ function numeric(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * STRICT numeric coercion — distinguishes DATA-MISSING (null/undefined/empty) from
+ * a genuine zero. numeric() alone is unsafe for fail-closed gates because
+ * Number(null) === 0 and Number("") === 0 would silently FABRICATE a zero from
+ * missing data — exactly anti-pattern #2. Use this wherever "field absent" must be
+ * told apart from "field genuinely 0" (e.g. organic_unknown vs a real low organic,
+ * volatility_unknown vs a real dead-flat 0). Mirrors windowScalar's strictNum in
+ * meteora-crossref.js.
+ */
+function strictNumeric(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null; // null / undefined / empty / object → data-missing
+}
+
 function isUsableVolatility(value) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0;
@@ -382,11 +415,20 @@ export function getRawPoolScreeningRejectReason(pool, s) {
   const binStep = numeric(pool?.dlmm_params?.bin_step);
   const tvl = numeric(pool?.tvl ?? pool?.active_tvl);
   const feeActiveTvlRatio = numeric(pool?.fee_active_tvl_ratio);
-  const volatility = numeric(pool?.volatility);
+  // strictNumeric for volatility + organic: a missing field (null/undefined) must
+  // stay null (→ *_unknown fail-closed) and NOT coerce to 0 (Number(null)===0),
+  // which would masquerade as a genuine dead/zero reading. The two cases get
+  // distinct reject reasons so enrich-before-gate can tell "no data yet" apart
+  // from "real low value" (anti-pattern #2).
+  const volatility = strictNumeric(pool?.volatility);
   const volume = numeric(pool?.volume);
   const holders = numeric(pool?.base_token_holders);
   const mcap = numeric(base?.market_cap);
-  const baseOrganic = numeric(base?.organic_score);
+  const baseOrganic = strictNumeric(base?.organic_score);
+  // quoteOrganic stays on numeric() — the quote side is SOL/USDC, frequently has
+  // no organic score, and minQuoteOrganic is 0; coercing missing→0 here is the
+  // intended (pre-existing) lenient behavior. Only the BASE organic gate needs the
+  // strict missing-vs-zero distinction for organic_unknown.
   const quoteOrganic = numeric(quote?.organic_score);
   const launchpad = base?.launchpad || pool?.base_token_launchpad || null;
   const createdAt = numeric(base?.created_at);
@@ -415,11 +457,23 @@ export function getRawPoolScreeningRejectReason(pool, s) {
   if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
     return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
   }
+  // Fail-closed (anti-pattern #2): null volatility = DATA-MISSING (e.g. a
+  // cross-ref signal pool whose endpoint never carried it). Distinguish it from a
+  // genuine vol<=0 (dead/flat) reading so enrich-before-gate can tell the two
+  // apart. After enrichNativeDetailBeforeGate has run, a still-null volatility
+  // means enrich failed → reject, never default to a usable value.
+  if (volatility == null) return "volatility_unknown";
   if (!isUsableVolatility(volatility)) {
-    return `volatility ${volatility ?? "unknown"} is unusable`;
+    return `volatility ${volatility} is unusable`;
   }
-  if (baseOrganic == null || baseOrganic < s.minOrganic) {
-    return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`;
+  // Fail-closed (anti-pattern #2): null organic = DATA-MISSING (structural gap on
+  // the cross-ref endpoint, NOT a genuine low score). organic_unknown is
+  // distinguishable from a genuine sub-floor score so enrich-before-gate (which
+  // back-fills organic via a native detail fetch) is not confused with a real
+  // low-organic reject. After enrich, a still-null organic means the fetch failed.
+  if (baseOrganic == null) return "organic_unknown";
+  if (baseOrganic < s.minOrganic) {
+    return `base organic ${baseOrganic} below minOrganic ${s.minOrganic}`;
   }
   if (quoteOrganic == null || quoteOrganic < s.minQuoteOrganic) {
     return `quote organic ${quoteOrganic ?? "unknown"} below minQuoteOrganic ${s.minQuoteOrganic}`;
@@ -716,6 +770,164 @@ export function __enrichHolderCountsBeforeGateForTests(rawPools, s, fetchCount) 
   return enrichHolderCountsBeforeGate(rawPools, s, fetchCount);
 }
 
+/**
+ * Cassiopeia — enrich-before-gate for the volatility + organic structural gaps.
+ *
+ * THE LAST FUNNEL WALL (Draco empirical 2026-06-11): cross-ref signal pools died
+ * at `base organic 0 < minOrganic` because `organic_score` and `volatility` are a
+ * STRUCTURAL GAP on the cross-ref endpoint (dlmm.datapi.meteora.ag) — Sirius's
+ * field-mapping fix (commit 2b4be22) resolved volume/fee_tvl/bin_step/holders, but
+ * those two fields simply do not exist on that index. A 0 there = MISSING, not a
+ * genuine low organic. The fix is NOT to lower minOrganic — it is to GIVE the pool
+ * its real data: the NATIVE Pool-Discovery detail endpoint
+ * (pool-discovery-api.datapi.meteora.ag, queried by pool_address) carries
+ * volatility + organic_score (+ fee/age/mcap/tvl) as proper scalars. One fetch per
+ * surviving pool fills every gap at once — more efficient than per-field fetches.
+ *
+ * This extends the enrich-before-gate framework ([[holder-enrich-before-gate]],
+ * commit 0b7332f). It runs AFTER enrichHolderCountsBeforeGate (so holders is
+ * already filled and the cheap-gate probe below is accurate).
+ *
+ * Order (Lyra cost-aware): we only fetch a native detail for a pool that is
+ * MISSING volatility or base organic AND would clear EVERY OTHER gate once those
+ * two gaps are filled (probe with passing sentinels for ONLY the two gap fields).
+ * A pool that dies on mcap/volume/tvl/holders/bin_step/age (all already-available,
+ * no extra API) gets NO native fetch — we never spend a detail call on the 41
+ * discord pools if most die on mcap.
+ *
+ * FAIL-CLOSED (anti-pattern #2): if the native fetch fails OR the field is still
+ * null after enrich, we leave it null and the gate rejects volatility_unknown /
+ * organic_unknown. Enrich = a CHANCE to get data, never a pass without it. We back
+ * only the structurally-missing scalars from the native detail; we never overwrite
+ * a value the pool already has, and never default a missing field to a safe number.
+ *
+ * Mutates pools in place. Injectable fetchDetail lets tests run without the live API.
+ */
+async function enrichNativeDetailBeforeGate(rawPools, s, fetchDetail = fetchPoolDiscoveryDetail) {
+  // A pool needs native enrich only if a STRUCTURAL-GAP field is missing. Native
+  // discovery pools (Meteora-origin) already carry both → never re-fetched.
+  // strictNumeric: a missing field is null/undefined (NOT a coerced 0). A genuine
+  // 0 volatility is NOT a structural gap — it's a real dead reading the gate should
+  // reject as unusable, not something a native fetch can "rescue" to a fake number.
+  const isMissingGapField = (pool) => {
+    const vol = strictNumeric(pool?.volatility);
+    const organic = strictNumeric(pool?.token_x?.organic_score);
+    return vol == null || organic == null;
+  };
+
+  const needsEnrich = rawPools.filter((pool) => {
+    if (!pool?.pool_address) return false;     // no address → can't fetch detail → gate rejects unknown
+    if (!isMissingGapField(pool)) return false; // already has both → nothing to fetch
+    // Lyra cost-aware: only spend a native detail fetch on a pool that would clear
+    // every OTHER gate once the two gaps are filled. Probe with passing sentinels
+    // for ONLY the MISSING gap fields; every other gate (mcap/volume/tvl/holders/
+    // bin_step/fee/age — all already-available, no API) still applies. A pool that
+    // dies on a cheap gate is dropped here for free — no native fetch wasted.
+    const volMissing = strictNumeric(pool?.volatility) == null;
+    const organicMissing = strictNumeric(pool?.token_x?.organic_score) == null;
+    const probe = {
+      ...pool,
+      volatility: volMissing ? 1 : pool.volatility,
+      token_x: {
+        ...(pool?.token_x || {}),
+        organic_score: organicMissing
+          ? Math.max(0, numeric(s.minOrganic) || 0)
+          : pool.token_x.organic_score,
+      },
+    };
+    return getRawPoolScreeningRejectReason(probe, s) === null;
+  });
+
+  if (needsEnrich.length === 0) return;
+
+  const now = Date.now();
+  await Promise.all(
+    needsEnrich.map(async (pool) => {
+      const addr = pool.pool_address;
+      let detail = null;
+      const cached = _nativeDetailCache.get(addr);
+      if (cached && now - cached.ts < NATIVE_DETAIL_CACHE_TTL_MS) {
+        detail = cached.detail;
+      } else {
+        try {
+          // 30m timeframe matches the conservative window the cross-ref mapper
+          // uses (anti-hype) and the volatility-rescue pass — keeps volatility
+          // comparable across enrich paths.
+          detail = await fetchDetail({ poolAddress: addr, timeframe: MIN_VOLATILITY_TIMEFRAME });
+        } catch (error) {
+          detail = null; // fail-closed — gaps stay null → gate rejects unknown
+          log("screening", `Native-detail enrich failed for ${pool.name || addr}: ${error.message}`);
+        }
+        _nativeDetailCache.set(addr, { detail, ts: now });
+      }
+      pool._native_detail_enriched = true;
+      if (!detail) return; // fail-closed: no detail → leave gaps null → gate rejects
+
+      const filled = [];
+      // ── Structural-gap fields (the whole point of this pass) ──
+      // strictNumeric: only treat genuinely-missing (null/undefined) as a gap to
+      // fill, and write the detail value HONESTLY (a real 0 vol is written as 0 →
+      // the gate then rejects it as genuinely unusable, never rescued to a fake>0).
+      if (strictNumeric(pool.volatility) == null) {
+        const v = strictNumeric(detail.volatility);
+        if (v != null) { pool.volatility = v; pool.volatility_timeframe = MIN_VOLATILITY_TIMEFRAME; filled.push(`vol=${v}`); }
+      }
+      if (strictNumeric(pool.token_x?.organic_score) == null) {
+        const o = strictNumeric(detail.token_x?.organic_score);
+        if (o != null) {
+          if (!pool.token_x) pool.token_x = {};
+          pool.token_x.organic_score = o;
+          filled.push(`organic=${Math.round(o)}`);
+        }
+      }
+      // ── Opportunistic back-fill (same fetch, zero extra cost) — only when the
+      // pool is STILL missing the field. Never overwrite an existing value. These
+      // are not the primary target but plugging them costs nothing and keeps a
+      // cross-ref pool from dying on a different gap on the next iteration.
+      if (numeric(pool.fee_active_tvl_ratio) == null) {
+        const f = numeric(detail.fee_active_tvl_ratio);
+        if (f != null) { pool.fee_active_tvl_ratio = f; filled.push(`fee/tvl=${f.toFixed(4)}`); }
+      }
+      if (numeric(pool.token_x?.market_cap) == null && numeric(detail.token_x?.market_cap) != null) {
+        if (!pool.token_x) pool.token_x = {};
+        pool.token_x.market_cap = numeric(detail.token_x.market_cap);
+        filled.push("mcap");
+      }
+      if (numeric(pool.token_x?.created_at) == null && numeric(detail.token_x?.created_at) != null) {
+        if (!pool.token_x) pool.token_x = {};
+        pool.token_x.created_at = numeric(detail.token_x.created_at);
+        pool.base_token_created_at = pool.token_x.created_at;
+        filled.push("created_at");
+      }
+      if (numeric(pool.base_token_holders) == null || numeric(pool.base_token_holders) === 0) {
+        const h = numeric(detail.base_token_holders);
+        if (h != null && h > 0) { pool.base_token_holders = h; filled.push(`holders=${h}`); }
+      }
+      if (numeric(pool.tvl) == null) {
+        const t = numeric(detail.tvl ?? detail.active_tvl);
+        if (t != null) { pool.tvl = t; filled.push("tvl"); }
+      }
+      if (numeric(pool.volume) == null) {
+        const vol = numeric(detail.volume);
+        if (vol != null) { pool.volume = vol; filled.push("volume"); }
+      }
+      if (numeric(pool.dlmm_params?.bin_step) == null) {
+        const b = numeric(detail.dlmm_params?.bin_step);
+        if (b != null) { pool.dlmm_params = { ...(pool.dlmm_params || {}), bin_step: b }; filled.push("bin_step"); }
+      }
+      if (filled.length) {
+        log("screening", `Native-detail enrich: ${pool.name || addr} → ${filled.join(", ")} (gate evaluates real data)`);
+      }
+    })
+  );
+}
+
+// Testable seam — exposes the native-detail enrich pass with an injectable
+// fetcher so scripts can verify enrich-before-gate without hitting the live API.
+export function __enrichNativeDetailBeforeGateForTests(rawPools, s, fetchDetail) {
+  return enrichNativeDetailBeforeGate(rawPools, s, fetchDetail);
+}
+
 export async function discoverPools({
   page_size = 50,
 } = {}) {
@@ -922,6 +1134,20 @@ export async function discoverPools({
   // no fetch is spent on a pool that would die on mcap/volume/tvl/age anyway.
   if (s.enrichHolderCountBeforeGate !== false) {
     await enrichHolderCountsBeforeGate(rawPools, s);
+  }
+
+  // Cassiopeia — enrich-before-gate (THE LAST FUNNEL WALL, 2026-06-11): cross-ref
+  // signal pools (discord/solscan/pumpfun via dlmm.datapi.meteora.ag) arrive WITHOUT
+  // volatility + organic_score — a STRUCTURAL GAP on the cross-ref endpoint (those
+  // fields don't exist there; 0 = MISSING, not a real low score). They died at the
+  // volatility/organic gates before the LLM judge. We back-fill the real numbers via
+  // ONE native Pool-Discovery detail fetch per surviving pool (volatility + organic +
+  // fee/age/mcap in one call). NOT a floor drop, NOT a minOrganic loosening. Runs
+  // AFTER holder-enrich so the cheap-gate probe is accurate. Lyra-aware: no native
+  // fetch on a pool that dies on mcap/volume/tvl/holders/bin_step anyway. Fail-closed:
+  // fetch fails / field stays null → gate rejects volatility_unknown / organic_unknown.
+  if (s.enrichNativeDetailBeforeGate !== false) {
+    await enrichNativeDetailBeforeGate(rawPools, s);
   }
 
   const filteredExamples = [];

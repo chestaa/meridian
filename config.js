@@ -160,6 +160,17 @@ export const config = {
     // → holders stays null → gate rejects "holders_unknown" (fail-closed,
     // anti-pattern #2). Set false to restore legacy hard-reject-on-missing.
     enrichHolderCountBeforeGate: u.enrichHolderCountBeforeGate ?? true,
+    // ─── Enrich-before-gate for the volatility + organic structural gaps (Cassiopeia) ───
+    // Cross-ref signal pools (discord/solscan/pumpfun via dlmm.datapi.meteora.ag)
+    // arrive WITHOUT volatility + organic_score — those fields are a STRUCTURAL GAP
+    // on the cross-ref endpoint (they don't exist there; a 0 read = DATA-MISSING, not
+    // a real low score). When true, fetch the NATIVE Pool-Discovery detail once per
+    // pool (by pool_address, cached) for survivors of every other cheap gate, filling
+    // volatility + organic (+ fee/age/mcap) so the gates judge REAL numbers. minOrganic
+    // is UNCHANGED. NOT a bypass: enrich failure → field stays null → gate rejects
+    // "volatility_unknown" / "organic_unknown" (fail-closed, anti-pattern #2). Set
+    // false to restore legacy hard-reject-on-missing for cross-ref pools.
+    enrichNativeDetailBeforeGate: u.enrichNativeDetailBeforeGate ?? true,
     // ─── Item (a) Fee-Gen-Token signal — balanced two-sided flow (SCORE BONUS ONLY) ───
     // NEVER a gate (dormancy risk — a one-sided pump can still be a fine LP).
     // Pool Discovery API exposes NO per-side fee field (verified live: only aggregate
@@ -601,6 +612,7 @@ export function reloadScreeningThresholds() {
     if (fresh.tvlMcapGateEnabled !== undefined) s.tvlMcapGateEnabled = fresh.tvlMcapGateEnabled;
     if (fresh.maxTvlMcapRatio    != null) s.maxTvlMcapRatio = fresh.maxTvlMcapRatio;
     if (fresh.enrichHolderCountBeforeGate !== undefined) s.enrichHolderCountBeforeGate = fresh.enrichHolderCountBeforeGate;
+    if (fresh.enrichNativeDetailBeforeGate !== undefined) s.enrichNativeDetailBeforeGate = fresh.enrichNativeDetailBeforeGate;
     if (fresh.feeGenSymmetryBonusEnabled !== undefined) s.feeGenSymmetryBonusEnabled = fresh.feeGenSymmetryBonusEnabled;
     if (fresh.feeGenSymmetryWeight != null) s.feeGenSymmetryWeight = fresh.feeGenSymmetryWeight;
     if (fresh.feeTvlHighBonusEnabled !== undefined) s.feeTvlHighBonusEnabled = fresh.feeTvlHighBonusEnabled;

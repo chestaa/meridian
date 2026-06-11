@@ -1,0 +1,7 @@
+- [Gate hardening batch (2026-05-30)](project-gate-hardening-batch.md) — rug gates added, vol=0 rescue, dev_sold_all compound, smart-money coupling removed
+- [fee/TVL + TVL/MC + binsBelow (2026-05-30)](project-feetvl-tvlmc-binsbelow.md) — fee/TVL 0.07→0.08, new TVL/MC gate (0.2, live), binsBelow coupling verdict=sound
+- [Fee-Gen-Token symmetry bonus (2026-06-01)](project-feegen-symmetry-bonus.md) — Item (a): no native per-side fee field; buy/sell vol proxy SCORE BONUS, flag-off, never a gate
+- [fee/TVL + token-age intel adopt (2026-06-02)](project-feetvl-age-adopt.md) — fee/TVL 0.10→0.20 ramp + age 12-48h SCORE BONUSES (flag-off); refused blind 0.20 floor/48h max = dormancy; live floor 0.08→0.10
+- [Fail-closed missing data](feedback-fail-closed-missing-data.md) — safety gates reject on missing data, never default to safe (anti-pattern #2)
+- [Holder enrich-before-gate (2026-06-11)](project-holder-enrich-before-gate.md) — holder floor choke fixed by enriching count for signal pools; floor stays 500, fail-closed → holders_unknown
+- [Native-detail enrich-before-gate (2026-06-11)](project-native-detail-enrich-before-gate.md) — LAST wall: cross-ref vol+organic gap filled via native detail fetch; strictNumeric fixes null→0 coercion; reject split *_unknown vs genuine
