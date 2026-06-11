@@ -100,7 +100,12 @@ export const config = {
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
     minOrganic:        u.minOrganic        ?? 60,
-    minQuoteOrganic:   u.minQuoteOrganic   ?? 60,
+    // Quote-organic floor — default 0 (gate effectively off). The quote token is
+    // always a blue-chip (wSOL/USDC) for this single-side-SOL bot, with no
+    // meaningful organic score; quoteOrganicGateRejectReason() also EXEMPTS those
+    // mints, so even a non-zero floor never rejects a blue-chip-quoted pool. A
+    // non-zero floor only gates exotic non-blue-chip quotes (defense in depth).
+    minQuoteOrganic:   u.minQuoteOrganic   ?? 0,
     minHolders:        u.minHolders        ?? 500,
     minMcap:           u.minMcap           ?? 150_000,
     maxMcap:           u.maxMcap           ?? 10_000_000,

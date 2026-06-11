@@ -41,6 +41,18 @@ const _nativeDetailCache = new Map(); // pool_address -> { detail: object|null, 
 // undeployable. Used by solQuoteRejectReason() to cut undeployable waste
 // pre-LLM. Exact 32-byte wSOL mint — do not abbreviate.
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
+// USDC mint. Together with wSOL these are the inherently-liquid blue-chip quote
+// tokens. They have no meaningful "organic score" (organic measures base-token
+// holder authenticity, which is nonsensical for a stablecoin / wrapped SOL), so
+// the quote-organic gate must EXEMPT them — gating quote-organic on a blue-chip
+// quote rejects 100% of otherwise-valid SOL/USDC-quoted pools (misconfig, not
+// protection). See QUOTE_ORGANIC_EXEMPT_MINTS / quoteOrganicGateRejectReason.
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+// Blue-chip quote mints exempt from the quote-organic gate. Note: this bot
+// deploys single-side SOL only, so solQuoteRejectReason() further restricts the
+// DEPLOYABLE set to wSOL alone; USDC is kept here so the gate stays correct even
+// if the SOL-quote pre-filter is ever disabled (defense in depth).
+const QUOTE_ORGANIC_EXEMPT_MINTS = new Set([WSOL_MINT, USDC_MINT]);
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
@@ -396,6 +408,45 @@ export function solQuoteRejectReason(pool, s) {
   return null;
 }
 
+/**
+ * Cassiopeia — quote-organic gate (pure decision fn, raw-pool shape).
+ *
+ * THE 7TH FUNNEL WALL (Draco empirical 2026-06-11): `minQuoteOrganic 60` rejected
+ * nearly every pool. This bot deploys single-side SOL, so the quote token is
+ * ALWAYS wSOL (or USDC pre-SOL-quote-filter) — inherently-liquid blue-chips with
+ * no meaningful organic score. `organic_score` measures BASE-token holder
+ * authenticity; demanding it of a stablecoin / wrapped-SOL quote is nonsense, not
+ * protection. So we EXEMPT blue-chip quote mints (wSOL + USDC) from this gate.
+ *
+ * This is NOT base-organic loosening — the BASE organic gate
+ * (getRawPoolScreeningRejectReason, baseOrganic < minOrganic, live overlay 72) is
+ * untouched and still fail-closed (organic_unknown). Only the QUOTE side is fixed.
+ *
+ * A non-blue-chip quote (some weird token) is STILL gated on quote-organic
+ * fail-closed (null/below floor → reject) — defense in depth for the rare exotic
+ * quote. But the deployable funnel (wSOL-quoted) now passes this gate cleanly.
+ *
+ * @param {object} pool - raw pool (token_y.address = quote mint, token_y.organic_score)
+ * @param {object} s - effective screening thresholds (minQuoteOrganic)
+ * @returns {string|null} reject reason or null (passes / exempt / floor disabled).
+ */
+export function quoteOrganicGateRejectReason(pool, s) {
+  const minQuoteOrganic = numeric(s?.minQuoteOrganic);
+  // Floor disabled / unset / non-positive → quote-organic not gated at all.
+  if (minQuoteOrganic == null || minQuoteOrganic <= 0) return null;
+  const quoteMint = pool?.token_y?.address || null;
+  // Blue-chip quote (wSOL/USDC) → inherently liquid/legit, no organic score by
+  // nature → EXEMPT. Gating these = rejecting 100% of valid pools (misconfig).
+  if (quoteMint && QUOTE_ORGANIC_EXEMPT_MINTS.has(quoteMint)) return null;
+  // Non-blue-chip quote → STILL gated fail-closed (anti-pattern #2): missing
+  // organic = reject, never default to a safe value.
+  const quoteOrganic = numeric(pool?.token_y?.organic_score);
+  if (quoteOrganic == null || quoteOrganic < minQuoteOrganic) {
+    return `quote organic ${quoteOrganic ?? "unknown"} below minQuoteOrganic ${minQuoteOrganic}`;
+  }
+  return null;
+}
+
 function includesCaseInsensitive(values, value) {
   if (!Array.isArray(values) || values.length === 0 || !value) return false;
   const needle = String(value).toLowerCase();
@@ -411,7 +462,6 @@ function getVolatilityTimeframe(sourceTimeframe) {
 
 export function getRawPoolScreeningRejectReason(pool, s) {
   const base = pool?.token_x || {};
-  const quote = pool?.token_y || {};
   const binStep = numeric(pool?.dlmm_params?.bin_step);
   const tvl = numeric(pool?.tvl ?? pool?.active_tvl);
   const feeActiveTvlRatio = numeric(pool?.fee_active_tvl_ratio);
@@ -425,11 +475,11 @@ export function getRawPoolScreeningRejectReason(pool, s) {
   const holders = numeric(pool?.base_token_holders);
   const mcap = numeric(base?.market_cap);
   const baseOrganic = strictNumeric(base?.organic_score);
-  // quoteOrganic stays on numeric() — the quote side is SOL/USDC, frequently has
-  // no organic score, and minQuoteOrganic is 0; coercing missing→0 here is the
-  // intended (pre-existing) lenient behavior. Only the BASE organic gate needs the
-  // strict missing-vs-zero distinction for organic_unknown.
-  const quoteOrganic = numeric(quote?.organic_score);
+  // NOTE: quote-organic is handled by quoteOrganicGateRejectReason() below, which
+  // EXEMPTS blue-chip quote mints (wSOL/USDC). The quote side is always a
+  // blue-chip for this single-side-SOL bot, so it has no meaningful organic score
+  // by nature — gating it rejected 100% of valid pools (the 7th funnel wall). A
+  // non-blue-chip quote is still gated fail-closed inside that fn.
   const launchpad = base?.launchpad || pool?.base_token_launchpad || null;
   const createdAt = numeric(base?.created_at);
 
@@ -475,8 +525,14 @@ export function getRawPoolScreeningRejectReason(pool, s) {
   if (baseOrganic < s.minOrganic) {
     return `base organic ${baseOrganic} below minOrganic ${s.minOrganic}`;
   }
-  if (quoteOrganic == null || quoteOrganic < s.minQuoteOrganic) {
-    return `quote organic ${quoteOrganic ?? "unknown"} below minQuoteOrganic ${s.minQuoteOrganic}`;
+  // Quote-organic gate — EXEMPTS blue-chip quote mints (wSOL/USDC). This bot
+  // deploys single-side SOL so the quote is always a blue-chip; demanding an
+  // organic score of a stablecoin/wSOL quote is nonsense and rejected 100% of
+  // valid pools (the 7th funnel wall, Draco 2026-06-11). A non-blue-chip quote is
+  // still gated fail-closed. BASE organic gate above is untouched.
+  {
+    const quoteOrganicReject = quoteOrganicGateRejectReason(pool, s);
+    if (quoteOrganicReject) return quoteOrganicReject;
   }
   if (
     pool?.discord_signal &&

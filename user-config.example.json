@@ -25,7 +25,7 @@
   "maxTvl": 150000,
   "minVolume": 500,
   "minOrganic": 60,
-  "minQuoteOrganic": 60,
+  "minQuoteOrganic": 0,
   "minHolders": 500,
   "minMcap": 150000,
   "maxMcap": 10000000,

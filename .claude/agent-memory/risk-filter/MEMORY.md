@@ -5,3 +5,4 @@
 - [Fail-closed missing data](feedback-fail-closed-missing-data.md) — safety gates reject on missing data, never default to safe (anti-pattern #2)
 - [Holder enrich-before-gate (2026-06-11)](project-holder-enrich-before-gate.md) — holder floor choke fixed by enriching count for signal pools; floor stays 500, fail-closed → holders_unknown
 - [Native-detail enrich-before-gate (2026-06-11)](project-native-detail-enrich-before-gate.md) — LAST wall: cross-ref vol+organic gap filled via native detail fetch; strictNumeric fixes null→0 coercion; reject split *_unknown vs genuine
+- [Quote-organic blue-chip exempt (2026-06-11)](project-quote-organic-bluechip-exempt.md) — 7th wall: minQuoteOrganic 60 nolak all SOL-quote pools; exempt wSOL+USDC; my prior memory falsely said live=0; full trace = clean pool reaches judge, no 8th wall

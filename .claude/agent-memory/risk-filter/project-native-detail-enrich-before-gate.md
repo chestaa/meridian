@@ -32,9 +32,12 @@ A 0 read there = DATA-MISSING, not a real low score. Sirius's field-map fix (com
 gate ALWAYS coerced missing organic/volatility to 0 → fell into the genuine-low branch,
 making `organic_unknown` dead code. Added `strictNumeric()` (mirrors windowScalar's
 strictNum) — null/undefined/empty/object → null, only real numbers/numeric-strings pass.
-Gate now reads volatility + BASE organic via strictNumeric. quoteOrganic stays on
-`numeric()` (SOL/USDC quote often has no score, minQuoteOrganic=0 → coerce-to-0 is the
-intended lenient pre-existing behavior; do NOT make quote strict or SOL pools break).
+Gate now reads volatility + BASE organic via strictNumeric. CORRECTION (2026-06-11,
+[[quote-organic-bluechip-exempt]]): this memory ORIGINALLY claimed "minQuoteOrganic=0 →
+coerce-to-0 is intended lenient behavior." That was WRONG — live minQuoteOrganic was 60
+(the 7th funnel wall). The quote-organic check has since been REPLACED by
+`quoteOrganicGateRejectReason()` which EXEMPTS blue-chip quote mints (wSOL/USDC); the
+old `numeric(quote.organic_score)` line + locals were removed.
 
 **Why:** save the funnel without weakening the floor — give cross-ref pools a CHANCE to
 be judged on real volatility+organic instead of dying on a structural data gap.
