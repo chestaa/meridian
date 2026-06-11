@@ -24,7 +24,22 @@ export function parseSignalMessage(message) {
       ...[...text.matchAll(SIGNAL_TOKEN_RE)].map((m) => m[0]),
     ]),
   ];
-  const tokenAddress = addresses.find((a) => /pump$|bonk$|moon$|uniP$/i.test(a)) || addresses[0] || null;
+  // WALL-10 (Sirius 2026-06-11): structured screener signals carry BOTH a
+  // `Pool: <poolAddr>` and a `Token: <mint>` line, and Pool appears FIRST. The
+  // old `addresses[0]` heuristic therefore picked the POOL address as the token
+  // mint → the enricher then queried Jupiter/Meteora for a pool address as if it
+  // were a token, which fails (or, worse, mis-identifies the asset). When an
+  // explicit `Token:` line carries a base58 address, that IS the token mint —
+  // prefer it over positional/suffix heuristics. The `Pool:` line address is the
+  // pool, never the token, so we also exclude it from token-address selection.
+  const tokenLineAddr = (text.match(/Token\s*:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/i) || [])[1] || null;
+  const poolLineAddr = (text.match(/Pool\s*:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/i) || [])[1] || null;
+  const tokenAddress =
+    tokenLineAddr ||
+    addresses.find((a) => /pump$|bonk$|moon$|uniP$/i.test(a) && a !== poolLineAddr) ||
+    addresses.find((a) => a !== poolLineAddr) ||
+    addresses[0] ||
+    null;
   const recipientAddress = addresses.find((a) => a !== tokenAddress) || null;
 
   const nameMatch = text.match(/(?:Name|Token Name)\s*:\s*([^\n(]+)(?:\(([^)]+)\))?/i);

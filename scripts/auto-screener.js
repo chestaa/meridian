@@ -56,23 +56,68 @@ async function sendTelegram(html) {
   } catch (e) { console.error("[telegram]", e.message); }
 }
 
+/**
+ * Resolve the candidate fields saveToInbox needs from the ACTUAL candidate shape
+ * getTopCandidates produces.
+ *
+ * THE LAST WALL (Sirius, Draco empirical 2026-06-11, post 24e2ab5): candidates
+ * cleared every Cassiopeia gate but were skipped at saveToInbox ("0 candidates,
+ * skipped N with no token address"). Root cause = field-name mismatch, NOT
+ * missing data. getTopCandidates returns the `condensePool` shape:
+ *     { pool, name, base: { symbol, mint }, quote: { symbol, mint }, tvl, ... }
+ * but saveToInbox read FLAT names that condensePool never emits:
+ *     c.base_mint / c.token_address  (real: c.base.mint)   → guard skipped ALL
+ *     c.pool_address                 (real: c.pool)        → "Pool: undefined"
+ *     c.symbol                       (real: c.base.symbol) → filename "unknown"
+ * The token mint was ALWAYS present at c.base.mint — it just wasn't being read.
+ *
+ * This resolver reads the canonical condensed shape FIRST, then falls back to
+ * flat aliases (defensive — some signal-source raw pools carry a flat base_mint
+ * alias). FAIL-CLOSED (anti-pattern #2): if no resolvable mint exists anywhere,
+ * tokenAddr stays null → caller skips. We never fabricate or write a candidate
+ * with no mint (would risk deploying into the wrong/zero mint).
+ */
+function resolveCandidateFields(c) {
+  const firstStr = (...vals) => {
+    for (const v of vals) {
+      if (typeof v === "string" && v.trim() !== "") return v.trim();
+    }
+    return null;
+  };
+  return {
+    // Canonical condensePool nested shape first, then flat aliases.
+    tokenAddr: firstStr(c?.base?.mint, c?.base_mint, c?.token_address),
+    poolAddr: firstStr(c?.pool, c?.pool_address),
+    symbol: firstStr(c?.base?.symbol, c?.symbol),
+    pair: firstStr(c?.name, c?.pair),
+  };
+}
+
 export function saveToInbox(candidates, { fsImpl = fs } = {}) {
   fsImpl.mkdirSync(INBOX_DIR, { recursive: true });
   const ts = Date.now();
   let written = 0;
   let skipped = 0;
   for (const c of candidates) {
-    // Guard: skip candidates with no resolvable token address. These flood
-    // inbox/ and get instantly rejected by pre-score ("no token address").
-    const tokenAddr = c?.base_mint || c?.token_address;
-    if (!tokenAddr || typeof tokenAddr !== "string" || tokenAddr.trim() === "") {
+    const { tokenAddr, poolAddr, symbol, pair } = resolveCandidateFields(c);
+    // Guard (FAIL-CLOSED, anti-pattern #2): no resolvable token mint → skip.
+    // A signal with no mint is undeployable AND dangerous (could match the wrong
+    // token) — never write it. With the field-mapping fixed, this now ONLY fires
+    // on genuinely mint-less candidates, not on every well-formed one.
+    if (!tokenAddr) {
       skipped++;
       continue;
     }
-    const filename = `${ts}-screener-${(c.symbol || "unknown").replace(/[^a-z0-9]/gi, "").slice(0, 12)}.txt`;
+    // Pool address is required downstream (Vega deploys by pool_address). A
+    // candidate with a mint but no pool can't be acted on → skip fail-closed.
+    if (!poolAddr) {
+      skipped++;
+      continue;
+    }
+    const filename = `${ts}-screener-${(symbol || "unknown").replace(/[^a-z0-9]/gi, "").slice(0, 12)}.txt`;
     const content = [
-      `[SCREENER SIGNAL] ${c.symbol || "?"} / ${c.pair || "?"}`,
-      `Pool: ${c.pool_address}`,
+      `[SCREENER SIGNAL] ${symbol || "?"} / ${pair || "?"}`,
+      `Pool: ${poolAddr}`,
       `Token: ${tokenAddr}`,
       `TVL: $${Number(c.tvl || 0).toFixed(0)} | Vol: $${Number(c.volume_window || 0).toFixed(0)}`,
       `Fee/TVL: ${Number(c.fee_active_tvl_ratio || 0).toFixed(4)} | Organic: ${c.organic_score || "?"}`,
@@ -161,7 +206,7 @@ async function runScan() {
   // Build LLM prompt — ultra short to save tokens
   const topN = candidates.slice(0, MAX_CANDIDATES_TO_REPORT);
   const poolSummary = topN.map((c, i) =>
-    `${i + 1}. ${c.symbol || "?"} | TVL $${Number(c.tvl || 0).toFixed(0)} | ` +
+    `${i + 1}. ${resolveCandidateFields(c).symbol || "?"} | TVL $${Number(c.tvl || 0).toFixed(0)} | ` +
     `Vol $${Number(c.volume_window || 0).toFixed(0)} | Fee/TVL ${Number(c.fee_active_tvl_ratio || 0).toFixed(3)} | ` +
     `Organic ${c.organic_score || "?"} | BinStep ${c.bin_step || "?"}`
   ).join("\n");
@@ -178,11 +223,12 @@ async function runScan() {
   const sep = "─────────────────";
 
   const poolLines = topN.map((c, i) => {
+    const { symbol, poolAddr } = resolveCandidateFields(c);
     const tvl     = `$${Number(c.tvl || 0).toLocaleString("id-ID", { maximumFractionDigits: 0 })}`;
     const vol     = `$${Number(c.volume_window || 0).toLocaleString("id-ID", { maximumFractionDigits: 0 })}`;
     const fee     = Number(c.fee_active_tvl_ratio || 0).toFixed(3);
     const organic = c.organic_score || "?";
-    return `<b>${i + 1}. ${c.symbol || "?"}</b>  <code>${(c.pool_address || "").slice(0, 8)}...</code>\n` +
+    return `<b>${i + 1}. ${symbol || "?"}</b>  <code>${(poolAddr || "").slice(0, 8)}...</code>\n` +
            `   TVL ${tvl} | Vol ${vol} | Fee/TVL ${fee} | Organic ${organic}`;
   }).join("\n\n");
 
