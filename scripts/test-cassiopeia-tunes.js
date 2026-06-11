@@ -78,8 +78,8 @@ check("maxBundlePct unchanged",                            cfg?.maxBundlePct,   
 check("maxSniperPct unchanged",                            cfg?.maxSniperPct,         0.5);
 check("maxTop10Pct unchanged (base)",                      cfg?.maxTop10Pct,           60);
 check("liveOverrides.maxTop10Pct unchanged",               cfg?.liveOverrides?.maxTop10Pct, 55);
-check("liveOverrides.minOrganic unchanged",                cfg?.liveOverrides?.minOrganic, 75);
-check("liveOverrides.minFeeActiveTvlRatio unchanged",      cfg?.liveOverrides?.minFeeActiveTvlRatio, 0.07);
+check("liveOverrides.minOrganic (live overlay, tightened 75->72)", cfg?.liveOverrides?.minOrganic, 72);
+check("liveOverrides.minFeeActiveTvlRatio (live overlay, tightened 0.07->0.10)", cfg?.liveOverrides?.minFeeActiveTvlRatio, 0.1);
 check("maxPositions = 2 (Vega-validated 2-slot envelope)", cfg?.maxPositions,           2);
 
 // ─── 5. config.js propagation check ───────────────────────────
