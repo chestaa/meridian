@@ -21,6 +21,7 @@ import { log } from "../logger.js";
 import { recordLlmUsage } from "../llm-usage.js";
 import { assertWithinBudget, BudgetExceededError, getBudgetStatus } from "../cost-guard.js";
 import { notifyBudgetExceeded } from "../telegram.js";
+import { recordNativeVerdicts } from "../verdict-log.js";
 
 const apiKey = process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY;
 
@@ -208,6 +209,9 @@ export async function judgeCandidates(candidates, context = {}) {
   const enter = verdicts.filter(v => v.decision === "enter").length;
   const skip = verdicts.length - enter;
   log("agent", `[ORION] judged ${verdicts.length} candidates: ${enter} enter, ${skip} skip`);
+  // Calibration-audit persistence: one JSONL row per verdict (verdict-log.js).
+  // Pure local append, no extra LLM cost; never alters verdict behavior.
+  recordNativeVerdicts(verdicts, candidates);
   return verdicts;
 }
 

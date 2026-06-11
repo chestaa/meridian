@@ -3,6 +3,7 @@ import path from "path";
 import { parseSignalMessage, scoreParsedSignal } from "../signal-parser.js";
 import { enrichSignal } from "../signal-enricher.js";
 import { judgeSignalWithLlm, formatSignalJudgment } from "../signal-judge.js";
+import { recordSignalVerdict } from "../verdict-log.js";
 import { sendMessage, isEnabled as telegramEnabled, isExecutiveMode } from "../telegram.js";
 import { config } from "../config.js";
 
@@ -63,6 +64,9 @@ async function processFile(filePath) {
   };
 
   appendJsonl(RESULTS_FILE, result);
+  // Calibration-audit persistence (verdict-log.js): one JSONL row per signal
+  // verdict, 0-1 confidence scale + path="signal". Pure local append, no LLM cost.
+  recordSignalVerdict(signal, llm);
   const text = formatSignalJudgment({ signal, preScore, llm });
   console.log(`\n${text}\n`);
   // Executive mode silences per-signal verdicts — aggregated in daily boss-report.
