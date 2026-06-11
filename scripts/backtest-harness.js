@@ -148,8 +148,8 @@ function cassiopeiaCheck(candidate) {
   const reasons = [];
   const m = candidate.pool || {};
 
-  const mcapMin = Number(s.signalMinMcap ?? 5_000);
-  const mcapMax = Number(s.signalMaxMcap ?? 80_000);
+  const mcapMin = Number(s.signalMinMcap ?? 50_000);
+  const mcapMax = Number(s.signalMaxMcap ?? 2_000_000);
   if (m.mcap != null) {
     if (m.mcap < mcapMin) reasons.push(`mcap ${m.mcap} < signalMinMcap ${mcapMin}`);
     if (m.mcap > mcapMax) reasons.push(`mcap ${m.mcap} > signalMaxMcap ${mcapMax}`);

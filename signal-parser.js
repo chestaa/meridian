@@ -111,9 +111,9 @@ function scoreEnrichedProfile(signal) {
   if (signal.tokenAddress) score += 15;
   else reasons.push("no token address");
 
-  // Mcap band (same signal band as legacy)
-  const signalMinMcap = Number(config?.screening?.signalMinMcap ?? 5_000);
-  const signalMaxMcap = Number(config?.screening?.signalMaxMcap ?? 80_000);
+  // Mcap band (same signal band as legacy) — defaults widened 2026-06-11 to 50k/2M.
+  const signalMinMcap = Number(config?.screening?.signalMinMcap ?? 50_000);
+  const signalMaxMcap = Number(config?.screening?.signalMaxMcap ?? 2_000_000);
   if (mcap != null && mcap >= signalMinMcap && mcap <= signalMaxMcap) score += 20;
   else reasons.push("mcap outside early signal band");
 
@@ -149,11 +149,12 @@ function scoreLegacyProfile(signal) {
 
   // Signal-mode mcap band intentionally diverges from pool-discovery `minMcap` (default 150k).
   // Signal sources (Discord alpha, KOL bundles) surface earlier-stage opportunities — so the
-  // signal mcap floor is much lower than the conservative pool-screen floor used by Hunter.
-  // Pool-discovery mode keeps the 150k floor via config.screening.minMcap; signal-mode
-  // uses config.screening.signalMinMcap / signalMaxMcap (defaults 5k / 80k).
-  const signalMinMcap = Number(config?.screening?.signalMinMcap ?? 5_000);
-  const signalMaxMcap = Number(config?.screening?.signalMaxMcap ?? 80_000);
+  // signal mcap floor is lower than the conservative pool-screen floor used by Hunter.
+  // Pool-discovery keeps 150k floor via config.screening.minMcap; signal-mode uses
+  // config.screening.signalMinMcap / signalMaxMcap (defaults 50k / 2M after the 2026-06-11
+  // widening — old 5k/80k band rejected the real quality zone: yunus $100k-1M, PARQ $922k).
+  const signalMinMcap = Number(config?.screening?.signalMinMcap ?? 50_000);
+  const signalMaxMcap = Number(config?.screening?.signalMaxMcap ?? 2_000_000);
   if (signal.mcapUsd != null && signal.mcapUsd >= signalMinMcap && signal.mcapUsd <= signalMaxMcap) score += 20;
   else reasons.push("mcap outside early signal band");
 

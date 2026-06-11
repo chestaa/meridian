@@ -109,15 +109,24 @@ export const config = {
     minHolders:        u.minHolders        ?? 500,
     minMcap:           u.minMcap           ?? 150_000,
     maxMcap:           u.maxMcap           ?? 10_000_000,
-    // Signal-mode mcap band — used by signal-parser.js, NOT pool discovery.
-    // Signals discover earlier-stage opportunities; pool-screen keeps conservative 150k floor.
-    signalMinMcap:     u.signalMinMcap     ?? 5_000,
-    signalMaxMcap:     u.signalMaxMcap     ?? 80_000,
+    // Signal-mode mcap band — used by signal-parser.js + backtest-harness, NOT pool discovery.
+    // Widened 2026-06-11 (Bro-authorized opt Y) from 5k-80k → 50k-2M. The old 80k ceiling
+    // rejected the actual quality DLMM zone (yunus SOL-USDC $100k-1M, PARQ $922k, Jotchua
+    // $3.6M). Floor RAISED 5k→50k (sub-50k = degen/rug/thin zone, blind-scanner historically
+    // leaked bad picks there). Ceiling 80k→2M covers the documented quality cluster with PARQ
+    // inside; capped at 2M (NOT 3.6M) — late-stage large-cap is native discovery's job
+    // (minMcap 150k-10M). Signal band stays intentionally distinct: floor BELOW native (earlier
+    // entry justified by alpha), ceiling BELOW native (single-signal bets avoid late-stage thin
+    // fee velocity). Old dead zone (80k<150k, nobody covered) now CLOSED — bands overlap 150k-2M.
+    // WIDENING MCAP DOES NOT LOOSEN ANY OTHER GATE — rug/bot/top10/holders/fee-TVL/organic/
+    // TVL-MC/volatility are separately keyed and stay strict. Mcap band only sets pool SIZE.
+    signalMinMcap:     u.signalMinMcap     ?? 50_000,
+    signalMaxMcap:     u.signalMaxMcap     ?? 2_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
-    minTokenFeesSol:   u.minTokenFeesSol   ?? 15,  // global fees paid (priority+jito tips). below = bundled/scam. recalibrated 30→15 for micro-cap target ($5-80k mcap structurally can't hit 30 SOL global fees)
+    minTokenFeesSol:   u.minTokenFeesSol   ?? 15,  // global fees paid (priority+jito tips). below = bundled/scam. recalibrated 30→15 for low-cap target (now 50k-2M signal band, was $5-80k; 15 SOL floor still appropriate at the lower end of the widened band)
     useDiscordSignals: u.useDiscordSignals ?? false,
     discordSignalMode: u.discordSignalMode ?? "merge", // merge | only
     discordSource: u.discordSource ?? "meteoraidn_ranked", // meteoraidn_ranked (real local) | hivemind (legacy 404 phantom)

@@ -74,6 +74,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | minOrganic | screening | 60 |
 | minHolders | screening | 500 |
 | minMcap / maxMcap | screening | 150k / 10M |
+| signalMinMcap / signalMaxMcap | screening | 50k / 2M |
 | minBinStep / maxBinStep | screening | 80 / 125 |
 | timeframe | screening | "5m" |
 | category | screening | "trending" |
@@ -99,6 +100,11 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
 | managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
+
+**Dual mcap band (Cassiopeia):** two intentionally distinct mcap windows.
+
+- `minMcap / maxMcap` (150k–10M) — **native pool discovery** (Hunter), conservative deep-screen.
+- `signalMinMcap / signalMaxMcap` (50k–2M) — **signal-mode only** (`signal-parser.js` + `backtest-harness.js`), for alpha/KOL-surfaced earlier-stage opportunities. Floor sits *below* native (50k vs 150k — alpha justifies earlier entry); ceiling sits *below* native (2M vs 10M — late-stage large-cap is native's job). Widened 2026-06-11 (Bro opt Y) from 5k–80k: old 80k ceiling rejected the real quality DLMM zone (yunus SOL-USDC $100k-1M, PARQ $922k, Jotchua $3.6M); floor RAISED 5k→50k (sub-50k = degen/rug/thin). Bands now overlap 150k–2M, closing the old 80k–150k dead zone. **Widening mcap does NOT loosen any other gate** — rug/bot/top10/holders/fee-TVL/organic/TVL-MC/volatility stay strict; mcap only sets pool SIZE. In `signal-parser.js` the band is a +20 score component (out-of-band → lose 20pts, often drops below the 55 watch threshold); in `backtest-harness.js` it is a hard reject. Hard late-stage cut (>50M) and implausible-low cut (<1k) are separate and unchanged. Tests: `scripts/test-mcap-band-widening.js` (18 assertions).
 
 **`computeDeployAmount(walletSol)`** — scales position size with wallet balance (compounding). Formula: `clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)`.
 
