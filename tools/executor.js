@@ -104,12 +104,104 @@ function poolDetailVolatility(pool) {
   return numberOrNull(pool?.volatility);
 }
 
+/**
+ * Vega — transient-error classifier for the pre-deploy snapshot READ fetch.
+ * Transient = worth a bounded retry (Draco restart-3 thundering-herd 429 burst,
+ * upstream 5xx, network timeout/abort). Everything else (other 4xx, bad payload)
+ * is permanent → fail-close immediately, never retry something that won't succeed.
+ *
+ * IMPORTANT (anti-pattern #4): this governs ONLY the read-only snapshot fetch.
+ * It must NEVER be applied to deploy_position itself — the deploy TX stays
+ * single-attempt. State after a failed deploy is unknown; retrying is forbidden.
+ */
+const SNAPSHOT_FETCH_MAX_RETRIES = 3; // total attempts = 1 + 3 retries
+const SNAPSHOT_FETCH_BACKOFF_MS = [1000, 2000, 4000]; // ride-through transient burst
+
+export function isTransientFetchError(err) {
+  if (!err) return false;
+  // HTTP status carried on the error (set below for !res.ok)
+  if (Number.isFinite(err.status)) {
+    return err.status === 429 || err.status === 502 || err.status === 503 || err.status === 504;
+  }
+  // Network-level: AbortError (timeout) or fetch TypeError ("fetch failed", ECONNRESET, etc.)
+  const name = String(err.name || "");
+  const msg = String(err.message || "").toLowerCase();
+  if (name === "AbortError") return true;
+  if (name === "TypeError" && msg.includes("fetch")) return true;
+  if (msg.includes("timeout") || msg.includes("econnreset") || msg.includes("network")) return true;
+  return false;
+}
+
+function _sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Test seam: allow tests to inject a fake fetch + zero-out backoff sleeps.
+ * Production code passes nothing → real global fetch, real backoff.
+ */
+let _snapshotFetchImpl = (...args) => fetch(...args);
+let _snapshotBackoffMs = SNAPSHOT_FETCH_BACKOFF_MS;
+export function __setSnapshotFetchForTests(fetchFn, backoffMs) {
+  _snapshotFetchImpl = fetchFn || ((...a) => fetch(...a));
+  _snapshotBackoffMs = backoffMs || SNAPSHOT_FETCH_BACKOFF_MS;
+}
+export function __resetSnapshotFetchForTests() {
+  _snapshotFetchImpl = (...args) => fetch(...args);
+  _snapshotBackoffMs = SNAPSHOT_FETCH_BACKOFF_MS;
+}
+// Test seam: exercise the retry-aware snapshot fetch directly.
+export function __fetchFreshPoolDetailForTests(poolAddress, timeframe) {
+  return fetchFreshPoolDetail(poolAddress, timeframe);
+}
+
+/**
+ * Vega — bounded retry-with-backoff for the pre-deploy snapshot READ fetch.
+ * Retries ONLY transient errors (429/502/503/504/timeout) up to
+ * SNAPSHOT_FETCH_MAX_RETRIES with exponential backoff (~1s/2s/4s). Non-transient
+ * errors throw immediately (no retry). When ALL retries are exhausted the last
+ * error propagates → caller fail-closes (snapshot_verify_failed). This is
+ * ride-through for transient bursts, NOT a guard bypass.
+ */
+async function fetchPoolDetailWithRetry(url) {
+  let attempt = 0;
+  // total attempts = 1 + SNAPSHOT_FETCH_MAX_RETRIES
+  for (;;) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      let res;
+      try {
+        res = await _snapshotFetchImpl(url, { signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) {
+        const err = new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+        err.status = res.status;
+        throw err;
+      }
+      return res;
+    } catch (err) {
+      const transient = isTransientFetchError(err);
+      if (!transient || attempt >= SNAPSHOT_FETCH_MAX_RETRIES) {
+        // Permanent error, OR transient but retries exhausted → propagate.
+        // Caller (validateDeployPoolThresholds) fail-closes the deploy.
+        throw err;
+      }
+      const wait = _snapshotBackoffMs[attempt] ?? _snapshotBackoffMs[_snapshotBackoffMs.length - 1];
+      log("snapshot_fetch_retry", `transient ${err.status ?? err.name ?? "error"} on pre-deploy snapshot fetch, retry ${attempt + 1}/${SNAPSHOT_FETCH_MAX_RETRIES} in ${wait}ms`);
+      await _sleep(wait);
+      attempt += 1;
+    }
+  }
+}
+
 async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
   const encodedTimeframe = encodeURIComponent(timeframe);
   const filter = encodeURIComponent(`pool_address=${poolAddress}`);
   const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+  const res = await fetchPoolDetailWithRetry(url);
   const data = await res.json();
   return (data?.data || [])[0] ?? null;
 }
@@ -213,9 +305,14 @@ async function validateDeployPoolThresholds(args) {
     detail = await fetchFreshPoolDetail(args.pool_address);
     if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
   } catch (error) {
+    // FAIL-CLOSED (anti-pattern #2/#3): retry-with-backoff already ran inside
+    // fetchFreshPoolDetail for transient 429/5xx/timeout. Reaching here means the
+    // snapshot could NOT be verified (retries exhausted or permanent error) —
+    // we REFUSE to deploy on stale/unverified data. snapshot_verify_failed marker
+    // lets monitoring tell a transient-exhaustion reject from a threshold breach.
     return {
       pass: false,
-      reason: `Could not verify pool screening thresholds before deploy: ${error.message}`,
+      reason: `snapshot_verify_failed: could not verify pool screening thresholds before deploy: ${error.message}`,
     };
   }
 
@@ -267,7 +364,7 @@ async function validateDeployPoolThresholds(args) {
     } catch (error) {
       return {
         pass: false,
-        reason: `Could not verify pool ${volatilityTimeframe} volatility before deploy: ${error.message}`,
+        reason: `snapshot_verify_failed: could not verify pool ${volatilityTimeframe} volatility before deploy: ${error.message}`,
       };
     }
   }
