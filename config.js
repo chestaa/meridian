@@ -123,8 +123,30 @@ export const config = {
     signalMinMcap:     u.signalMinMcap     ?? 50_000,
     signalMaxMcap:     u.signalMaxMcap     ?? 2_000_000,
     minBinStep:        u.minBinStep        ?? 80,
-    maxBinStep:        u.maxBinStep        ?? 125,
-    timeframe:         u.timeframe         ?? "5m",
+    // Cassiopeia 2026-06-13 — maxBinStep 125→200. Orion research + Cassiopeia live
+    // probe: memecoin DLMM pools cluster at bin_step 80/100/125/200 (the 126-200 band
+    // held 87/1000 broad pools, ~8.7%). Base fee scales LINEARLY with bin_step
+    // (baseFactor*binStep/1e6) so a 200-bps pool earns ~1.6x the fee-per-crossing of a
+    // 125-bps pool — meaningful fee capture on the same volume. Deploy-side safe: the
+    // bins_below formula clamps to [35,69] INDEPENDENT of bin_step, and a wider bin =
+    // wider price tolerance per bin = LESS OOR churn, not more. Quality gates unchanged
+    // (most 126-200 pools still fail organic/fee-TVL on merit). Reversible: set 125.
+    maxBinStep:        u.maxBinStep        ?? 200,
+    // Cassiopeia 2026-06-13 — timeframe 5m→1h (ROOT-CAUSE BOTTLENECK FIX, NOT a gate
+    // loosening). Live probe vs the broad set: at timeframe=5m, 271/300 pools read
+    // volume=0 and 266/300 read fee/TVL=0 — the 5m window is structurally EMPTY (no
+    // trade in the last 5 min for the vast majority), so the volume gate (minVolume
+    // 500) and fee/TVL gate rejected fee-GENERATING pools on a stale-window artifact
+    // (the same class as the RICH-SOL volatility miss, but volume/fee/TVL have no
+    // refetch-rescue). The dominant reject was volume_below_min at 59.4% — a DATA
+    // shape, not low quality. At 1h only 26/300 read zero; the raw gate passes 1→15
+    // pools (14 deployable after sol-quote) with EVERY quality threshold byte-identical
+    // (organic 60, holders 500, fee/TVL, mcap band, rug/bot/top10 all unchanged —
+    // counterfactuals proved loosening them unlocks ~nothing; they are NOT the binding
+    // constraint). 1h (not 24h) chosen to preserve the magnitude the minVolume/fee-TVL
+    // thresholds were tuned for; volatility is insulated (read at a 30m floor via
+    // getVolatilityTimeframe regardless). Reversible: set "5m".
+    timeframe:         u.timeframe         ?? "1h",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 15,  // global fees paid (priority+jito tips). below = bundled/scam. recalibrated 30→15 for low-cap target (now 50k-2M signal band, was $5-80k; 15 SOL floor still appropriate at the lower end of the widened band)
     useDiscordSignals: u.useDiscordSignals ?? false,
