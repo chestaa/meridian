@@ -9,6 +9,9 @@ import {
   buildLessonsSection,
   buildDrawdownSection,
   buildOrionRejectionsSection,
+  buildScreeningSummarySection,
+  plainRejectBucket,
+  isDeployFailure,
 } from "./boss-report.js";
 
 let pass = 0;
@@ -151,6 +154,96 @@ console.log("\n[buildOrionRejectionsSection]");
 
   const emptyText = buildOrionRejectionsSection([]);
   assert("returns null on empty signal entries", emptyText === null);
+}
+
+// ── Test: buildScreeningSummarySection ──────────────────────────
+console.log("\n[buildScreeningSummarySection]");
+{
+  const TODAY = new Date().toISOString().slice(0, 10);
+  const t = (h, m, s = 0) => `${TODAY}T${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}.000Z`;
+
+  // Two screening cycles today (14:25 and 15:09 — >90s apart), 3 candidates each.
+  const verdictRows = [
+    { ts: t(14,25,1), path: "native", verdict: "skip",  reason: "low volatility and bots high" },
+    { ts: t(14,25,2), path: "native", verdict: "enter", reason: "good fee/tvl and smart wallets" },
+    { ts: t(14,25,3), path: "native", verdict: "skip",  reason: "organic too low" },
+    { ts: t(15,9,46), path: "native", verdict: "skip",  reason: "low volatility and bots high" },
+    { ts: t(15,9,47), path: "native", verdict: "skip",  reason: "mcap out of target band" },
+    { ts: t(15,9,48), path: "native", verdict: "watch", reason: "organic borderline, wait" },
+    // A row from a DIFFERENT day — must be excluded.
+    { ts: "2020-01-01T00:00:00.000Z", path: "native", verdict: "skip", reason: "old" },
+  ];
+
+  const decisions = [
+    // Category 1 — deploy success.
+    { ts: t(14,25,5), type: "deploy",    actor: "SCREENER", summary: "Relay deployed 0.5 SOL" },
+    // Category 2 — gagal deploy (attempted, blocked by 429).
+    { ts: t(15,9,50), type: "no_deploy", actor: "SCREENER", summary: "Deploy attempt did not succeed", reason: "snapshot_verify_failed 429 rate-limit" },
+    // Category 3 — ga di-deploy (judge skip).
+    { ts: t(16,0,0),  type: "no_deploy", actor: "SCREENER", summary: "LLM chose no deploy", reason: "organic too low across candidates" },
+    // Category 4 — ga ada kandidat.
+    { ts: t(17,0,0),  type: "no_deploy", actor: "SCREENER", summary: "No candidates available", reason: "All candidates filtered before deploy" },
+    // Different day — excluded.
+    { ts: "2020-01-01T00:00:00.000Z", type: "deploy", summary: "old deploy" },
+  ];
+
+  const text = buildScreeningSummarySection(verdictRows, decisions, TODAY);
+  assert("returns non-null", text != null);
+  assert("has header 'Ringkasan Screening Harian'", text.includes("Ringkasan Screening Harian"));
+  assert("counts 2 screening cycles (90s clustering)", /Total screening: <b>2x<\/b>/.test(text));
+  assert("counts 6 candidates judged (excludes other-day row)", /Lolos ke penilai \(judge\): <b>6<\/b>/.test(text));
+
+  // ── 3 categories clearly DIFFERENTIATED ──
+  assert("CAT1 deploy berhasil = 1", /Deploy berhasil: <b>1<\/b>/.test(text));
+  assert("CAT2 gagal deploy distinguished (1x, 429)", /Gagal deploy: <b>1x<\/b>/.test(text) && /rate-limit/.test(text));
+  assert("CAT3 ga di-deploy distinguished (judge skip)", /Ga di-deploy: <b>1x<\/b>/.test(text) && /pool kurang bagus/.test(text));
+  assert("CAT4 ga ada kandidat distinguished", /Ga ada kandidat lolos filter: <b>1x<\/b>/.test(text));
+
+  // ── Reject reasons aggregated + plain language ──
+  assert("lists top reject reasons", text.includes("Alasan paling sering pool ditolak"));
+  assert("aggregates 'pergerakan harga' bucket (2 low-vol rows)", /Pergerakan harga/.test(text));
+  assert("shows reject % figure", /\d+%/.test(text));
+
+  // ── Plain language: NO raw jargon leaks into output ──
+  assert("NO raw 'organic' jargon", !/organic/i.test(text) || /organik/i.test(text));
+  assert("NO raw 'mcap' jargon in output", !/mcap/i.test(text));
+  assert("NO raw 'fee_tvl' / 'fee/tvl' jargon", !/fee.?tvl/i.test(text));
+  assert("NO raw 'volatility' jargon", !/volatility/i.test(text));
+  assert("NO raw 'snapshot_verify' token leaked", !/snapshot_verify/.test(text));
+
+  // ── Graceful when data empty (anti-fabrication) ──
+  const empty = buildScreeningSummarySection([], [], TODAY);
+  assert("graceful empty: honest 'data mulai terkumpul' message", /mulai terkumpul/.test(empty));
+  assert("graceful empty: does NOT fabricate cycle numbers", !/Total screening: <b>\d/.test(empty));
+
+  // ── Verdict-log present but decision-log empty: still reports judged + reasons ──
+  const noDecisions = buildScreeningSummarySection(verdictRows, [], TODAY);
+  assert("verdict-only: still counts candidates judged", /Lolos ke penilai \(judge\): <b>6<\/b>/.test(noDecisions));
+  assert("verdict-only: deploy berhasil falls back to 0", /Deploy berhasil: <b>0<\/b>/.test(noDecisions));
+  assert("verdict-only: ga di-deploy falls back to per-candidate count", /Ga di-deploy:/.test(noDecisions));
+}
+
+// ── Test: plainRejectBucket (pure mapper) ───────────────────────
+console.log("\n[plainRejectBucket]");
+{
+  assert("organic → organik bucket", plainRejectBucket("organic too low") === "Aktivitas organik rendah");
+  assert("mcap → ukuran pool bucket", /Ukuran pool/.test(plainRejectBucket("mcap out of target band")));
+  assert("volatility → pergerakan harga", /Pergerakan harga/.test(plainRejectBucket("low volatility")));
+  assert("bot → bot/bundler bucket", /bot\/bundler/.test(plainRejectBucket("bot holders 40% high")));
+  assert("rug/mint → keamanan bucket", /keamanan/.test(plainRejectBucket("mint authority not renounced")));
+  assert("unknown → 'Alasan lain'", plainRejectBucket("something totally novel xyz") === "Alasan lain");
+  assert("empty → 'Alasan lain'", plainRejectBucket("") === "Alasan lain");
+  assert("null-safe", plainRejectBucket(null) === "Alasan lain");
+}
+
+// ── Test: isDeployFailure (category 2 vs 3 splitter) ────────────
+console.log("\n[isDeployFailure]");
+{
+  assert("429 = deploy failure", isDeployFailure({ reason: "429 rate-limit" }) === true);
+  assert("snapshot_verify = deploy failure", isDeployFailure({ reason: "snapshot_verify_failed" }) === true);
+  assert("'Deploy attempt did not succeed' summary = failure", isDeployFailure({ summary: "Deploy attempt did not succeed" }) === true);
+  assert("judge 'LLM chose no deploy' = NOT a deploy failure", isDeployFailure({ summary: "LLM chose no deploy", reason: "organic too low" }) === false);
+  assert("no candidate = NOT a deploy failure", isDeployFailure({ summary: "No candidates available" }) === false);
 }
 
 // ── Summary ─────────────────────────────────────────────────────

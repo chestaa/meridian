@@ -474,6 +474,220 @@ export function buildOrionRejectionsSection(entries) {
   return lines.join("\n");
 }
 
+/**
+ * Map a raw judge/reject reason string into a plain-Indonesian bucket an
+ * investor understands — NO raw jargon (organic→"organik", fee/TVL→"fee",
+ * mcap→"ukuran pool", volatility→"pergerakan harga"). Keyword-driven so it
+ * degrades safely on novel reason text (unknown → "alasan lain").
+ * @param {string} reason
+ * @returns {string} plain Indonesian bucket label
+ */
+export function plainRejectBucket(reason) {
+  const r = String(reason || "").toLowerCase();
+  if (!r.trim()) return "Alasan lain";
+  // Order matters — most specific keywords first.
+  if (/organic|organik/.test(r))                       return "Aktivitas organik rendah";
+  if (/volatil|pergerakan/.test(r))                    return "Pergerakan harga kurang (pool sepi)";
+  if (/\bbot|bundler|bundle/.test(r))                  return "Banyak bot/bundler";
+  if (/top.?10|top.?holder|concentrat|holder/.test(r)) return "Kepemilikan terlalu terpusat";
+  if (/mcap|market.?cap|ukuran/.test(r))               return "Ukuran pool (market cap) di luar target";
+  if (/fee.?tvl|fee\/tvl|fee active|fee_tvl|\bfee\b/.test(r)) return "Fee terlalu kecil dibanding likuiditas";
+  if (/\btvl\b|liquidit|likuid/.test(r))               return "Likuiditas (TVL) tipis";
+  if (/volume|sepi/.test(r))                           return "Volume perdagangan sepi";
+  if (/age|umur|too new|too old/.test(r))              return "Umur token di luar rentang aman";
+  if (/rug|mint|freeze|renounce/.test(r))              return "Gagal cek keamanan token (rug/mint/freeze)";
+  if (/sol.?quote|non.?sol|undeployable/.test(r))      return "Pool tidak pakai SOL (tak bisa dipasang)";
+  if (/launchpad/.test(r))                             return "Launchpad diblokir";
+  if (/confidence|low conf|not worth|did not qualify|no enter/.test(r)) return "Skor kelayakan kurang menurut penilai";
+  return "Alasan lain";
+}
+
+/**
+ * Detect whether a no_deploy decision was a SAFETY/transient BLOCK (deploy was
+ * attempted but refused by a safety check / rate-limit / on-chain error) vs a
+ * JUDGE decision (pool simply not good enough). This is the line Bro asked for:
+ * "gagal deploy" (blocked mid-deploy) vs "ga di-deploy" (judge said no).
+ * @param {object} d - a decision-log entry (type === "no_deploy")
+ * @returns {boolean} true when it's a deploy-attempt failure, not a judge skip
+ */
+export function isDeployFailure(d) {
+  const txt = `${d?.summary || ""} ${d?.reason || ""}`.toLowerCase();
+  if (/deploy attempt did not succeed/.test(txt)) return true;
+  if (/429|rate.?limit|rate limit|snapshot_verify|snapshot verify|timeout|timed out|on-chain|onchain|tx failed|transaction failed|blocked by safety|safety check|insufficient/.test(txt)) return true;
+  return false;
+}
+
+/**
+ * Translate a deploy-failure reason into a plain, short Indonesian phrase.
+ * @param {object} d
+ * @returns {string}
+ */
+function plainDeployFailReason(d) {
+  const txt = `${d?.summary || ""} ${d?.reason || ""}`.toLowerCase();
+  if (/429|rate.?limit|rate limit/.test(txt))             return "API kena rate-limit (429, sementara)";
+  if (/snapshot_verify|snapshot verify/.test(txt))        return "Verifikasi harga pool gagal (data berubah)";
+  if (/timeout|timed out/.test(txt))                      return "Koneksi timeout (sementara)";
+  if (/insufficient|balance/.test(txt))                   return "Saldo SOL kurang untuk deploy";
+  if (/on-chain|onchain|tx failed|transaction failed/.test(txt)) return "Transaksi on-chain gagal";
+  return "Ke-block saat mau deploy (cek log teknis)";
+}
+
+/**
+ * Ringkasan Screening Harian — the daily executive screening summary Bro asked
+ * for: how many screening cycles ran today, how many candidates reached the
+ * judge, deploy outcomes split into THREE clear categories, and the most-common
+ * plain-language reasons pools were rejected.
+ *
+ * THREE CATEGORIES (verbatim Bro intent):
+ *   1. Deploy berhasil   — position actually opened.
+ *   2. Gagal deploy      — deploy WAS attempted but blocked (safety/429/error).
+ *   3. Ga di-deploy      — judge decided WATCH/SKIP (pool not good enough).
+ *   + Ga ada kandidat    — nothing survived filters far enough to be judged.
+ *
+ * DATA SOURCES (all local files, NO LLM cost):
+ *   - verdictRows  : logs/verdicts-YYYY-MM-DD.jsonl (per-candidate judge verdicts
+ *                    + reasons + cycle timestamps). Authoritative for cycle count,
+ *                    candidates-judged, and reject reasons.
+ *   - decisions    : decision-log.json entries (deploy success / no_deploy reason).
+ *
+ * ANTI-FABRICATION: when verdictRows is empty for today we DO NOT invent cycle
+ * counts — we say "data screening mulai terkumpul hari ini" and show only what
+ * the decision-log proves. Never fabricate aggregate numbers.
+ *
+ * @param {Array}  verdictRows - parsed rows from today's verdicts-*.jsonl
+ * @param {Array}  decisions   - decision-log.json entries (will be filtered to today)
+ * @param {string} dateStr     - YYYY-MM-DD for "today" (defaults to system today)
+ * @returns {string} HTML section
+ */
+export function buildScreeningSummarySection(verdictRows, decisions, dateStr) {
+  const today = dateStr || new Date().toISOString().slice(0, 10);
+  const rows = Array.isArray(verdictRows)
+    ? verdictRows.filter(r => typeof r?.ts === "string" && r.ts.startsWith(today))
+    : [];
+  const decs = Array.isArray(decisions)
+    ? decisions.filter(d => typeof d?.ts === "string" && d.ts.startsWith(today))
+    : [];
+
+  // Friendly date label (e.g. "14 Jun").
+  let dateLabel = today;
+  try {
+    dateLabel = new Date(`${today}T12:00:00Z`).toLocaleDateString("id-ID", {
+      timeZone: "Asia/Jakarta", day: "2-digit", month: "short",
+    });
+  } catch { /* keep ISO */ }
+
+  const header = `📊 <b>Ringkasan Screening Harian</b> (${dateLabel})`;
+
+  // ── Empty-data honesty ───────────────────────────────────────────
+  // If there is NOTHING from either source today, be honest rather than
+  // print a wall of zeros that looks like a broken report.
+  if (rows.length === 0 && decs.length === 0) {
+    return [
+      header,
+      `<i>Data screening mulai terkumpul hari ini — belum ada siklus tercatat.</i>`,
+    ].join("\n");
+  }
+
+  // ── Cycle count — cluster verdict rows by timestamp proximity ────
+  // One screening cycle judges its candidates within a few seconds, so rows
+  // whose timestamps are within 90s of the previous one belong to the SAME
+  // cycle. This gives an HONEST cycle count without a separate cycle marker.
+  const CYCLE_GAP_MS = 90_000;
+  const sortedTs = rows.map(r => Date.parse(r.ts)).filter(Number.isFinite).sort((a, b) => a - b);
+  let cycleCount = 0;
+  let lastTs = -Infinity;
+  for (const ts of sortedTs) {
+    if (ts - lastTs > CYCLE_GAP_MS) cycleCount++;
+    lastTs = ts;
+  }
+  // Cycle count from verdict-log only reflects cycles that REACHED the judge.
+  // Cycles that produced no candidate never write a verdict row — so we count
+  // those separately from the decision-log "no candidate" entries.
+  const noCandidateDecs = decs.filter(d =>
+    d.type === "no_deploy" &&
+    /no candidate|all filtered|all candidates filtered|single candidate/i.test(`${d.summary || ""} ${d.reason || ""}`)
+  );
+
+  // ── Candidates judged + verdict split (verdict-log) ──────────────
+  const judged = rows.length;
+  const enterCount = rows.filter(r => r.verdict === "enter").length;
+  const skipCount  = rows.filter(r => r.verdict === "skip").length;
+  const watchCount = rows.filter(r => r.verdict === "watch").length;
+
+  // ── Deploy outcomes (decision-log) — THE 3 CATEGORIES ────────────
+  const deploySuccess = decs.filter(d => d.type === "deploy").length;
+  const noDeployDecs  = decs.filter(d => d.type === "no_deploy");
+  const deployFailDecs = noDeployDecs.filter(isDeployFailure);
+  const judgeSkipDecs  = noDeployDecs.filter(d => !isDeployFailure(d) && !noCandidateDecs.includes(d));
+
+  // ── Aggregate reject reasons (plain Indonesian, top 3) ───────────
+  // Source: judge SKIP/WATCH reasons (the pool-quality verdict text). This is
+  // the "kenapa pool ditolak" Bro wants — bucketed and translated.
+  const rejBuckets = new Map();
+  for (const r of rows) {
+    if (r.verdict === "enter") continue; // enter = accepted, not a rejection
+    const bucket = plainRejectBucket(r.reason);
+    rejBuckets.set(bucket, (rejBuckets.get(bucket) || 0) + 1);
+  }
+  const totalRej = [...rejBuckets.values()].reduce((s, n) => s + n, 0);
+  const topRej = [...rejBuckets.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+  // ── Compose ──────────────────────────────────────────────────────
+  const lines = [header];
+
+  // Cycle line — honest about what the count covers.
+  if (cycleCount > 0) {
+    lines.push(`Total screening: <b>${cycleCount}x</b>`);
+  } else {
+    lines.push(`Total screening: <i>belum tercatat lewat penilai hari ini</i>`);
+  }
+
+  if (judged > 0) {
+    lines.push(`Lolos ke penilai (judge): <b>${judged}</b> kandidat`);
+  } else {
+    lines.push(`Lolos ke penilai (judge): <b>0</b> — belum ada pool yang lolos filter awal`);
+  }
+
+  lines.push(`Deploy berhasil: <b>${deploySuccess}</b>`);
+
+  // Category 2 — Gagal deploy (attempted but blocked).
+  if (deployFailDecs.length > 0) {
+    // Surface the single most-common fail reason in plain language.
+    const failReasons = new Map();
+    for (const d of deployFailDecs) {
+      const k = plainDeployFailReason(d);
+      failReasons.set(k, (failReasons.get(k) || 0) + 1);
+    }
+    const topFail = [...failReasons.entries()].sort((a, b) => b[1] - a[1])[0];
+    lines.push(`  ⛔ Gagal deploy: <b>${deployFailDecs.length}x</b> — ${topFail[0]}`);
+  }
+
+  // Category 3 — Ga di-deploy (judge said no / WATCH-SKIP).
+  if (judgeSkipDecs.length > 0 || skipCount > 0 || watchCount > 0) {
+    // Prefer the decision-log no_deploy count (1 per cycle) but if absent fall
+    // back to per-candidate skip/watch from the verdict-log so we never under-report.
+    const noDeployN = judgeSkipDecs.length > 0 ? judgeSkipDecs.length : (skipCount + watchCount);
+    const unit = judgeSkipDecs.length > 0 ? "siklus" : "kandidat";
+    lines.push(`  ⏸️ Ga di-deploy: <b>${noDeployN}x</b> (${unit}) — penilai menilai pool kurang bagus`);
+  }
+
+  // Category 4 — Ga ada kandidat lolos filter.
+  if (noCandidateDecs.length > 0) {
+    lines.push(`  🚫 Ga ada kandidat lolos filter: <b>${noCandidateDecs.length}x</b>`);
+  }
+
+  // Top reject reasons (plain language, with %).
+  if (topRej.length > 0 && totalRej > 0) {
+    lines.push(`Alasan paling sering pool ditolak:`);
+    for (const [bucket, n] of topRej) {
+      const pct = Math.round((n / totalRej) * 100);
+      lines.push(`  • ${bucket} ${pct}%`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 // Export helpers for tests
 export { readJson, readJsonl, median };
 
@@ -544,6 +758,15 @@ async function runBossReport() {
   const signalEntries = readJsonl("signal-results.jsonl");
   const orionSection  = buildOrionRejectionsSection(signalEntries);
 
+  // ─── Daily screening summary (Lyra) ─────────────────────────────
+  // Sources: today's per-candidate judge verdicts (logs/verdicts-YYYY-MM-DD.jsonl)
+  // + decision-log.json deploy/no_deploy outcomes. Both local files, NO LLM cost.
+  const todayDate = new Date().toISOString().slice(0, 10);
+  const verdictRows = readJsonl(`logs/verdicts-${todayDate}.jsonl`);
+  const decisionData = readJson("decision-log.json");
+  const decisionRows = Array.isArray(decisionData?.decisions) ? decisionData.decisions : [];
+  const screeningSummary = buildScreeningSummarySection(verdictRows, decisionRows, todayDate);
+
   // ─── timestamp ──────────────────────────────────────────────────
   const nowStr = new Date().toLocaleString("id-ID", {
     timeZone: "Asia/Jakarta", day: "2-digit", month: "short",
@@ -603,6 +826,8 @@ async function runBossReport() {
     tradeSection,
     sep,
     signalSection,
+    sep,
+    screeningSummary,
     sep,
     cbSection,
     sep,
