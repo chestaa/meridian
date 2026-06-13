@@ -5,7 +5,21 @@ import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
 const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
-const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions"]);
+// SCREENER tool-set is intentionally LEAN. Every candidate's enrichment
+// (holders/top10/bots/fees, narrative, smart-wallets, OKX risk/tags, active_bin,
+// pool memory, mcap/tvl/vol/fee-tvl/organic/volatility/age) is PREFETCHED into
+// the candidate blocks of the screening goal (index.js ~line 984) BEFORE this
+// loop starts. Exposing the enrichment tools here let the LLM re-fetch data it
+// already had — burning ~17s/call and looping until max-steps without ever
+// committing to deploy_position (the [SCREENER_STALL] root cause). With the
+// re-fetch tools removed, the only forward moves are deploy_position or
+// finish/skip — the model is forced to commit on the data already in-prompt.
+// Removed: get_top_candidates, check_smart_wallets_on_pool, get_token_holders,
+// get_token_narrative, get_token_info, search_pools, get_pool_memory.
+// Kept: deploy_position (the action), get_active_bin (per-candidate fallback if
+// a prefetch active_bin was null), get_my_positions / get_wallet_balance
+// (deploy-time safety reads — pre-deploy count + SOL coverage).
+const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_wallet_balance", "get_my_positions"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
   "update_config",
@@ -581,4 +595,4 @@ export function __setCreateForTests(fakeCreate) {
 }
 
 // Exposed for unit testing — not part of the public agent API.
-export { is400Error, parseOrionEnterVerdicts, next400Fallback, FALLBACK_LADDER_400 };
+export { is400Error, parseOrionEnterVerdicts, next400Fallback, FALLBACK_LADDER_400, getToolsForRole, SCREENER_TOOLS };

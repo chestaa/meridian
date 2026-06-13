@@ -1063,6 +1063,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
 DRY_RUN REPORTING RULE:
 If DRY_RUN is true and deploy_position returns dry_run/would_deploy, write SIMULATED DEPLOY instead of DEPLOYED. Never imply a real on-chain deployment happened during dry-run.
 
+0. All enrichment is already in the candidate blocks above. Do NOT re-fetch, verify, or double-check anything — decide on the data shown.
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
@@ -1127,6 +1128,7 @@ IMPORTANT:
 - Keep the whole report compact and highly scannable for Telegram.`;
 
     const terseReportSteps = `STEPS (Andromeda renders the Telegram report — do NOT render it yourself):
+0. All enrichment is already in the candidate blocks above. Do NOT re-fetch, verify, or double-check anything — decide on the data shown.
 1. Decide if any candidate is worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the highest-conviction candidate (narrative + smart wallets + pool metrics + Orion verdict).
 3. Call deploy_position with active_bin pre-fetched. bins_below = round(${config.strategy.minBinsBelow} + (volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}]. Pass deploy_position.volatility = candidate volatility. amount_y only, amount_x=0, bins_above=0.
