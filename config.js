@@ -185,6 +185,35 @@ export const config = {
     // "volatility_unknown" / "organic_unknown" (fail-closed, anti-pattern #2). Set
     // false to restore legacy hard-reject-on-missing for cross-ref pools.
     enrichNativeDetailBeforeGate: u.enrichNativeDetailBeforeGate ?? true,
+    // ─── Broad discovery — server→client gate migration (Cassiopeia, CROWN JEWEL) ───
+    // ROOT CAUSE (Sirius, verified live): we sent EVERY strict gate (organic>=60,
+    // fee/TVL, binStep, mcap band, holders, age, ...) to the Pool-Discovery server as
+    // filter_by params, so the server cut the 114k-pool universe down to ~3 BEFORE we
+    // ever saw a candidate. We were "playing 5 pools out of millions." Pagination on
+    // that API is broken (page/offset ignored) — page_size is the only lever, ceiling
+    // 1000 (we used 50 = 20x headroom thrown away).
+    //
+    // FIX (NOT a loosening): when broadDiscoveryEnabled, send ONLY a WIDE cheap server
+    // pre-filter (pool_type=dlmm + critical-warning sanity flags + a WIDE mcap band +
+    // a low tvl floor) and a free server pre-sort (fee_active_tvl_ratio:desc), pull up
+    // to broadDiscoveryPageSize pools, then run the IDENTICAL strict client gate
+    // (getRawPoolScreeningRejectReason) on the broad set. The gate is byte-identical;
+    // ONLY the evaluation LOCATION moved (server→client) so we LOOK AT more candidates.
+    // The broad server bounds are deliberately WIDER than the strict client thresholds
+    // (broadMcapFloor <= minMcap, broadMcapCeil >= maxMcap, broadMinTvl <= minTvl), so
+    // the server can NEVER reject a pool the strict client gate would have passed —
+    // the broad filter is a strict SUPERSET of what survives the client gate.
+    // Set broadDiscoveryEnabled=false → legacy strict-server-filter behavior (fully
+    // reversible). Cost-control: enrich-before-gate passes are probe-gated against the
+    // STRICT thresholds (a pool failing strict mcap/organic/fee-TVL is dropped from the
+    // enrich set for free), and getTopCandidates pre-ranks + slices to `limit` BEFORE
+    // any per-pool enrichment (PVP/Jupiter audit/OKX) → enrichment + judge cost FLAT.
+    broadDiscoveryEnabled:   u.broadDiscoveryEnabled   ?? true,
+    broadDiscoveryPageSize:  u.broadDiscoveryPageSize  ?? 1000,   // API ceiling; broken pagination makes this the only breadth lever
+    broadMcapFloor:          u.broadMcapFloor          ?? 10_000, // WIDE — well below strict minMcap (150k native / 50k signal). Server sanity floor only; strict mcap gate runs client-side.
+    broadMcapCeil:           u.broadMcapCeil           ?? 50_000_000, // WIDE — above strict maxMcap (10M). Strict ceil runs client-side.
+    broadMinTvl:             u.broadMinTvl             ?? 1_000,  // WIDE — below strict minTvl (10k). Strict tvl floor runs client-side.
+    broadSortBy:             u.broadSortBy             ?? "fee_active_tvl_ratio:desc", // free server pre-sort: if page_size clips, the highest fee/TVL pools are pulled first
     // ─── Item (a) Fee-Gen-Token signal — balanced two-sided flow (SCORE BONUS ONLY) ───
     // NEVER a gate (dormancy risk — a one-sided pump can still be a fine LP).
     // Pool Discovery API exposes NO per-side fee field (verified live: only aggregate
@@ -627,6 +656,12 @@ export function reloadScreeningThresholds() {
     if (fresh.maxTvlMcapRatio    != null) s.maxTvlMcapRatio = fresh.maxTvlMcapRatio;
     if (fresh.enrichHolderCountBeforeGate !== undefined) s.enrichHolderCountBeforeGate = fresh.enrichHolderCountBeforeGate;
     if (fresh.enrichNativeDetailBeforeGate !== undefined) s.enrichNativeDetailBeforeGate = fresh.enrichNativeDetailBeforeGate;
+    if (fresh.broadDiscoveryEnabled  !== undefined) s.broadDiscoveryEnabled  = fresh.broadDiscoveryEnabled;
+    if (fresh.broadDiscoveryPageSize != null) s.broadDiscoveryPageSize = fresh.broadDiscoveryPageSize;
+    if (fresh.broadMcapFloor != null) s.broadMcapFloor = fresh.broadMcapFloor;
+    if (fresh.broadMcapCeil  != null) s.broadMcapCeil  = fresh.broadMcapCeil;
+    if (fresh.broadMinTvl    != null) s.broadMinTvl    = fresh.broadMinTvl;
+    if (fresh.broadSortBy    != null) s.broadSortBy    = fresh.broadSortBy;
     if (fresh.feeGenSymmetryBonusEnabled !== undefined) s.feeGenSymmetryBonusEnabled = fresh.feeGenSymmetryBonusEnabled;
     if (fresh.feeGenSymmetryWeight != null) s.feeGenSymmetryWeight = fresh.feeGenSymmetryWeight;
     if (fresh.feeTvlHighBonusEnabled !== undefined) s.feeTvlHighBonusEnabled = fresh.feeTvlHighBonusEnabled;

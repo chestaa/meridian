@@ -565,12 +565,17 @@ async function fetchDiscordSignalCandidates() {
   return Array.isArray(data?.candidates) ? data.candidates : [];
 }
 
-async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category }) {
+async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category, sort_by = null }) {
+  // sort_by is a FREE server-side pre-sort (Sirius verified: fee_active_tvl_ratio:desc,
+  // volume:desc, tvl:desc supported). When the broad page_size still clips the
+  // universe, the highest-ranked pools by this key are pulled FIRST — so the cream
+  // survives even at the page ceiling. Never narrows the result set, only orders it.
   const url = `${POOL_DISCOVERY_BASE}/pools?` +
     `page_size=${page_size}` +
     `&filter_by=${encodeURIComponent(filters)}` +
     `&timeframe=${timeframe}` +
-    `&category=${category}`;
+    `&category=${category}` +
+    (sort_by ? `&sort_by=${encodeURIComponent(sort_by)}` : "");
 
   const res = await fetch(url);
 
@@ -1076,42 +1081,127 @@ export function __enrichNativeDetailBeforeGateForTests(rawPools, s, fetchDetail)
   return enrichNativeDetailBeforeGate(rawPools, s, fetchDetail);
 }
 
-export async function discoverPools({
-  page_size = 50,
-} = {}) {
-  const s = effectiveScreeningThresholds();
-  const filters = [
+/**
+ * Build the server-side filter_by string for the Pool-Discovery API.
+ *
+ * TWO MODES (Cassiopeia, CROWN JEWEL — server→client gate migration):
+ *
+ *  - LEGACY STRICT (broadDiscoveryEnabled === false): send EVERY strict gate to the
+ *    server. The server cuts the 114k-pool universe to ~3 before we see anything.
+ *    This is the behavior we are fixing; kept for full reversibility.
+ *
+ *  - BROAD (default): send ONLY a WIDE cheap pre-filter — pool_type=dlmm (this bot is
+ *    DLMM-only), the critical-warning / single-ownership sanity flags (pure rug sanity,
+ *    never narrows the QUALITY funnel), a WIDE mcap band (broadMcapFloor..broadMcapCeil)
+ *    and a low tvl floor (broadMinTvl). Every strict quality gate (mcap band, holders,
+ *    volume, tvl, binStep, fee/TVL, organic, age, launchpad, rug, bot, top10, ...) then
+ *    runs CLIENT-SIDE via getRawPoolScreeningRejectReason + the getTopCandidates gates,
+ *    IDENTICALLY — only the evaluation LOCATION moved.
+ *
+ * INVARIANT (this is what makes it NOT a loosening): every condition in the broad
+ * filter is also enforced client-side, and the broad BOUNDS are deliberately wider
+ * than the strict thresholds (broadMcapFloor <= minMcap, broadMcapCeil >= maxMcap,
+ * broadMinTvl <= minTvl). So the server can NEVER drop a pool the strict client gate
+ * would have passed — the broad result is a strict SUPERSET of the deployable set.
+ *
+ * Exported pure fn so the test can assert (a) broad mode is wide, (b) every broad
+ * bound is looser-or-equal to the matching strict threshold.
+ *
+ * @param {object} s - effective screening thresholds.
+ * @returns {string} the joined filter_by string.
+ */
+export function buildDiscoveryFilters(s) {
+  // Cheap sanity flags shared by BOTH modes — pure rug/critical-warning gating that
+  // the client gate (getRawPoolScreeningRejectReason lines for *_has_critical_warnings
+  // / *_high_single_ownership / high_supply_concentration) also enforces. These never
+  // narrow the quality funnel; they only drop pools the client gate would reject too.
+  const sanity = [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
     s.excludeHighSupplyConcentration ? "base_token_has_high_supply_concentration=false" : null,
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
-    `base_token_market_cap>=${s.minMcap}`,
-    `base_token_market_cap<=${s.maxMcap}`,
-    `base_token_holders>=${s.minHolders}`,
-    `volume>=${s.minVolume}`,
-    `tvl>=${s.minTvl}`,
-    s.maxTvl != null ? `tvl<=${s.maxTvl}` : null,
-    `dlmm_bin_step>=${s.minBinStep}`,
-    `dlmm_bin_step<=${s.maxBinStep}`,
-    `fee_active_tvl_ratio>=${s.minFeeActiveTvlRatio}`,
-    `base_token_organic_score>=${s.minOrganic}`,
-    `quote_token_organic_score>=${s.minQuoteOrganic}`,
-    s.minTokenAgeHours != null ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
-    s.maxTokenAgeHours != null ? `base_token_created_at>=${Date.now() - s.maxTokenAgeHours * 3_600_000}` : null,
-    Array.isArray(s.allowedLaunchpads) && s.allowedLaunchpads.length > 0
-      ? `base_token_launchpad=[${s.allowedLaunchpads.join(",")}]`
-      : null,
+  ];
+
+  if (s.broadDiscoveryEnabled === false) {
+    // LEGACY STRICT — every gate server-side (the pre-fix behavior, kept reversible).
+    return [
+      ...sanity,
+      `base_token_market_cap>=${s.minMcap}`,
+      `base_token_market_cap<=${s.maxMcap}`,
+      `base_token_holders>=${s.minHolders}`,
+      `volume>=${s.minVolume}`,
+      `tvl>=${s.minTvl}`,
+      s.maxTvl != null ? `tvl<=${s.maxTvl}` : null,
+      `dlmm_bin_step>=${s.minBinStep}`,
+      `dlmm_bin_step<=${s.maxBinStep}`,
+      `fee_active_tvl_ratio>=${s.minFeeActiveTvlRatio}`,
+      `base_token_organic_score>=${s.minOrganic}`,
+      `quote_token_organic_score>=${s.minQuoteOrganic}`,
+      s.minTokenAgeHours != null ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
+      s.maxTokenAgeHours != null ? `base_token_created_at>=${Date.now() - s.maxTokenAgeHours * 3_600_000}` : null,
+      Array.isArray(s.allowedLaunchpads) && s.allowedLaunchpads.length > 0
+        ? `base_token_launchpad=[${s.allowedLaunchpads.join(",")}]`
+        : null,
+    ].filter(Boolean).join("&&");
+  }
+
+  // BROAD — wide cheap pre-filter only; the strict gate runs client-side. The wide
+  // mcap band must STRADDLE both the native (minMcap..maxMcap) and the strict client
+  // bounds, so we cannot drop a pool the client would pass. broadMinTvl is a low sanity
+  // floor (kills 0-TVL dust without touching the strict client minTvl).
+  const mcapFloor = numeric(s.broadMcapFloor);
+  const mcapCeil  = numeric(s.broadMcapCeil);
+  const tvlFloor  = numeric(s.broadMinTvl);
+  return [
+    ...sanity,
+    mcapFloor != null ? `base_token_market_cap>=${mcapFloor}` : null,
+    mcapCeil  != null ? `base_token_market_cap<=${mcapCeil}`  : null,
+    tvlFloor  != null ? `tvl>=${tvlFloor}` : null,
   ].filter(Boolean).join("&&");
+}
+
+export async function discoverPools({
+  page_size = 50,
+  // returnLimit caps the gate-passed `pools` array we RETURN (token-bloat guard for
+  // the direct discover_pools LLM tool, which would otherwise dump the whole broad
+  // gate-passed set into the prompt). getTopCandidates passes returnLimit=null so its
+  // deterministic pre-rank sees the FULL gate-passed universe before slicing to
+  // `limit` itself. Default = page_size: a direct tool call gets at most page_size
+  // gate-passed pools (legacy-feeling cap), the screening path stays uncapped.
+  returnLimit = undefined,
+} = {}) {
+  const s = effectiveScreeningThresholds();
+  const filters = buildDiscoveryFilters(s);
+  // Broad mode pulls up to broadDiscoveryPageSize (API ceiling 1000) with a free
+  // server pre-sort so the highest fee/TVL pools survive even if the page clips.
+  // Legacy strict mode keeps the caller's page_size (default 50). The strict client
+  // gate runs on whatever set comes back — identical regardless of breadth.
+  const broad = s.broadDiscoveryEnabled !== false;
+  const effectivePageSize = broad
+    ? (numeric(s.broadDiscoveryPageSize) ?? page_size)
+    : page_size;
+  const sortBy = broad ? (s.broadSortBy || null) : null;
 
   const data = await fetchPoolDiscoveryPage({
-    page_size,
+    page_size: effectivePageSize,
     filters,
     timeframe: s.timeframe,
     category: s.category,
+    sort_by: sortBy,
   });
 
   let rawPools = Array.isArray(data.data) ? data.data : [];
+
+  // CROWN JEWEL breadth telemetry — surface how many candidates the broad server
+  // pre-filter returned (vs the legacy ~3). The strict client gate runs next; this
+  // is the raw breadth BEFORE client gating. Draco watches this to confirm the fix.
+  log(
+    "screening",
+    `Discovery fetch: ${broad ? "BROAD" : "legacy-strict"} mode, page_size=${effectivePageSize}` +
+      `${sortBy ? `, sort=${sortBy}` : ""} → ${rawPools.length} raw pool(s)` +
+      (data.total != null ? ` (server total=${data.total})` : ""),
+  );
 
   // Phase G — stamp Meteora as the base source for every discovery pool.
   for (const pool of rawPools) {
@@ -1307,6 +1397,16 @@ export async function discoverPools({
     return false;
   });
 
+  // CROWN JEWEL — how many of the broad set survived the IDENTICAL strict client
+  // gate. This is the gate-passed breadth getTopCandidates pre-ranks over (vs the
+  // pre-fix ~3). The gate is byte-identical to the old server filter; only the
+  // location moved, so a pool surviving here is a pool the old strict filter would
+  // also have surfaced — we just now look at the whole universe to find them.
+  log(
+    "screening",
+    `Client gate: ${thresholdedRawPools.length}/${rawPools.length} pool(s) passed the strict Cassiopeia gate`,
+  );
+
   const condensed = thresholdedRawPools.map(condensePool);
 
   // Hard-filter blacklisted tokens and blocked deployers (what pool discovery already gave us)
@@ -1370,9 +1470,22 @@ export async function discoverPools({
     }
   }
 
+  // Token-bloat guard: cap the RETURNED gate-passed set for direct tool callers.
+  // returnLimit defaults to page_size (a direct discover_pools call gets at most
+  // page_size pools — the legacy feel). getTopCandidates passes returnLimit=null →
+  // uncapped, so its own pre-rank picks the cream of the FULL gate-passed universe.
+  // The pre-sort (broadSortBy, fee/TVL desc) keeps the highest-quality pools at the
+  // front, so even a capped return surfaces the best gate-passed pools first.
+  const effectiveReturnLimit = returnLimit === null
+    ? null
+    : (numeric(returnLimit) ?? page_size);
+  const returnedPools = (effectiveReturnLimit != null && pools.length > effectiveReturnLimit)
+    ? pools.slice(0, effectiveReturnLimit)
+    : pools;
+
   return {
     total: data.total,
-    pools,
+    pools: returnedPools,
     filtered_examples: filteredExamples,
   };
 }
@@ -1383,7 +1496,14 @@ export async function discoverPools({
  */
 export async function getTopCandidates({ limit = 10 } = {}) {
   const { config } = await import("../config.js");
-  const discovery = await discoverPools({ page_size: 50 });
+  // page_size is honored only in legacy-strict mode; broad mode (default) uses
+  // broadDiscoveryPageSize (1000) internally. discoverPools runs the FULL strict
+  // Cassiopeia client gate, so `pools` here is already gate-passed (rug/bot-data-
+  // independent cheap gates + mcap/holders/vol/organic/fee-TVL/age). Broad mode means
+  // this set is the cream of the WHOLE universe, not the cream of 50. returnLimit:null
+  // → discoverPools returns ALL gate-passed pools so our pre-rank below picks the true
+  // top-`limit` from the whole universe (the cost slice happens HERE, not in discovery).
+  const discovery = await discoverPools({ returnLimit: null });
   const { pools } = discovery;
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
 
@@ -1442,8 +1562,21 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       }
       return true;
     })
+    // CROWN JEWEL COST BOUNDARY (anti-pattern #8 — no waste to the LLM/enrichment).
+    // Deterministic pre-rank by scoreCandidate (fee/TVL×weight + organic + volume +
+    // tvl + bonuses), then HARD slice to `limit`. EVERY expensive per-pool step below
+    // (PVP, Jupiter audit, OKX advanced-info/risk/clusters) and the LLM judge see ONLY
+    // this top-`limit` set. So broadening the fetch from 50 → 1000 makes `limit` the
+    // CREAM of the whole gate-passed universe instead of the cream of 50, while
+    // enrichment + judge cost stay FLAT (still `limit` pools, no more). This slice runs
+    // BEFORE any API enrichment — that is the entire cost guarantee.
     .sort((a, b) => scoreCandidate(b, eff) - scoreCandidate(a, eff))
     .slice(0, limit);
+
+  log(
+    "screening",
+    `Pre-rank: ${pools.length} gate-passed pool(s) → top-${eligible.length} by score enter enrichment+judge (cost-flat at limit=${limit})`,
+  );
 
   // Deployability pre-filter (Cassiopeia, Lyra cost-cut) — runs BEFORE all
   // enrichment (PVP/Jupiter audit/OKX) and BEFORE the LLM judge. We deploy
