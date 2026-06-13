@@ -41,7 +41,7 @@ import { appendDecision } from "./decision-log.js";
 import { recordPaperDeploy, refreshPaperTrades } from "./paper-trades.js";
 import { getCircuitStatus, manualReset as circuitReset } from "./account-circuit-breaker.js";
 import { judgeCandidates, formatOrionVerdicts } from "./agents/orion.js";
-import { formatDeployReport, formatNoDeployReport, andromedaEnabled } from "./agents/andromeda.js";
+import { formatDeployReport, formatNoDeployReport, andromedaEnabled, formatScreeningTerse } from "./agents/andromeda.js";
 import { deployFromOrionVerdict, vegaDeterministicDeployEnabled } from "./agents/vega.js";
 import { runDeterministicManagement, managerDeterministicEnabled } from "./agents/manager.js";
 import { rebalanceOnOor } from "./agents/rebalance.js";
@@ -687,6 +687,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let prePositions, preBalance;
   let liveMessage = null;
   let screenReport = null;
+  // Sirius terse-notif funnel state (function-scope so the `finally` send block
+  // can render the 2–5 line summary). Verbose `screenReport` stays the audit
+  // record; this drives ONLY the Telegram message to Bro.
+  const funnel = { universe: null, passed: 0, deployed: false, poolName: null, amountSol: null, reason: null, skipped: false, skipReason: null, failed: false };
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
     if (prePositions.total_positions >= config.risk.maxPositions) {
@@ -758,6 +762,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
+    // Funnel baseline for the terse notif: raw universe scanned this cycle.
+    funnel.universe = topCandidates?.total_universe ?? topCandidates?.total_screened ?? null;
 
     const allCandidates = [];
     for (const pool of candidates) {
@@ -801,7 +807,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
       return true;
     });
 
+    funnel.passed = passing.length;
+
     if (passing.length === 0) {
+      // Terse notif: "ga ada kandidat lolos" (universe → 0 lolos). The single
+      // most-common rejection reason (if any) drives the plain phrase.
+      funnel.reason = filteredOut[0]?.reason || earlyFilteredExamples[0]?.reason || "no candidates";
       const combined = filteredOut.length > 0 ? filteredOut : earlyFilteredExamples;
       const combinedExamples = combined.slice(0, 3)
         .map((entry) => `- ${entry.name}: ${entry.reason}`)
@@ -822,6 +833,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     if (passing.length === 1) {
       const skipReason = getLoneCandidateSkipReason(passing[0]);
       if (skipReason) {
+        funnel.reason = skipReason;
         const candidateName = passing[0].pool?.name || "unknown";
         screenReport = [
           "⛔ NO DEPLOY",
@@ -939,12 +951,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
       // If Vega declined every ENTER without dispatching, we still surface a
       // no-deploy report — the LLM agentLoop is skipped entirely under this flag.
       if (vegaDeployResult) {
+        funnel.deployed = true;
+        funnel.poolName = vegaDeployResult.pool_name || vegaDeployedCandidate?.pool?.name
+          || vegaDeployResult.would_deploy?.pool_address || vegaDeployResult.pool || null;
+        funnel.amountSol = vegaDeployResult.amount_y ?? vegaDeployResult.would_deploy?.amount_y
+          ?? vegaDeployResult.would_deploy?.amount_sol ?? null;
         screenReport = formatDeployReport({
           deployResult: vegaDeployResult,
           candidate: vegaDeployedCandidate,
           orionVerdict: vegaDeployedVerdict,
         });
       } else {
+        funnel.reason = enterVerdicts.length === 0 ? "judge no enter" : "judge skip";
         const verdictByPool = new Map((orionVerdicts || []).map((v) => [v.pool_address, v]));
         const rejectedCandidates = passing.map((c) => ({
           pool: c.pool,
@@ -1195,6 +1213,11 @@ ${andromedaOn ? terseReportSteps : legacyReportSteps}
         const orionVerdict = Array.isArray(orionVerdicts)
           ? orionVerdicts.find((v) => v.pool_address === lastDeployPoolAddress) || null
           : null;
+        funnel.deployed = true;
+        funnel.poolName = lastDeployResult.pool_name || candidate?.pool?.name
+          || lastDeployResult.would_deploy?.pool_address || lastDeployResult.pool || null;
+        funnel.amountSol = lastDeployResult.amount_y ?? lastDeployResult.would_deploy?.amount_y
+          ?? lastDeployResult.would_deploy?.amount_sol ?? null;
         screenReport = formatDeployReport({ deployResult: lastDeployResult, candidate, orionVerdict });
       } else {
         // No deploy: synthesize a reject list from Orion skips (advisory) +
@@ -1205,9 +1228,24 @@ ${andromedaOn ? terseReportSteps : legacyReportSteps}
           reason: verdictByPool.get(c.pool?.pool)?.reason || "did not qualify",
         }));
         const reason = stripThink(content || "").trim().slice(0, 400) || null;
+        // Terse-notif reason: prefer the top Orion verdict reason (most specific)
+        // over the freeform LLM ACK, which is often a full sentence.
+        funnel.reason = rejectedCandidates[0]?.reason || reason || "no enter";
         screenReport = formatNoDeployReport({ rejectedCandidates, reason });
       }
     } else {
+      // Legacy (non-Andromeda) LLM-rendered report. Derive terse funnel from
+      // the deploy signal — full LLM content stays the audit record.
+      if (deploySucceeded) {
+        funnel.deployed = true;
+        funnel.poolName = lastDeployResult?.pool_name
+          || candidateByPool.get(lastDeployPoolAddress)?.pool?.name
+          || lastDeployPoolAddress || null;
+        funnel.amountSol = lastDeployResult?.amount_y ?? lastDeployResult?.would_deploy?.amount_y
+          ?? lastDeployResult?.would_deploy?.amount_sol ?? null;
+      } else {
+        funnel.reason = (orionVerdicts || [])[0]?.reason || "no enter";
+      }
       screenReport = process.env.DRY_RUN === "true"
         ? content.replace(/^[^\n]*DEPLOYED/m, deployHeader)
         : content;
@@ -1230,10 +1268,32 @@ ${andromedaOn ? terseReportSteps : legacyReportSteps}
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
+    funnel.failed = true;
+    funnel.reason = error.message;
   } finally {
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
-      if (screenReport) {
+      // Sirius terse-notif: Bro reads 2–5 lines only. We send the collapsed
+      // funnel summary instead of the verbose report. The verbose report is
+      // already persisted (decision-log + log files) for Lyra's audit. The
+      // funnel ran if we reached candidate discovery (universe set) OR a deploy
+      // landed OR the cycle threw. Pre-check skips (max positions / balance /
+      // insufficient SOL) never touch the funnel → keep the legacy verbose-but-
+      // exec-silenced path so they stay quiet in executive mode as before.
+      const funnelRan = funnel.universe != null || funnel.deployed || funnel.failed;
+      if (funnelRan) {
+        const terse = formatScreeningTerse(funnel);
+        // finalizeTerse REPLACES the whole live message (drops the tool-step echo
+        // that finalize() would leave above the footer) → true 2–5 line notif.
+        if (liveMessage) await liveMessage.finalizeTerse(terse).catch(() => {});
+        // Terse notif always carries a DEPLOY / NO DEPLOY verdict marker, so it
+        // passes isMeaningfulReport in executive mode (a cycle that scanned the
+        // universe is always worth one 2–5 line line of signal).
+        else if (!isExecutiveMode() || isMeaningfulReport(terse)) {
+          sendMessage(terse).catch(() => { });
+        }
+      } else if (screenReport) {
+        // Pre-check skip / boilerplate — unchanged legacy path.
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
         // HOTFIX-5: Executive mode silences cycle-header noise + boilerplate,
         // but ALLOWS Orion verdict text (DEPLOY / NO DEPLOY / BEST CANDIDATE).

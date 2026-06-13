@@ -410,6 +410,25 @@ export async function createLiveMessage(title, intro = "Starting...") {
       _liveMessageDepth = Math.max(0, _liveMessageDepth - 1);
       typing.stop();
     },
+    // Sirius: collapse the ENTIRE live message to a terse final text. Unlike
+    // finalize() (which keeps title + intro + tool-step lines above the footer),
+    // this REPLACES the whole body so Bro sees only the 2–5 line summary — no
+    // tool-step echo ("✅ get pool memory done"), no candidate dump. The verbose
+    // detail stays in the log files for Lyra.
+    async finalizeTerse(finalText) {
+      if (state.flushTimer) {
+        clearTimeout(state.flushTimer);
+        state.flushTimer = null;
+      }
+      if (state.flushPromise) await state.flushPromise;
+      state.title = "";
+      state.intro = "";
+      state.toolLines = [];
+      state.footer = finalText;
+      await flushNow();
+      _liveMessageDepth = Math.max(0, _liveMessageDepth - 1);
+      typing.stop();
+    },
     async fail(errorText) {
       if (state.flushTimer) {
         clearTimeout(state.flushTimer);

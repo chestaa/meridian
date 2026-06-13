@@ -1978,6 +1978,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   return {
     candidates: eligible,
     total_screened: pools.length,
+    // Raw universe size from the discovery API (pre-gate). Funnel baseline for
+    // the terse Telegram notif ("N pool → M lolos filter"). data.total is the
+    // full pool count the API reports before any client-side gating.
+    total_universe: Number.isFinite(Number(discovery.total)) ? Number(discovery.total) : pools.length,
     filtered_examples: filteredOut.slice(0, 3),
   };
 }

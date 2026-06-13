@@ -213,6 +213,121 @@ export function formatNoDeployReport({ rejectedCandidates = [], reason = null } 
   return lines.join("\n");
 }
 
+// ─── Sirius: terse per-cycle screening notif (2–5 lines, plain language) ──────
+//
+// Bro Dikta does not read long/verbose cycle reports. The Telegram notif for
+// each screening cycle is collapsed to 2–5 lines:
+//   line 1: 🔍 Screening <HH:MM> WIB
+//   line 2: funnel — "<N> pool → <M> lolos filter → judge"  (numbers only)
+//   line 3: outcome — DEPLOY (pool + size) OR NO DEPLOY (short plain reason)
+//
+// The full verbose report (formatDeployReport / formatNoDeployReport) is STILL
+// written to the decision-log + daily log files for Lyra's audit — only the
+// Telegram message to Bro is shrunk. Plain language: no raw jargon
+// (bin_step / fee_active_tvl_ratio etc.) — those are translated to human phrases.
+
+function wibTime(date = new Date()) {
+  try {
+    return new Intl.DateTimeFormat("id-ID", {
+      timeZone: "Asia/Jakarta",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(date);
+  } catch {
+    return "--:--";
+  }
+}
+
+// Translate a raw/technical no-deploy reason into a short plain-language phrase.
+// Pattern-match on the substance, fall back to a generic phrase — NEVER leak
+// raw gate names or metric keys to Bro.
+export function plainReason(raw) {
+  if (!raw) return "ga ada kandidat lolos";
+  const s = String(raw).toLowerCase();
+
+  // Infra / fetch failures
+  if (/\b429\b|rate.?limit|too many requests/.test(s)) return "API rate-limit (429)";
+  if (/\b(403|forbidden|waf)\b/.test(s)) return "API ditolak (403)";
+  if (/\b5\d\d\b|timeout|timed out|econn|fetch fail|network/.test(s)) return "API error";
+  if (/balance unreadable|wallet balance/.test(s)) return "saldo wallet ga kebaca";
+  if (/insufficient sol/.test(s)) return "SOL kurang buat deploy";
+  if (/max positions/.test(s)) return "posisi udah penuh";
+
+  // No-candidate funnel outcomes
+  if (/no candidates?|all filtered|did not qualify|no candidate met/.test(s)) return "ga ada kandidat lolos";
+
+  // Pool-quality reasons (translate jargon → human)
+  if (/fee.?(active.?)?tvl|fee\/tvl|fee.?gen|fee.*(low|kecil|below)/.test(s)) return "fee kekecilan";
+  if (/tvl.*(low|thin|below|tipis|min)/.test(s)) return "pool TVL tipis";
+  if (/tvl.*(high|above|max)/.test(s)) return "pool TVL kegedean";
+  if (/volume|sepi|illiquid/.test(s)) return "pool sepi";
+  if (/volatil/.test(s)) return "volatilitas ga sehat";
+  if (/rug|liquidity removal/.test(s)) return "kandidat berisiko rug";
+  if (/bot|sniper|bundle/.test(s)) return "holder mencurigakan";
+  if (/top.?10|concentrat|whale/.test(s)) return "holder kepusat di whale";
+  if (/mint|freeze|authority/.test(s)) return "authority belum di-renounce";
+  if (/mcap|market.?cap/.test(s)) return "mcap di luar band";
+  if (/age|too (young|new|old)/.test(s)) return "umur token ga pas";
+  if (/non.?sol|usdc|undeployable|quote/.test(s)) return "pool bukan pair SOL";
+  if (/organic/.test(s)) return "aktivitas pool ga organik";
+  if (/cooldown/.test(s)) return "pool lagi cooldown";
+
+  // LLM judge verdicts
+  if (/\bwatch\b/.test(s)) return "judge WATCH (belum ENTER)";
+  if (/no enter|did not enter|skip/.test(s)) return "judge ga ENTER";
+
+  // Generic fallback — short, no jargon
+  return "ga ada yang lolos bar deploy";
+}
+
+function fmtSolShort(v) {
+  const n = num(v);
+  return n == null ? "?" : `${n.toFixed(2)} SOL`;
+}
+
+/**
+ * Build the terse 2–5 line Telegram screening notif.
+ *
+ * @param {object} funnel
+ *   - universe:   raw pool count scanned (number)
+ *   - passed:     candidates that reached the judge (number)
+ *   - deployed:   boolean
+ *   - poolName:   string (deploy path)
+ *   - amountSol:  number (deploy path)
+ *   - reason:     raw reason string (no-deploy path) — translated via plainReason
+ *   - skipped:    boolean — cycle never reached the funnel (pre-check skip)
+ *   - skipReason: raw reason for a pre-check skip
+ *   - at:         optional Date (defaults to now)
+ *
+ * Always returns 2–5 lines. Never throws.
+ */
+export function formatScreeningTerse(funnel = {}) {
+  const at = funnel.at instanceof Date ? funnel.at : new Date();
+  const lines = [`🔍 Screening ${wibTime(at)} WIB`];
+
+  // Pre-check skip (no funnel ran): 2 lines, plain reason.
+  if (funnel.skipped) {
+    lines.push(`Skip cycle: ${plainReason(funnel.skipReason)}`);
+    return lines.join("\n");
+  }
+
+  const universe = num(funnel.universe);
+  const passed = num(funnel.passed) ?? 0;
+  const universeStr = universe != null ? String(universe) : "?";
+
+  if (funnel.deployed) {
+    lines.push(`${universeStr} pool → ${passed} lolos → judge ENTER`);
+    const name = funnel.poolName || "?";
+    lines.push(`✅ DEPLOY: ${name} ${fmtSolShort(funnel.amountSol)}`);
+    return lines.join("\n");
+  }
+
+  lines.push(`${universeStr} pool → ${passed} lolos filter → judge`);
+  lines.push(`Hasil: NO DEPLOY (${plainReason(funnel.reason)})`);
+  return lines.join("\n");
+}
+
 // Convenience: detect whether Andromeda formatting is active. Lets callers
 // (index.js) keep a single source of truth for the flag check.
 export function andromedaEnabled(config) {
