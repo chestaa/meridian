@@ -434,10 +434,21 @@ export const config = {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
     maxSteps:    u.maxSteps    ?? 20,
-    // Orion cost fix (2026-06-01) — screening is lookup-heavy (candidates pre-loaded,
-    // active_bin pre-fetched); it needs at most pick→deploy→ack. A dedicated, lower cap
-    // bounds runaway/stall loops on the 97%-cost SCREENER without touching MANAGER/GENERAL.
-    screeningMaxSteps: u.screeningMaxSteps ?? 8,
+    // Orion step-budget fix (2026-06-13) — raised 8 → 16. The 8-step cap was
+    // starving completed deploys: a single ENTER candidate needs the enrichment
+    // batch (get_pool_detail + smart_wallets + token_holders + token_narrative —
+    // up to ~4 steps if the model doesn't parallelize) + deploy reasoning (1) +
+    // deploy_position (1) + one-line ACK after the tool result (1) = ~7 steps
+    // worst-case. At 8 the loop exhausted in enrichment BEFORE deploy_position
+    // → [SCREENER_STALL] "Orion ENTER but max-steps reached without deploy".
+    // 16 ≈ 2.3x realistic worst-case for a top-1 deploy — headroom without bloat.
+    // Cost stays flat: deploy_position is NO_RETRY (locks after first attempt) and
+    // the loop exits on ACK, so extra steps are consumed ONLY when a cycle actually
+    // deploys. No-ENTER cycles still exit in 1–2 steps. Stays < global maxSteps (20).
+    // Raising this does NOT bypass any safety: deploy still passes judge ENTER +
+    // Cassiopeia gates + executor.js hardcoded caps (maxDeployAmount, gasReserve,
+    // maxPositions, fresh-snapshot guard). Vega money-VETO on the deploy path holds.
+    screeningMaxSteps: u.screeningMaxSteps ?? 16,
     // Orion cost fix (2026-06-01) — cap how many scored candidates are rendered into the
     // SCREENER goal. Trims the dominant prompt-token driver; reporting still sees all.
     screeningPromptCandidateCap: u.screeningPromptCandidateCap ?? 5,

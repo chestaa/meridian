@@ -39,15 +39,26 @@ for (const tier of screeningTiers) {
   );
 }
 
-// 2. Step cap — screening must be tighter than the global default.
+// 2. Step cap — screening must stay bounded below the global default (cost guard),
+//    but ALSO be large enough to actually complete an enrichment + deploy sequence.
+//    Orion 2026-06-13: raised 8 → 16. At 8 the SCREENER loop exhausted in the
+//    enrichment batch BEFORE reaching deploy_position → [SCREENER_STALL] despite
+//    an Orion ENTER. A full top-1 deploy needs ~7 steps worst-case (enrichment
+//    batch + deploy reasoning + deploy_position + ACK), so the cap must clear that
+//    with buffer. Cost stays flat: deploy_position is NO_RETRY and the loop exits
+//    on ACK, so the extra budget is consumed only on cycles that actually deploy.
 check("screeningMaxSteps is defined", typeof config.llm.screeningMaxSteps === "number");
 check(
   `screeningMaxSteps (${config.llm.screeningMaxSteps}) < global maxSteps (${config.llm.maxSteps})`,
   config.llm.screeningMaxSteps < config.llm.maxSteps,
 );
 check(
-  `screeningMaxSteps (${config.llm.screeningMaxSteps}) <= 10`,
-  config.llm.screeningMaxSteps <= 10,
+  `screeningMaxSteps (${config.llm.screeningMaxSteps}) >= 12 (room for enrichment batch + deploy + ACK)`,
+  config.llm.screeningMaxSteps >= 12,
+);
+check(
+  `screeningMaxSteps (${config.llm.screeningMaxSteps}) <= 18 (still bounded — no runaway loop)`,
+  config.llm.screeningMaxSteps <= 18,
 );
 
 // 3. Prompt candidate cap — bounds the prompt-token bloat driver.
