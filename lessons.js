@@ -20,6 +20,43 @@ const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
 const MAX_MANUAL_LESSON_LENGTH = 400;
 
+// PIECE 2 — meaningful-profit bar (Lyra). A close counts a "win" in reporting
+// only when its TRUE realized SOL delta (net of IL+slippage+gas) clears this.
+// REPORTING ONLY — never gates exit/close/money. Reloadable via user-config.
+const DEFAULT_MIN_MEANINGFUL_PROFIT_SOL = 0.005;
+
+/**
+ * Read the meaningful-profit bar from user-config.json (reloadable), with a
+ * safe default. Pure read; never throws.
+ * @returns {number}
+ */
+function meaningfulProfitBarSol() {
+  try {
+    if (fs.existsSync(USER_CONFIG_PATH)) {
+      const u = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
+      const v = Number(u.minMeaningfulProfitSol);
+      if (Number.isFinite(v) && v >= 0) return v;
+    }
+  } catch { /* ignore — use default */ }
+  return DEFAULT_MIN_MEANINGFUL_PROFIT_SOL;
+}
+
+/**
+ * HONEST win test for a closed-position record (PIECE 2). Uses the TRUE realized
+ * SOL delta when present (net of IL+slippage+gas): a win is realized_sol_delta
+ * >= the meaningful bar — micro-profits below it are NOISE, not wins. Falls back
+ * to LP-PnL sign only when the record predates realized-SOL accounting.
+ * @param {object} r        - performance record
+ * @param {number} barSol   - meaningful-profit bar in SOL
+ * @returns {boolean}
+ */
+export function isMeaningfulWin(r, barSol = DEFAULT_MIN_MEANINGFUL_PROFIT_SOL) {
+  const realized = Number(r?.realized_sol_delta);
+  if (Number.isFinite(realized)) return realized >= barSol;
+  // Legacy fallback — no realized figure on this record. LP-PnL sign.
+  return Number(r?.pnl_usd ?? r?.pnl_pct ?? 0) > 0;
+}
+
 function normalizeLessonsData(raw) {
   const data = raw && typeof raw === "object" ? raw : {};
   return {
@@ -682,13 +719,18 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
     }));
 
   const totalPnl = filtered.reduce((s, r) => s + (r.pnl_usd ?? 0), 0);
-  const wins = filtered.filter((r) => r.pnl_usd > 0).length;
+  // PIECE 2 — honest win count: realized SOL >= meaningful bar (NOISE excluded).
+  // Re-read the raw records (filtered is projected) so realized_sol_delta survives.
+  const bar = meaningfulProfitBarSol();
+  const rawInWindow = p.filter((r) => r.recorded_at >= cutoff).slice(-limit);
+  const wins = rawInWindow.filter((r) => isMeaningfulWin(r, bar)).length;
 
   return {
     hours,
     count: filtered.length,
     total_pnl_usd: Math.round(totalPnl * 100) / 100,
     win_rate_pct: filtered.length > 0 ? Math.round((wins / filtered.length) * 100) : null,
+    win_bar_sol: bar,
     positions: filtered,
   };
 }

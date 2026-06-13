@@ -32,6 +32,30 @@ const judgeTool = {
   },
 };
 
+/**
+ * PIECE 1 — profit-share hint for the signal judge. Local copy (signal-judge
+ * stays decoupled from the heavier agents/orion.js graph). Our take ≈
+ * our_position / pool_TVL. Signals rarely carry TVL, so this is usually null
+ * (neutral — the prompt factor still applies via mcap reasoning). FAIL-SAFE:
+ * missing/zero/non-finite TVL or position → null (never fabricate).
+ *
+ * @param {number} positionSol  probe size in SOL (default 0.05 live cap)
+ * @param {number} tvlUsd       pool TVL in USD if the signal carries it
+ * @param {number} solUsd       SOL/USD price (optional)
+ * @returns {{ fee_share_pct: number, tier: string }|null}
+ */
+export function signalProfitShareHint(positionSol, tvlUsd, solUsd = null) {
+  const pos = Number(positionSol);
+  const tvl = Number(tvlUsd);
+  if (!Number.isFinite(pos) || pos <= 0) return null;
+  if (!Number.isFinite(tvl) || tvl <= 0) return null;
+  const price = Number.isFinite(Number(solUsd)) && Number(solUsd) > 0 ? Number(solUsd) : null;
+  const posValue = price != null ? pos * price : pos;
+  const sharePct = (posValue / tvl) * 100;
+  const tier = sharePct < 0.05 ? "micro" : sharePct < 0.2 ? "thin" : "healthy";
+  return { fee_share_pct: Number(sharePct.toFixed(4)), tier };
+}
+
 export async function judgeSignalWithLlm(signal, preScore, options = {}) {
   if (!client) {
     return {
@@ -86,12 +110,35 @@ export async function judgeSignalWithLlm(signal, preScore, options = {}) {
           "This is dry-run unless explicitly stated otherwise.",
           "Prefer skip when distribution, holders, or liquidity quality is unclear.",
           "Never recommend more than 0.05 SOL for a first live probe.",
+          // ── Profit-potential factor (NOT a hard gate) ────────────────────────
+          // A signal can pass every risk filter and still be UNECONOMIC for our
+          // tiny probe. Our take ≈ our_position / pool_TVL × pool_fees × time-in-range.
+          "PROFIT-POTENTIAL FACTOR (weigh it; do NOT skip on it alone): our probe is small",
+          "(<= 0.05 SOL live, ~0.18 SOL when scaled). Profit ≈ (our_position / pool_TVL) ×",
+          "pool_fees × time-in-range. GREEN: fee/TVL >= 0.10 AND pool TVL small enough that",
+          "our share is non-trivial -> meaningful profit, lean enter. RED: pool TVL huge vs",
+          "our position so our fee share is micro (< ~0.05% of the pool) -> our take is dust",
+          "($0.001-class micro-profit), not worth gas + IL even if the token looks safe ->",
+          "prefer skip or watch. Use the profitShare hint in the payload if present (tier =",
+          "micro|thin|healthy). It is ONE factor: never skip a clearly strong signal just",
+          "because TVL is large; only let a micro share demote an otherwise borderline one.",
           "Use the tool exactly once.",
         ].join(" "),
       },
       {
         role: "user",
-        content: JSON.stringify({ signal, deterministicScore: preScore }, null, 2),
+        content: JSON.stringify({
+          signal,
+          deterministicScore: preScore,
+          // PIECE 1 — pre-chewed profit-share hint (null when the signal carries
+          // no TVL; the prompt's profit factor still applies via mcap reasoning).
+          // Probe size = 0.05 SOL live cap (this judge's hard ceiling).
+          profitShare: signalProfitShareHint(
+            0.05,
+            signal?.poolTvlUsd ?? signal?.tvlUsd ?? signal?.tvl ?? null,
+            signal?.solUsd ?? options?.solUsd ?? null,
+          ),
+        }, null, 2),
       },
     ],
     tools: [judgeTool],

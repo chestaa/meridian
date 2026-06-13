@@ -17,6 +17,77 @@ const ROOT = path.join(__dirname, "..");
 const DEFAULT_MIN_ORGANIC = 60;
 const DEFAULT_MIN_FEE_ACTIVE_TVL_RATIO = 0.05;
 
+// PIECE 2 — meaningful-profit reporting bar (Lyra tiers). The win-rate counts a
+// trade a "win" ONLY when its TRUE realized SOL delta clears NOISE. ~$0.75 = 0.005 SOL.
+const DEFAULT_MIN_MEANINGFUL_PROFIT_SOL = 0.005;
+const PROFIT_TIER_MARGINAL_SOL = 0.005; // >= this = MARGINAL (also = the win bar)
+const PROFIT_TIER_REAL_SOL     = 0.02;   // >= this = REAL
+const PROFIT_TIER_MEANINGFUL_SOL = 0.05; // >= this = MEANINGFUL
+
+/**
+ * The TRUE realized SOL delta for a closed record — net of IL + close-swap
+ * slippage + gas (realized-sol.js). This is the HONEST economic outcome, NOT
+ * the price-only LP-PnL. Returns null when the record predates realized-SOL
+ * accounting or the figure couldn't be computed (caller then falls back).
+ * @param {object} r - a lessons.performance record
+ * @returns {number|null}
+ */
+export function realizedSolOf(r) {
+  if (!r || typeof r !== "object") return null;
+  const v = r.realized_sol_delta;
+  return Number.isFinite(Number(v)) ? Number(v) : null;
+}
+
+/**
+ * Classify a closed trade by its realized SOL delta into Lyra's honesty tiers.
+ * Answers Bro's "$0.001 dianggap profit" — a $0.001-class net is NOISE, not a win.
+ *   LOSS      : realized < 0
+ *   NOISE     : 0 <= realized < 0.005  (gas + IL ate it — NOT a win)
+ *   MARGINAL  : 0.005 <= realized < 0.02
+ *   REAL      : 0.02 <= realized < 0.05
+ *   MEANINGFUL: realized >= 0.05
+ * Returns "UNKNOWN" when no realized figure exists (record predates accounting).
+ * @param {number|null} realizedSol
+ * @returns {"LOSS"|"NOISE"|"MARGINAL"|"REAL"|"MEANINGFUL"|"UNKNOWN"}
+ */
+export function profitTier(realizedSol) {
+  // null/undefined/"" all coerce to a finite Number via Number(), so guard them
+  // explicitly — a record with no realized figure is UNKNOWN, never NOISE/0.
+  if (realizedSol == null || realizedSol === "") return "UNKNOWN";
+  if (!Number.isFinite(Number(realizedSol))) return "UNKNOWN";
+  const v = Number(realizedSol);
+  if (v < 0) return "LOSS";
+  if (v < PROFIT_TIER_MARGINAL_SOL) return "NOISE";
+  if (v < PROFIT_TIER_REAL_SOL) return "MARGINAL";
+  if (v < PROFIT_TIER_MEANINGFUL_SOL) return "REAL";
+  return "MEANINGFUL";
+}
+
+/**
+ * HONEST win classifier (PIECE 2). A trade counts as a WIN only when its TRUE
+ * realized SOL delta clears the meaningful-profit bar. Micro-profits (NOISE)
+ * are explicitly NOT wins. When the record has no realized figure we FALL BACK
+ * to the legacy LP-PnL sign (so older records still classify) but flag it.
+ * @param {object} r        - lessons.performance record
+ * @param {number} minWinSol - meaningful-profit bar in SOL (config.minMeaningfulProfitSol)
+ * @returns {{ win: boolean, basis: "realized"|"lp_fallback", tier: string, realizedSol: number|null }}
+ */
+export function classifyTrade(r, minWinSol = DEFAULT_MIN_MEANINGFUL_PROFIT_SOL) {
+  const realizedSol = realizedSolOf(r);
+  if (realizedSol != null) {
+    return {
+      win: realizedSol >= minWinSol,
+      basis: "realized",
+      tier: profitTier(realizedSol),
+      realizedSol,
+    };
+  }
+  // Legacy fallback — no realized SOL on this record. Use LP-PnL sign so the
+  // record still classifies, but mark the basis so callers can disclose it.
+  const lp = Number(r?.pnl_usd ?? r?.pnl_pct ?? 0);
+  return { win: lp > 0, basis: "lp_fallback", tier: "UNKNOWN", realizedSol: null };
+}
+
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(path.join(ROOT, file), "utf8")); }
   catch { return null; }
@@ -145,12 +216,19 @@ export function buildBalanceSection(solBalance, solUsd, pubkey) {
 }
 
 /**
- * Trading performance section. (BUG 2 fix.)
+ * Trading performance section. (BUG 2 fix + PIECE 2 honest win-rate.)
  *
  * Headline win-rate now comes from LIVE closes only (lessons.performance
  * where source !== "paper"), windowed to recent activity — NOT the frozen
  * paper-trades.json blind-scanner batch (47 trades from May 2026 that
  * polluted the old all-time number into 14W/33L, -8.3%).
+ *
+ * PIECE 2 — HONEST win-rate. A trade counts a WIN only when its TRUE realized
+ * SOL delta (net of IL + slippage + gas, NOT LP-only PnL) clears the
+ * meaningful-profit bar (config.minMeaningfulProfitSol, default 0.005 SOL ~ $0.75).
+ * Micro-profits below that are NOISE — gas + IL ate them — and are shown as
+ * breakeven, NOT a win. This answers "$0.001 dianggap profit". A tier breakdown
+ * (NOISE/MARGINAL/REAL/MEANINGFUL) is surfaced so the distribution stays honest.
  *
  * Paper sim results are shown separately and clearly labelled as practice,
  * so losses are never hidden — just attributed honestly.
@@ -159,8 +237,9 @@ export function buildBalanceSection(solBalance, solUsd, pubkey) {
  * @param {Array} paperTrades - paper-trades.json rows (closed sim trades)
  * @param {number} openCount  - currently open positions
  * @param {number} windowDays - recency window for the live headline (default 30)
+ * @param {number} minWinSol  - meaningful-profit bar in SOL (default 0.005)
  */
-export function buildTradeSection(liveRecords, paperTrades, openCount = 0, windowDays = 30) {
+export function buildTradeSection(liveRecords, paperTrades, openCount = 0, windowDays = 30, minWinSol = DEFAULT_MIN_MEANINGFUL_PROFIT_SOL) {
   const recs = Array.isArray(liveRecords) ? liveRecords : [];
   const cutoff = Date.now() - windowDays * 86_400_000;
   const live = recs.filter(r => r && r.source !== "paper");
@@ -168,22 +247,39 @@ export function buildTradeSection(liveRecords, paperTrades, openCount = 0, windo
     const ts = Date.parse(r.recorded_at || r.closed_at || "");
     return Number.isFinite(ts) && ts >= cutoff;
   });
-  const liveWins = liveRecent.filter(r => (r.pnl_usd ?? r.pnl_pct ?? 0) > 0).length;
+
+  // HONEST classification — realized-SOL-based win bar (PIECE 2).
+  const classed = liveRecent.map(r => classifyTrade(r, minWinSol));
+  const liveWins = classed.filter(c => c.win).length;
   const liveWinRate = liveRecent.length ? Math.round((liveWins / liveRecent.length) * 100) : null;
   const liveAvgPct = liveRecent.length
     ? (liveRecent.reduce((s, r) => s + (r.pnl_pct ?? 0), 0) / liveRecent.length)
     : null;
+  // Net realized SOL across the window — the number Bro actually banks.
+  const realizedRecs = classed.filter(c => c.realizedSol != null);
+  const netRealizedSol = realizedRecs.reduce((s, c) => s + c.realizedSol, 0);
+  // Tier distribution (only counts records that HAVE a realized figure).
+  const tierCounts = { LOSS: 0, NOISE: 0, MARGINAL: 0, REAL: 0, MEANINGFUL: 0 };
+  for (const c of realizedRecs) { if (tierCounts[c.tier] != null) tierCounts[c.tier]++; }
+  const noiseCount = classed.filter(c => c.tier === "NOISE").length;
 
   const lines = [`📊 Hasil Trading (real money)`];
   if (openCount > 0) lines.push(`▶️ Posisi aktif sekarang: <b>${openCount}</b>`);
 
   if (liveRecent.length > 0) {
     const liveLosses = liveRecent.length - liveWins;
-    lines.push(`✅ Menang: ${liveWins}  ❌ Kalah: ${liveLosses}  (dari ${liveRecent.length} posisi ${windowDays} hari terakhir)`);
-    lines.push(`🎯 Tingkat kemenangan: <b>${liveWinRate}%</b>`);
+    lines.push(`✅ Menang: ${liveWins}  ❌ Kalah/impas: ${liveLosses}  (dari ${liveRecent.length} posisi ${windowDays} hari terakhir)`);
+    lines.push(`🎯 Tingkat kemenangan: <b>${liveWinRate}%</b> <i>(menang = profit nyata ≥ ${minWinSol} SOL bersih)</i>`);
+    if (noiseCount > 0) {
+      lines.push(`<i>⚠️ ${noiseCount} trade untung tipis &lt; ${minWinSol} SOL — dihitung impas (gas+IL makan), bukan menang.</i>`);
+    }
+    if (realizedRecs.length > 0) {
+      lines.push(`💰 Profit bersih (real, sudah dikurangi IL+slippage+gas): <b>${netRealizedSol >= 0 ? "+" : ""}${netRealizedSol.toFixed(4)} SOL</b>`);
+      lines.push(`<i>Sebaran: MEANINGFUL ${tierCounts.MEANINGFUL} · REAL ${tierCounts.REAL} · MARGINAL ${tierCounts.MARGINAL} · NOISE ${tierCounts.NOISE} · RUGI ${tierCounts.LOSS}</i>`);
+    }
     if (liveAvgPct != null) {
       const verb = liveAvgPct >= 0 ? "untung" : "rugi";
-      lines.push(`📈 Rata-rata per posisi: <b>${liveAvgPct >= 0 ? "+" : ""}${liveAvgPct.toFixed(1)}%</b> (${verb})`);
+      lines.push(`📈 Rata-rata LP-PnL per posisi: <b>${liveAvgPct >= 0 ? "+" : ""}${liveAvgPct.toFixed(1)}%</b> (${verb}) <i>(harga saja, bukan SOL bersih)</i>`);
     }
   } else {
     lines.push(`Belum ada posisi sungguhan yang ditutup dalam ${windowDays} hari terakhir.`);
@@ -461,7 +557,12 @@ async function runBossReport() {
   const balSection = buildBalanceSection(solBalance, solUsd, burnerPubkey);
 
   const livePerf = Array.isArray(lessonsState?.performance) ? lessonsState.performance : [];
-  const tradeSection = buildTradeSection(livePerf, tradeArr, openLiveCount, 30);
+  // PIECE 2 — honest win bar from config (reloadable). Falls back to the default
+  // when user-config.json doesn't set it.
+  const minWinSol = Number.isFinite(Number(userConfig.minMeaningfulProfitSol))
+    ? Number(userConfig.minMeaningfulProfitSol)
+    : DEFAULT_MIN_MEANINGFUL_PROFIT_SOL;
+  const tradeSection = buildTradeSection(livePerf, tradeArr, openLiveCount, 30, minWinSol);
 
   const signalSection = (() => {
     const lines = [`📡 Sinyal Discord`];

@@ -15,7 +15,7 @@
 
 import "dotenv/config";
 import OpenAI from "openai";
-import { config } from "../config.js";
+import { config, computeDeployAmount } from "../config.js";
 import { pickModel } from "../agent.js";
 import { log } from "../logger.js";
 import { recordLlmUsage } from "../llm-usage.js";
@@ -63,6 +63,21 @@ const SYSTEM_PROMPT = [
   "smart wallet presence (boost), pool memory cooldowns (heavy penalty if recent OOR/loss),",
   "launchpad reputation, and mcap band.",
   "Prefer skip when distribution/liquidity quality is unclear or volatility is 0/null.",
+  // ── Profit-potential factor (NOT a hard gate) ──────────────────────────────
+  // A pool can be perfectly SAFE yet still uneconomic for OUR small position. We
+  // earn roughly: our_position / pool_TVL  ×  pool_fees  ×  time_in_range. So the
+  // SAME fee/TVL ratio pays us far more in a small-TVL pool than a huge-TVL pool,
+  // because our share of the fees scales with our_position/TVL.
+  "PROFIT-POTENTIAL FACTOR (weigh it, do NOT hard-reject on it alone): your profit",
+  "≈ (our_position / pool_TVL) × pool_fees × time_in_range. Use our_position_sol from",
+  "the payload (our typical deploy). GREEN flag: fee/TVL >= 0.10 AND pool TVL small enough",
+  "that our_position/TVL gives a non-trivial fee share -> meaningful profit, lean enter.",
+  "RED flag: pool TVL so large vs our_position that our fee share is micro (< ~0.05% of",
+  "the pool) -> our take is dust ($0.001-class micro-profit), economically not worth the",
+  "gas + IL risk even if the pool is 'safe' -> lower confidence / prefer skip. This is a",
+  "FACTOR among many, not a new gate: a strong pool with healthy fee/TVL and decent volume",
+  "still enters even at larger TVL — only let micro-share DEMOTE a pool that is otherwise",
+  "merely borderline. Never skip a clearly good pool solely on TVL size (no dormancy).",
   "confidence is 0-100. reason <= 400 chars, specific and terse.",
   "If you'd enter, suggest recommended_bins_below in [35,69]: low vol -> 35, vol>=5 -> 69, linear.",
 ].join(" ");
@@ -114,6 +129,45 @@ function skipVerdict(pool_address, reason) {
   return { pool_address, decision: "skip", confidence: 0, reason };
 }
 
+/**
+ * Pure profit-share hint for the judge prompt (PIECE 1).
+ *
+ * Computes a DETERMINISTIC, pre-chewed estimate of how much of the pool's fee
+ * flow OUR position would capture — small LLMs are unreliable at arithmetic, so
+ * we hand them the share % + a tier word instead of asking them to divide.
+ *
+ *   fee_share_pct ≈ our_position_sol / pool_tvl_sol  (× 100)
+ *
+ * This is the multiplier on pool fees that lands in OUR pocket. A huge-TVL pool
+ * shrinks it toward dust regardless of fee/TVL ratio → the $0.001 micro-profit
+ * trap Bro hates. A small-TVL pool with healthy fee/TVL makes it meaningful.
+ *
+ * FAIL-SAFE (anti-pattern #2): missing/zero/non-finite TVL or position → null
+ * (NEUTRAL — no hint, the LLM falls back to its other factors; never fabricate).
+ * NOT a gate: returns a hint object only; the decision stays with the LLM.
+ *
+ * @param {number} positionSol  our typical deploy size in SOL
+ * @param {number} tvlUsd        pool TVL in USD
+ * @param {number} solUsd        SOL/USD price (to convert position to USD); default 1 keeps it unitless-safe
+ * @returns {{ fee_share_pct: number, tier: string }|null}
+ */
+export function profitShareHint(positionSol, tvlUsd, solUsd = null) {
+  const pos = Number(positionSol);
+  const tvl = Number(tvlUsd);
+  if (!Number.isFinite(pos) || pos <= 0) return null;
+  if (!Number.isFinite(tvl) || tvl <= 0) return null;
+  // Convert our position to the SAME unit as TVL (USD) when a price is known;
+  // when no price is available, compare raw (the RATIO's tier thresholds are
+  // chosen to be robust to the unit since TVL >> position either way).
+  const price = Number.isFinite(Number(solUsd)) && Number(solUsd) > 0 ? Number(solUsd) : null;
+  const posValue = price != null ? pos * price : pos;
+  const sharePct = (posValue / tvl) * 100;
+  // Tiers: micro share = dust; thin = marginal; healthy = meaningful capture.
+  // 0.05% is the RED line from Bro's brief (our take below it = $0.001-class).
+  const tier = sharePct < 0.05 ? "micro" : sharePct < 0.2 ? "thin" : "healthy";
+  return { fee_share_pct: Number(sharePct.toFixed(4)), tier };
+}
+
 async function judgeOne(candidate, context) {
   const pool_address = candidate.pool?.pool;
   if (!pool_address) return skipVerdict("unknown", "missing pool address");
@@ -130,9 +184,25 @@ async function judgeOne(candidate, context) {
   }
 
   const summary = compactCandidate(candidate);
+
+  // PIECE 1 — profit-share hint. Our economic take ≈ our_position/TVL × pool fees.
+  // Size our typical deploy from the live wallet when known (computeDeployAmount),
+  // else the configured floor. Then hand the LLM a pre-computed fee-share % + tier
+  // so it weighs micro-profit ($0.001 trap) WITHOUT having to do arithmetic.
+  const walletSol = Number(context?.portfolio?.sol);
+  const ourPositionSol = Number.isFinite(walletSol) && walletSol > 0
+    ? computeDeployAmount(walletSol)
+    : (config.management?.deployAmountSol ?? 0.5);
+  const tvlUsd = summary?.metrics?.tvl ?? null;
+  const solUsd = Number(context?.solUsd);
+  const share = profitShareHint(ourPositionSol, tvlUsd, Number.isFinite(solUsd) ? solUsd : null);
+
   const userPayload = {
     portfolio_sol: context?.portfolio?.sol ?? null,
     open_positions: context?.positions?.total_positions ?? null,
+    our_position_sol: Number(ourPositionSol.toFixed(3)),
+    // null when TVL/position unknown → LLM ignores the factor (fail-safe neutral).
+    profit_share: share, // { fee_share_pct, tier } | null
     candidate: summary,
   };
 

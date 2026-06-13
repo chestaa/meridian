@@ -14,6 +14,13 @@ import { Connection, PublicKey } from '@solana/web3.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..');
 
+// PIECE 2 — meaningful-profit bar (Lyra). REPORTING ONLY. A close counts a "win"
+// only when its TRUE realized SOL delta clears this (NOISE below = not a win).
+// This pure lib does not import config; the bar is read from user-config.json by
+// the live report and lessons.js. Here we use the agreed default constant so the
+// snapshot stays self-contained and honest. ~$0.75 at 150 SOL/USD.
+const MEANINGFUL_PROFIT_BAR_SOL = 0.005;
+
 export const BURNER_PUBKEY = process.env.SNAPSHOT_PUBKEY
   || 'DgA9MZYEsmbyZ7kLt9epZ7z3Eu8nv5FH8paHz66v1Hiu';
 
@@ -140,22 +147,23 @@ export function summarizeClosed(lessonsJson, windowMs, nowMs = Date.now()) {
     }
     pnlSum += pnlSol;
 
-    const realizedDelta = typeof r.realized_sol_delta === 'number' && isFinite(r.realized_sol_delta)
-      ? r.realized_sol_delta
-      : pnlSol;
+    const hasRealized = typeof r.realized_sol_delta === 'number' && isFinite(r.realized_sol_delta);
+    const realizedDelta = hasRealized ? r.realized_sol_delta : pnlSol;
     realizedSum += realizedDelta;
 
-    // Win definition: pnl_pct > 0 primary; fallback pnl_sol > 0;
-    // also count exits flagged with "Trailing TP" close_reason as wins.
-    const reason = String(r.close_reason || '').toLowerCase();
-    const isTrailingTP = reason.includes('trailing tp');
-    let isWin = false;
-    if (typeof r.pnl_pct === 'number' && isFinite(r.pnl_pct)) {
+    // PIECE 2 — HONEST win definition. A win requires TRUE realized SOL (net of
+    // IL+slippage+gas) >= the meaningful-profit bar (MEANINGFUL_PROFIT_BAR_SOL).
+    // Micro-profits below it are NOISE, not wins ($0.001-class). Falls back to
+    // LP-PnL sign ONLY when the record predates realized-SOL accounting.
+    let isWin;
+    if (hasRealized) {
+      isWin = r.realized_sol_delta >= MEANINGFUL_PROFIT_BAR_SOL;
+    } else if (typeof r.pnl_pct === 'number' && isFinite(r.pnl_pct)) {
       isWin = r.pnl_pct > 0;
     } else {
       isWin = pnlSol > 0;
     }
-    if (isWin || isTrailingTP) wins++;
+    if (isWin) wins++;
   }
 
   return {

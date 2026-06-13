@@ -354,6 +354,14 @@ export const config = {
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
+    // ─── PIECE 2 — Meaningful-profit reporting bar (Lyra + Orion) ───
+    // REPORTING THRESHOLD ONLY — does NOT touch exit/close/money logic. A closed
+    // trade whose TRUE realized SOL delta (net of IL + slippage + gas, NOT
+    // LP-only PnL) is below this is NOISE: gas + IL ate it, so it is NOT counted
+    // a "win" in the honest win-rate. Answers Bro's "$0.001 dianggap profit"
+    // complaint. Tiers (realized SOL): NOISE < 0.005, MARGINAL 0.005-0.02,
+    // REAL >= 0.02, MEANINGFUL >= 0.05. Reloadable. ~$0.75 at 150 SOL/USD.
+    minMeaningfulProfitSol: u.minMeaningfulProfitSol ?? 0.005,
   },
 
   // ─── DAMM v2 Idle-Reserve Parking (item 8, BRAND NEW — flag OFF) ──
@@ -695,6 +703,7 @@ export function reloadScreeningThresholds() {
     if (fresh.tokenAgeSweetSpotLowHours  != null) s.tokenAgeSweetSpotLowHours  = fresh.tokenAgeSweetSpotLowHours;
     if (fresh.tokenAgeSweetSpotHighHours != null) s.tokenAgeSweetSpotHighHours = fresh.tokenAgeSweetSpotHighHours;
     if (fresh.requireSolQuote     !== undefined) s.requireSolQuote = fresh.requireSolQuote;
+    if (fresh.minMeaningfulProfitSol != null) config.management.minMeaningfulProfitSol = fresh.minMeaningfulProfitSol;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;
