@@ -1,28 +1,28 @@
 {
-  "ts": "2026-06-14T05:53:02.269Z",
+  "ts": "2026-06-14T05:58:04.299Z",
   "wallet": {
     "pubkey": "DgA9MZ…1Hiu",
-    "sol_free": 0.59888,
+    "sol_free": 0.817529,
     "tokens": []
   },
   "summary": {
     "open_count": 0,
     "open_total_value_sol": 0,
     "open_aggregate_pnl_pct": 0,
-    "closed_24h_count": 0,
-    "closed_24h_pnl_sum_sol": 0,
-    "closed_24h_realized_sol_sum": 0,
-    "closed_7d_count": 10,
-    "closed_7d_pnl_sum_sol": 0.01435,
-    "closed_7d_realized_sol_sum": -0.014949,
-    "win_rate_24h": null,
-    "win_rate_7d": 0.2
+    "closed_24h_count": 1,
+    "closed_24h_pnl_sum_sol": -0.01935,
+    "closed_24h_realized_sol_sum": -0.019938,
+    "closed_7d_count": 11,
+    "closed_7d_pnl_sum_sol": -0.005,
+    "closed_7d_realized_sol_sum": -0.034887,
+    "win_rate_24h": 0,
+    "win_rate_7d": 0.18
   },
   "circuit_breaker": {
     "halted": false,
-    "realized_loss_sol": 0
+    "realized_loss_sol": 0.019342
   },
-  "llm_cost_24h_usd": 0.2579,
+  "llm_cost_24h_usd": 0.2591,
   "services_active": [
     "meridian",
     "signal-runner",
