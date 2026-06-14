@@ -1,0 +1,5 @@
+- [Reference: Headroom tool](reference-headroom-tool.md) — LLM context compressor (chopratejas/headroom, npm headroom-ai); proxy-required thin client; Orion verdict NO-GO for now
+- [Reference: Meridian LLM pipelines](reference-meridian-llm-pipelines.md) — the 3 LLM call sites + which are safe (free-text) vs unsafe (structured/schema) to compress
+- [Reference: DLMM profit benchmarks](reference-dlmm-profit-benchmarks.md) — fee/TVL "KING" 0.20 line, bin-step bands, distribution choice + sources for judge-prompt profit calibration
+- [Reference: profit-potential factor + win bar](reference-profit-potential-and-win-bar.md) — PIECE 1 profit-share judge factor (tier thresholds, anti-dormancy, FACTOR not gate) + PIECE 2 honest realized-SOL win bar (minMeaningfulProfitSol 0.005, Lyra tiers, files)
+- [Reference: SCREENER step budget](reference-screening-step-budget.md) — screeningMaxSteps 8->16 (flat-key read gotcha, why 16, cost flat, bypasses no safety, prefetch follow-up flagged)

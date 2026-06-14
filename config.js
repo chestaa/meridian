@@ -91,10 +91,15 @@ export const config = {
   // ─── Pool Screening Thresholds ───────────
   screening: {
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
-    // Intel adoption — modest floor bump toward the fee/TVL "king" line (0.20)
-    // WITHOUT hard-gating it. Base default 0.05→0.06 (paper headroom kept); live
-    // overlay carries 0.10 (was 0.08). High fee/TVL is rewarded via the
-    // feeTvlHighBonus SCORE BONUS, not a punishing 0.20 reject floor (dormancy).
+    // IL-coverage floor (Cassiopeia, 2026-06-14, evidence-based). yunus thesis:
+    // fee/TVL below ~0.20 does not cover IL → LP loses by math (the win-tiny/loss-big
+    // asymmetry Bro observed). Live-universe calibration (1h, 1000 dlmm) showed the
+    // deployable set is BIMODAL, not floor-hugging: of 11 native-band pools >=0.10,
+    // 9 are >=0.15 (82% throughput retained) — the marginal 0.10-0.20 sub-IL zone held
+    // only ~3 pools. So raising the floor toward IL-coverage costs ~no throughput while
+    // killing the structural loss. user-config sets base 0.13 / live overlay 0.15; the
+    // >=0.20 "king" tier is further favored by feeTvlHighBonus. Base DEFAULT stays 0.06
+    // as a safety fallback only — the real floor is the user-config overlay (0.13/0.15).
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.06,
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,

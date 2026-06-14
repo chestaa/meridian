@@ -368,19 +368,36 @@ try {
       assert.equal(r.action, "OUT_OF_RANGE");
     });
   }
-  // ON + high organic → REBALANCE_OOR signal (needs_design). Confirms gate works.
+  // ON + high organic + under cap → REBALANCE_OOR signal (re-center wired).
   {
     const addr = "RBL22222222222222222222222222222222222222222";
     writeState({ [addr]: trackedFixture(addr, {
       organic_score: 90,
+      rebalance_count: 0,
       partial_tp_done: true,
       out_of_range_since: new Date(Date.now() - 30 * 60000).toISOString(),
     }) });
-    const r = updatePnlAndCheckExits(addr, { pnl_pct: 1, in_range: false }, { ...MGMT, rebalanceOnOorEnabled: true });
-    check("flag ON + organic 90 → REBALANCE_OOR (needs_design, opt-in only)", () => {
+    const r = updatePnlAndCheckExits(addr, { pnl_pct: 1, in_range: false }, { ...MGMT, rebalanceOnOorEnabled: true, maxRebalances: 3 });
+    check("flag ON + organic 90 + count 0/3 → REBALANCE_OOR (opt-in, under cap)", () => {
       assert.ok(r);
       assert.equal(r.action, "REBALANCE_OOR");
-      assert.equal(r.needs_design, true);
+      assert.equal(r.rebalance_count, 0);
+      assert.equal(r.max_rebalances, 3);
+    });
+  }
+  // ON + high organic + cap HIT → OUT_OF_RANGE (anti-churn fallback).
+  {
+    const addr = "RBL22b2222222222222222222222222222222222222";
+    writeState({ [addr]: trackedFixture(addr, {
+      organic_score: 90,
+      rebalance_count: 3,
+      partial_tp_done: true,
+      out_of_range_since: new Date(Date.now() - 30 * 60000).toISOString(),
+    }) });
+    const r = updatePnlAndCheckExits(addr, { pnl_pct: 1, in_range: false }, { ...MGMT, rebalanceOnOorEnabled: true, maxRebalances: 3 });
+    check("flag ON + organic 90 + count 3 == max → OUT_OF_RANGE (cap hit)", () => {
+      assert.ok(r);
+      assert.equal(r.action, "OUT_OF_RANGE");
     });
   }
   // ON + LOW organic → still OUT_OF_RANGE (rebalance only for high-organic).

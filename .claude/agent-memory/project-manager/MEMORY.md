@@ -1,0 +1,2 @@
+- [Study fully before recommending](feedback-study-fully-before-recommending.md) — read core material (incl attachments/linked) before any skip/adopt verdict; no conclusion on unread data
+- [Deploy: restart ALL services](reference-deploy-restart-all-services.md) — code deploy must restart meridian + signal-runner + auto-screener; autopull updates files not running processes (18-day stale screener incident)

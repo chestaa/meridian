@@ -1,2 +1,4 @@
 - [Telegram reporting inventory](telegram-reporting-inventory.md) — Full map of Telegram notif paths + boss-report timer install 2026-05-16
 - [VPS SSH canonical path](vps-ssh-canonical-path.md) — Use C:\Users\Pradikta Andrianto\.ssh\meridian_vps_ed25519 + root@124.156.202.109; never ./vps-key
+- [Counterfactual data sources](counterfactual-data-sources.md) — Blocked-pool addresses NOT in logs/pool-memory; resolve via DexScreener search by short pool ID
+- [Realized PnL source of truth](realized-pnl-source-of-truth.md) — Per-trade PnL in lessons.json performance[] on VPS (NOT state.json peak-only); filter source!=="paper" for real money

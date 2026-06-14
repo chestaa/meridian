@@ -1,2 +1,12 @@
 - [Vega PR-3 deterministic deploy](vega-pr3-deterministic-deploy.md) — agents/vega.js dispatch path via executeTool; flag default OFF; 43-assertion test green
 - [executeTool seam pattern](executor-test-seam-pattern.md) — ESM namespace bindings can't be redefined; use exported __setForTests instead
+- [Partial TP + velocity VETOs cleared](vega-partial-tp-velocity-validation.md) — both money VETOs lifted 2026-05-30 via real DRY_RUN validation; how each was proven
+- [Realized SOL delta accounting](vega-realized-sol-accounting.md) — fix #1: TRUE economic SOL vs price-only lp_pnl; realized-sol.js; LIVE wallet-delta + PAPER sim; additive
+- [DAMM v2 idle-reserve parking](vega-damm-v2-idle-reserve.md) — item 8 scaffold; tools/damm-v2.js; @meteora-ag/cp-amm-sdk NOT installed; live VETO'd
+- [env-crypto AES-256-GCM](vega-env-crypto-aes-gcm.md) — lib/env-crypto.js + wallet-loader enc: prefix; non-breaking plaintext; live VETO'd pending out-of-band master key
+- [env-crypto Opt-B activation](vega-env-crypto-activation-optionB.md) — Bro override 2026-06-11 master-key-on-VPS root-600; TWO env-crypto systems (XOR envcrypt.js vs AES env-crypto.js) — Gate-0 verify before exec
+- [Volume-regime strategy spread](vega-volume-regime-strategy.md) — item (b); pickRegimeStrategy in dlmm.js; flag default OFF; volatility guard; 31+30 tests green; live VETO'd pending paper-soak
+- [Fast bid-ask bonus override](vega-fast-bidask-bonus.md) — item 1; isFastBidAskBonus in dlmm.js; flag OFF; timing override NOT new SDK shape; 34 tests green; live VETO'd
+- [maxPositions 1->2 envelope](vega-maxpositions-2-envelope.md) — APPROVED+shipped 2026-06-02; 2x0.20=0.40 exposure fits 0.856 wallet; per-pos cap+circuit unchanged; 22 tests
+- [Balance-read sentinel fail-closed](vega-balance-read-sentinel-failclosed.md) — getWalletBalances sol:null+error on read-fail (NOT 0); killed phantom drain alert + fail-open gates; 2-read confirm; 34 tests; shipped 2026-06-04
+- [maxPositions 2->3 @ 0.18 envelope](vega-maxpositions-3-envelope.md) — APPROVED+shipped 2026-06-07 f019ae1; 3x0.18+0.20=0.74 <= 0.90*0.851753; cap tightened 0.20->0.18; 76 tests

@@ -20,6 +20,8 @@ ssh -i "C:\Users\Pradikta Andrianto\.ssh\meridian_vps_ed25519" -o StrictHostKeyC
 
 Transient failure mode: first connection may return `Connection reset by peer` (server-side rate limit / brief blip). Retry once before declaring broken.
 
+**RECURRING DISAPPEARANCE (escalating):** the SSH material vanishes from this dev env intermittently. 2026-06-03: `~/.ssh/config` found EMPTY but key present (restored alias). 2026-06-04: ENTIRE `~/.ssh` directory ABSENT — no key, no config, no dir. When this happens an agent CANNOT reach the VPS at all; steps requiring SSH (HEAD confirm, manual run) must be reported as blocked, NOT fabricated. Always probe `Test-Path $env:USERPROFILE\.ssh` and `Test-Path ...\meridian_vps_ed25519` FIRST before any `ssh`. Bro must re-provision the key (from secure backup) into `~/.ssh/meridian_vps_ed25519` for SSH-dependent ops to resume.
+
 Suggested permanent hardening: add Host entry to `C:\Users\Pradikta Andrianto\.ssh\config`:
 ```
 Host meridian-vps

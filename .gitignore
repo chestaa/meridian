@@ -72,6 +72,12 @@ signals/processed/
 signals/rejected/
 signals/history/
 
+# Intel crawler output (Sirius — crawled social/chat content, keep out of git)
+intel/x/
+intel/telegram/
+intel/discord/
+intel/images/
+
 # Backtest reports
 backtest-reports/
 

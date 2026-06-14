@@ -24,9 +24,16 @@ A 0 read there = DATA-MISSING, not a real low score. Sirius's field-map fix (com
   gate probe sees real holders). For pools missing volatility OR base organic that clear
   every OTHER (no-API) gate, fetch native detail once (cached per pool_address, 5-min TTL
   — shorter than holder's 30min because volatility is time-sensitive), back-fill the gaps.
-- Lyra cost-aware: probe with passing sentinels for ONLY the missing gap fields; a pool
+- Lyra cost-aware: probe with passing sentinels for the missing gap fields; a pool
   that dies on mcap/volume/tvl/holders/bin_step/age gets NO native fetch (don't fetch
   detail for 41 discord pools if most die on mcap). Reuses the holder-enrich probe pattern.
+  CORRECTION (2026-06-11, [[enrich-probe-catch22-close]], commit 24e2ab5): this line
+  ORIGINALLY said the probe sentinels "ONLY the missing gap fields" (vol+organic). That
+  was the catch-22 — the probe gated created_at (+5 other fields) that the fetch back-fills,
+  so signal pools with no created_at were age-rejected IN the probe → fetch never fired
+  (0 fires for 2 cycles). FIXED: `buildEnrichProbe` now sentinels ALL nine back-fill
+  fields, and the back-fill block's missing-test was switched from `numeric` (===0 bug) to
+  `strictNumeric`. Test count 33 → 43.
 
 **CRITICAL secondary bug fixed:** `numeric(null) === 0` (`Number(null)===0`) meant the
 gate ALWAYS coerced missing organic/volatility to 0 → fell into the genuine-low branch,
