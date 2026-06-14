@@ -49,6 +49,24 @@ import { buildDigest, formatExecutiveDigest, gatherDigestData } from "./digest.j
 import { execSync } from "child_process";
 import fs from "fs";
 
+// Vega fix #1 — single source for the exit DECISION PnL. Prefers the
+// fee-inclusive net economic position (current value + fees − deposit, real IL
+// embedded) over the SDK price-only pnl_pct, matching updatePnlAndCheckExits.
+// Peak/trailing-drop confirmation MUST track the same metric as the exit
+// evaluator, else peak (price) vs current (fee-inclusive) mismatch corrupts the
+// trailing/drawdown deltas. FAIL-SAFE: missing fee-inclusive → reported pnl_pct.
+function decisionPnlPct(p) {
+  if (!p) return null;
+  if (
+    config.internalAgents?.feeInclusiveExitEnabled !== false &&
+    p.pnl_pct_fee_inclusive != null &&
+    Number.isFinite(Number(p.pnl_pct_fee_inclusive))
+  ) {
+    return Number(p.pnl_pct_fee_inclusive);
+  }
+  return p.pnl_pct ?? null;
+}
+
 const isMain = process.argv[1]
   ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
   : false;
@@ -278,7 +296,7 @@ function schedulePeakConfirmation(positionAddress) {
     try {
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       const position = result?.positions?.find((p) => p.position === positionAddress);
-      resolvePendingPeak(positionAddress, position?.pnl_pct ?? null, TRAILING_PEAK_CONFIRM_TOLERANCE);
+      resolvePendingPeak(positionAddress, decisionPnlPct(position), TRAILING_PEAK_CONFIRM_TOLERANCE);
     } catch (error) {
       log("state_warn", `Peak confirmation failed for ${positionAddress}: ${error.message}`);
     }
@@ -297,7 +315,7 @@ function scheduleTrailingDropConfirmation(positionAddress) {
       const position = result?.positions?.find((p) => p.position === positionAddress);
       const resolved = resolvePendingTrailingDrop(
         positionAddress,
-        position?.pnl_pct ?? null,
+        decisionPnlPct(position),
         config.management.trailingDropPct,
         TRAILING_DROP_CONFIRM_TOLERANCE_PCT,
       );
@@ -406,7 +424,7 @@ export async function runManagementCycle({ silent = false } = {}) {
     for (const p of positionData) {
       if (
         !p.pnl_pct_suspicious &&
-        queuePeakConfirmation(p.position, p.pnl_pct, { immediate: !shouldUsePnlRecheck() }) &&
+        queuePeakConfirmation(p.position, decisionPnlPct(p), { immediate: !shouldUsePnlRecheck() }) &&
         shouldUsePnlRecheck()
       ) {
         schedulePeakConfirmation(p.position);
@@ -1359,7 +1377,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
       for (const p of result.positions) {
         if (
           !p.pnl_pct_suspicious &&
-          queuePeakConfirmation(p.position, p.pnl_pct, { immediate: !shouldUsePnlRecheck() }) &&
+          queuePeakConfirmation(p.position, decisionPnlPct(p), { immediate: !shouldUsePnlRecheck() }) &&
           shouldUsePnlRecheck()
         ) {
           schedulePeakConfirmation(p.position);
@@ -1446,6 +1464,10 @@ function formatCandidates(candidates) {
 
 function getDeterministicCloseRule(position, managementConfig) {
   const tracked = getTrackedPosition(position.position);
+  // Vega fix #1 — SL/TP decide on the fee-inclusive net position (fallback to
+  // reported pnl_pct). pnlSuspect still guards on the price-only reported value
+  // (the divergence check is about SDK reporting, not the economic metric).
+  const decisionPnl = decisionPnlPct(position);
   const pnlSuspect = (() => {
     if (position.pnl_pct == null) return false;
     if (position.pnl_pct > -90) return false;
@@ -1456,10 +1478,10 @@ function getDeterministicCloseRule(position, managementConfig) {
     return false;
   })();
 
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
+  if (!pnlSuspect && decisionPnl != null && decisionPnl <= managementConfig.stopLossPct) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
+  if (!pnlSuspect && decisionPnl != null && decisionPnl >= managementConfig.takeProfitPct) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (

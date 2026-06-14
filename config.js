@@ -511,6 +511,20 @@ export const config = {
     // any deploy/close behavior, TX, DRY_RUN, or risk constant. Default ON; flip
     // false for silent revert to lp_pnl-only reporting. See realized-sol.js.
     realizedSolAccounting: u.internalAgents?.realizedSolAccounting ?? true,
+    // Vega fix #1 — fee-inclusive exit decision metric. When ON (default), all
+    // PnL-based exit rules (SL / TP / trailing / partial / velocity / drawdown)
+    // decide on the NET economic position (price + fees − IL) instead of the
+    // PRICE-ONLY proxy. Root-cause of the 1:2 loss/win asymmetry: SL fired on
+    // raw price drops with fees never offsetting (loser realized full), while
+    // winners only exited on price moves (accrued fees triggered nothing).
+    // FAIL-SAFE (anti-pattern #2): when the fee-inclusive figure is missing/null
+    // the logic falls back to the price proxy — never assumes fees are large,
+    // never skips the stop loss. Downside stays capped: SL still fires, it just
+    // measures the true net position. Paper uses naive 0% IL (optimistic, see
+    // paper-trades.js computeFeeInclusivePnl); live uses the real derived PnL
+    // (current value + fees − deposit, IL embedded in current value). Flip false
+    // → silent revert to price-only decisions on BOTH paper and live.
+    feeInclusiveExitEnabled: u.internalAgents?.feeInclusiveExitEnabled ?? true,
   },
 
   // ─── Darwinian Signal Weighting ───────

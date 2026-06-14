@@ -10,6 +10,7 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 
 const STATE_FILE = "./state.json";
 
@@ -412,13 +413,29 @@ export function getStateSummary() {
  */
 export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
   const {
-    pnl_pct: currentPnlPct,
+    pnl_pct: reportedPnlPct,
+    pnl_pct_fee_inclusive,
     pnl_pct_suspicious,
     in_range,
     fee_per_tvl_24h,
     price_change_1h_pct,
     net_buyers_1h,
   } = positionData;
+  // Vega fix #1 — exit DECISION metric is the fee-inclusive net economic
+  // position (current value + fees − deposit, REAL IL embedded in current
+  // value), mirroring the paper side. Root-cause fix for the 1:2 loss/win
+  // asymmetry: SL/TP/trailing/partial/velocity all now read where the position
+  // TRULY sits net of accrued fees instead of raw price.
+  // FAIL-SAFE (anti-pattern #2): when pnl_pct_fee_inclusive is missing/null we
+  // fall back to the SDK-reported pnl_pct — never assume fees are large, and the
+  // stop loss still fires. Downside stays capped: SL measures the true net
+  // position, which is <= price-only only when IL exceeds fees (the loss is
+  // real). Reversibility: feeInclusiveExitEnabled=false → revert to reported.
+  const feeInclusiveOn =
+    config.internalAgents?.feeInclusiveExitEnabled !== false &&
+    pnl_pct_fee_inclusive != null &&
+    Number.isFinite(Number(pnl_pct_fee_inclusive));
+  const currentPnlPct = feeInclusiveOn ? Number(pnl_pct_fee_inclusive) : reportedPnlPct;
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;

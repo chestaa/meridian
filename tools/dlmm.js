@@ -1471,6 +1471,15 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
             ? Math.round(reportedPnlPct * 100) / 100
             : null,
           pnl_pct_derived:    derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
+          // Vega fix #1 — fee-inclusive exit metric (LIVE). derivedPnlPct is
+          // (currentValue + unclaimedFees + withdrawals + allTimeFees − deposit)
+          // / deposit — i.e. the TRUE net economic position with REAL IL already
+          // embedded in currentValue (NOT naive 0% like paper). state.js prefers
+          // this over the SDK-reported price-only pnl_pct for exit decisions,
+          // with fallback to pnl_pct when derived is unavailable. Suspicious
+          // ticks (reported vs derived diverge) still short-circuit via
+          // pnl_pct_suspicious upstream.
+          pnl_pct_fee_inclusive: derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
           pnl_pct_diff:       pnlPctDiff != null ? Math.round(pnlPctDiff * 100) / 100 : null,
           pnl_pct_suspicious: !!pnlPctSuspicious,
           unclaimed_fees_true_usd: lpData

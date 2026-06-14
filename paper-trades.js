@@ -235,7 +235,25 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
     }
   }
 
-  const pnlPct = Number(snapshot.price_proxy_pnl_pct);
+  // Vega fix #1 — exit DECISION metric is the fee-inclusive net economic
+  // position (price proxy + fees earned − IL), NOT raw price. This is the
+  // root-cause fix for the 1:2 loss/win asymmetry: SL/TP/trailing/partial/
+  // velocity/drawdown all now read where the position TRULY sits net of fees.
+  // FAIL-SAFE (anti-pattern #2): if fee_inclusive_pnl_pct is null/non-finite
+  // (missing fees/IL data) we fall back to the price proxy — we never assume
+  // fees are large, and the stop loss still fires. NOTE: paper IL is naive 0%
+  // (computeFeeInclusivePnl), so paper fee-inclusive is OPTIMISTIC; live uses
+  // real IL via derived PnL. Reversibility: feeInclusiveExitEnabled=false →
+  // decisions revert to price-only. OOR (below) stays a price-deviation proxy.
+  // NOTE: guard null/undefined BEFORE Number() — Number(null) === 0 would
+  // silently treat "no fee data" as a real 0% position (anti-pattern #2).
+  const rawFeeInclusive = snapshot.fee_inclusive_pnl_pct;
+  const feeInclusive = rawFeeInclusive == null ? NaN : Number(rawFeeInclusive);
+  const priceProxyPnl = Number(snapshot.price_proxy_pnl_pct);
+  const useFeeInclusive =
+    config.internalAgents?.feeInclusiveExitEnabled !== false &&
+    Number.isFinite(feeInclusive);
+  const pnlPct = useFeeInclusive ? feeInclusive : priceProxyPnl;
   if (Number.isFinite(pnlPct)) {
     // Track peak for trailing TP
     if (trade.peak_pnl_pct == null || pnlPct > trade.peak_pnl_pct) {

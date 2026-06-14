@@ -50,6 +50,8 @@ function cleanup() {
 const { updatePnlAndCheckExits, markPartialTpDone } = await import("../state.js");
 const { evaluatePaperExit } = await import("../paper-trades.js");
 const { config, computeDeployAmount, computeDynamicDeployAmount } = await import("../config.js");
+const { estimateAccumulatedFeesSol } = await import("../agents/rebalance.js");
+const { estimateRebalanceFrictionSol } = await import("../tools/dlmm.js");
 
 let assertions = 0;
 function check(label, fn) {
@@ -351,10 +353,15 @@ try {
   // Item 9 — Rebalance-on-OOR flag OFF → legacy hard close
   // ─────────────────────────────────────────────────────────────
   console.log("\nItem 9 — rebalance-on-OOR flag");
-  check("config default rebalanceOnOorEnabled === false", () => {
-    assert.equal(config.management.rebalanceOnOorEnabled, false);
+  // Vega FIX #2 — flag flipped ON (live default). Re-centering on OOR for
+  // high-organic tokens keeps fee accrual instead of realizing a loss every
+  // time price moves. Friction guard (agents/rebalance.js) + maxRebalances cap
+  // bound the cost; gate below proves the OFF behavior still reverts cleanly.
+  check("config default rebalanceOnOorEnabled === true (FIX #2)", () => {
+    assert.equal(config.management.rebalanceOnOorEnabled, true);
   });
-  // OFF + high organic + OOR past limit → OUT_OF_RANGE (legacy hard close).
+  // Explicit OFF override + high organic + OOR past limit → OUT_OF_RANGE (proves
+  // the legacy hard-close path is still reachable / fully reversible).
   {
     const addr = "RBL11111111111111111111111111111111111111111";
     writeState({ [addr]: trackedFixture(addr, {
@@ -362,8 +369,8 @@ try {
       partial_tp_done: true,
       out_of_range_since: new Date(Date.now() - 30 * 60000).toISOString(),
     }) });
-    const r = updatePnlAndCheckExits(addr, { pnl_pct: 1, in_range: false }, MGMT);
-    check("flag OFF + organic 90 + OOR 30m → OUT_OF_RANGE (no behavior change)", () => {
+    const r = updatePnlAndCheckExits(addr, { pnl_pct: 1, in_range: false }, { ...MGMT, rebalanceOnOorEnabled: false });
+    check("explicit flag OFF + organic 90 + OOR 30m → OUT_OF_RANGE (reversible)", () => {
       assert.ok(r);
       assert.equal(r.action, "OUT_OF_RANGE");
     });
@@ -412,6 +419,157 @@ try {
     check("flag ON + organic 50 (< 80) → OUT_OF_RANGE (high-organic only)", () => {
       assert.ok(r);
       assert.equal(r.action, "OUT_OF_RANGE");
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Vega FIX #1 — fee-inclusive exit DECISION metric (paper + live)
+  // Root-cause of the 1:2 loss/win asymmetry: exit logic decided on
+  // PRICE-ONLY pnl, so losers realized full price drops while winners'
+  // accrued fees triggered nothing. Decisions now read the NET economic
+  // position (price + fees − IL), with price fallback when fee data missing.
+  // ─────────────────────────────────────────────────────────────
+  console.log("\nFIX #1 — fee-inclusive exit decision (paper)");
+
+  // (a) WINNER: fee accrual lifts net above trailing trigger so exit fires at
+  //     a real gain, where price-only would NOT have armed trailing at all.
+  //     price proxy +2% (below 18 trigger) but fees +20% → fee-inclusive +22%
+  //     arms trailing; then a 6% net drop → TRAILING_TP at a meaningful gain.
+  {
+    const peak = { price_proxy_pnl_pct: 2, fee_inclusive_pnl_pct: 22 };
+    const drop = { price_proxy_pnl_pct: 2, fee_inclusive_pnl_pct: 16, price: 102, entry: 100 };
+    const trade = {
+      status: "open", opened_at: new Date(Date.now() - 60 * 60000).toISOString(),
+      entry_price: 100, peak_pnl_pct: 0, partial_tp_done: true, notes: [],
+    };
+    // Arm on the +22% net peak (price-only +2% would never arm at trigger 18).
+    const r1 = evaluatePaperExit(trade, { ...peak, price: 102 }, MGMT);
+    check("(a) winner: fees push net +22% → arms (no premature exit), peak tracks net", () => {
+      assert.equal(r1, null);
+      assert.equal(trade.peak_pnl_pct, 22); // peak is fee-inclusive, NOT price 2
+    });
+    const r2 = evaluatePaperExit(trade, drop, MGMT);
+    check("(a) winner: 6% net drop from +22% peak → TRAILING_TP at real gain", () => {
+      assert.ok(r2);
+      assert.equal(r2.action, "TRAILING_TP");
+    });
+  }
+  // (b) LOSER: SL fires on the NET economic position, downside STILL capped.
+  //     Price -12% but fees +4% → fee-inclusive -8% (above SL -50 in MGMT;
+  //     use a tight SL to prove SL still protects on the net metric).
+  {
+    const tightSL = { ...MGMT, stopLossPct: -10 };
+    const trade = {
+      status: "open", opened_at: new Date(Date.now() - 60 * 60000).toISOString(),
+      entry_price: 100, peak_pnl_pct: 0, partial_tp_done: true, notes: [],
+    };
+    // net -8% (price -12 + fee +4): SL -10 NOT hit yet — fees correctly offset.
+    const r1 = evaluatePaperExit(trade, { price_proxy_pnl_pct: -12, fee_inclusive_pnl_pct: -8, price: 88 }, tightSL);
+    check("(b) loser: net -8% (fees offset price -12%) → SL -10 NOT premature", () => {
+      assert.equal(r1, null);
+    });
+    // net -11% → SL -10 FIRES. Downside capped on the true economic position.
+    const r2 = evaluatePaperExit(trade, { price_proxy_pnl_pct: -16, fee_inclusive_pnl_pct: -11, price: 84 }, tightSL);
+    check("(b) loser: net -11% → STOP_LOSS fires (downside capped, net metric)", () => {
+      assert.ok(r2);
+      assert.equal(r2.action, "STOP_LOSS");
+    });
+  }
+
+  // (c) FAIL-SAFE: fee data missing (fee_inclusive null) → price fallback, no
+  //     crash, SL still fires on the price proxy.
+  {
+    const tightSL = { ...MGMT, stopLossPct: -10 };
+    const trade = {
+      status: "open", opened_at: new Date(Date.now() - 60 * 60000).toISOString(),
+      entry_price: 100, peak_pnl_pct: 0, partial_tp_done: true, notes: [],
+    };
+    const r = evaluatePaperExit(trade, { price_proxy_pnl_pct: -15, fee_inclusive_pnl_pct: null, price: 85 }, tightSL);
+    check("(c) fail-safe: fee-inclusive null → price proxy -15% → STOP_LOSS (no crash)", () => {
+      assert.ok(r);
+      assert.equal(r.action, "STOP_LOSS");
+    });
+  }
+
+  console.log("\nFIX #1 — fee-inclusive exit decision (live state.js)");
+  // (e) LIVE mirror parallel to paper: state.js prefers pnl_pct_fee_inclusive.
+  // Peak tracking lives in index.js (queuePeakConfirmation, fed by decisionPnlPct
+  // → the SAME fee-inclusive metric). Here the peak has already been captured at
+  // the fee-inclusive +22% (price-only +2% would never have reached trigger 18).
+  // updatePnlAndCheckExits then arms trailing on that net peak and, on a 6% net
+  // drop, fires TRAILING_TP at a real gain. This is the winner the OLD price-only
+  // path closed at MAX_HOLD/OOR for a sliver.
+  {
+    const addr = "FIE11111111111111111111111111111111111111111";
+    writeState({ [addr]: trackedFixture(addr, { peak_pnl_pct: 22, partial_tp_done: true }) });
+    const r1 = updatePnlAndCheckExits(addr, { pnl_pct: 2, pnl_pct_fee_inclusive: 22, in_range: true }, MGMT);
+    check("(e) live winner: net peak +22% arms trailing (price-only +2% would not)", () => {
+      assert.equal(r1, null);
+      assert.equal(readPos(addr).trailing_active, true);
+    });
+    // 6% net drop from +22% peak (fee-inclusive 16) → TRAILING_TP at real gain.
+    const r2 = updatePnlAndCheckExits(addr, { pnl_pct: 0, pnl_pct_fee_inclusive: 16, in_range: true }, MGMT);
+    check("(e) live winner: 6% net drop → TRAILING_TP at +16% net (not a sliver)", () => {
+      assert.ok(r2);
+      assert.equal(r2.action, "TRAILING_TP");
+    });
+  }
+  // Live loser: SL on net position, downside capped.
+  {
+    const addr = "FIE22222222222222222222222222222222222222222";
+    writeState({ [addr]: trackedFixture(addr, { partial_tp_done: true }) });
+    const tightSL = { ...MGMT, stopLossPct: -10 };
+    const r1 = updatePnlAndCheckExits(addr, { pnl_pct: -12, pnl_pct_fee_inclusive: -8, in_range: true }, tightSL);
+    check("(e) live loser: net -8% (price -12 + fee) → SL -10 NOT premature", () => {
+      assert.equal(r1, null);
+    });
+    const r2 = updatePnlAndCheckExits(addr, { pnl_pct: -16, pnl_pct_fee_inclusive: -11, in_range: true }, tightSL);
+    check("(e) live loser: net -11% → STOP_LOSS fires (downside capped)", () => {
+      assert.ok(r2);
+      assert.equal(r2.action, "STOP_LOSS");
+    });
+  }
+  // Live fail-safe: pnl_pct_fee_inclusive missing → reported pnl_pct used.
+  {
+    const addr = "FIE33333333333333333333333333333333333333333";
+    writeState({ [addr]: trackedFixture(addr, { partial_tp_done: true }) });
+    const tightSL = { ...MGMT, stopLossPct: -10 };
+    const r = updatePnlAndCheckExits(addr, { pnl_pct: -15, in_range: true }, tightSL);
+    check("(e) live fail-safe: no fee-inclusive field → reported pnl_pct -15% → STOP_LOSS", () => {
+      assert.ok(r);
+      assert.equal(r.action, "STOP_LOSS");
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // FIX #2 — rebalance-on-OOR friction guard (d)
+  // ─────────────────────────────────────────────────────────────
+  console.log("\nFIX #2 — rebalance-on-OOR friction guard");
+  // (d) friction = gas(3tx) + slippage(amount*1%). Re-center only worth it when
+  //     accrued fees >= friction; else hard close. Prove both branches.
+  {
+    const friction = estimateRebalanceFrictionSol({ amountSol: 0.18 });
+    check("(d) friction > 0 and scales with capital (3 tx gas + 1% slippage)", () => {
+      assert.ok(Number.isFinite(friction));
+      assert.ok(friction > 0);
+      // 3 * 0.00015 + 0.18 * 0.01 = 0.00045 + 0.0018 = 0.00225
+      assert.ok(Math.abs(friction - 0.00225) < 1e-9);
+    });
+    // fees ABOVE friction → guard satisfied (re-center is economically sound).
+    const feesHigh = estimateAccumulatedFeesSol({ unclaimed_fees_sol: 0.01 }, {}, 150);
+    check("(d) fees 0.01 SOL > friction → re-center worth it (guard passes)", () => {
+      assert.ok(feesHigh >= friction);
+    });
+    // fees BELOW friction → guard fails → hard close (no churn bleed).
+    const feesLow = estimateAccumulatedFeesSol({ unclaimed_fees_sol: 0.0001 }, {}, 150);
+    check("(d) fees 0.0001 SOL < friction → NOT worth re-center (hard close)", () => {
+      assert.ok(feesLow < friction);
+    });
+    // fail-safe: null fee inputs → 0 → fails guard → hard close (safe default).
+    const feesNull = estimateAccumulatedFeesSol({}, {}, 150);
+    check("(d) fail-safe: missing fee data → 0 SOL → fails guard (safe hard close)", () => {
+      assert.equal(feesNull, 0);
+      assert.ok(feesNull < friction);
     });
   }
 
