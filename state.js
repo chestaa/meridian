@@ -404,10 +404,34 @@ export function getStateSummary() {
 }
 
 /**
+ * Vega FIX#1 — pure OOR direction classifier.
+ * Single-side SOL deploys (bins_above=0) go OOR-UP on any up-move (token pumped,
+ * position holding appreciating token) and OOR-DOWN on a dump (depreciation, fees
+ * dead). The legacy OOR path closed both identically. This fn reads the bin fields
+ * getMyPositions already exposes (active_bin/upper_bin/lower_bin) and returns:
+ *   "UP"   — active_bin > upper_bin (pumped above range)
+ *   "DOWN" — active_bin < lower_bin (dumped below range)
+ *   "IN"   — active_bin within [lower_bin, upper_bin] (still in range)
+ *   "UNKNOWN" — any bin field missing/non-finite (FAIL-SAFE: caller uses normal timer)
+ * Pure: no I/O, no state read. Exported for unit tests.
+ */
+export function oorDirection(positionData) {
+  const active = Number(positionData?.active_bin);
+  const upper = Number(positionData?.upper_bin);
+  const lower = Number(positionData?.lower_bin);
+  if (!Number.isFinite(active) || !Number.isFinite(upper) || !Number.isFinite(lower)) {
+    return "UNKNOWN";
+  }
+  if (active > upper) return "UP";
+  if (active < lower) return "DOWN";
+  return "IN";
+}
+
+/**
  * Check all exit conditions for a position (trailing TP, stop loss, OOR, low yield).
  * Updates peak_pnl_pct, trailing_active, and OOR state.
  * @param {string} position_address
- * @param {object} positionData - fields from getMyPositions: pnl_pct, in_range, fee_per_tvl_24h
+ * @param {object} positionData - fields from getMyPositions: pnl_pct, in_range, fee_per_tvl_24h, active_bin/upper_bin/lower_bin
  * @param {object} mgmtConfig
  * Returns { action, reason } or null if no exit needed.
  */
@@ -550,7 +574,63 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Out of range too long ──────────────────────────────────────
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
-    if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
+
+    // Vega FIX#1 — OOR DIRECTIONAL handling. Only active when the flag is on AND
+    // we can read the bin fields. FAIL-SAFE: direction UNKNOWN (missing bins) →
+    // behaves EXACTLY like legacy (normal timer, no early arm). Downside stays
+    // capped — SL already fired above this block on the fee-inclusive net pnl.
+    const directionalOn = mgmtConfig.oorDirectionalExitEnabled === true;
+    const direction = directionalOn ? oorDirection(positionData) : "UNKNOWN";
+
+    if (directionalOn && direction === "UP") {
+      // OOR-UP = token pumped through our single-side range; we now hold
+      // appreciating token with fees stopped. If in-profit (fee-inclusive),
+      // DO NOT hard-close on the OOR timer — ARM TRAILING so we ride the pump
+      // and exit on the trailing-drop / SL instead of dumping a thin +sliver.
+      const inProfit = currentPnlPct != null && Number.isFinite(currentPnlPct) && currentPnlPct > 0;
+      if (inProfit) {
+        let changedUp = false;
+        if (!pos.trailing_active) {
+          pos.trailing_active = true;
+          changedUp = true;
+          log("state", `Position ${position_address} OOR-UP in-profit (${currentPnlPct.toFixed(2)}%) — trailing armed, NOT hard-closing on OOR timer (Vega FIX#1)`);
+        }
+        // Track the peak on EVERY OOR-UP-in-profit tick (not just the arming
+        // tick) so the trailing-drop block measures against the true high-water
+        // mark of the pump. Without this, peak would freeze at the arm value and
+        // a 6% drop from a higher pump would never be detected.
+        if (currentPnlPct > (pos.peak_pnl_pct ?? 0)) {
+          pos.peak_pnl_pct = currentPnlPct;
+          changedUp = true;
+        }
+        if (changedUp) save(state);
+        // No exit: the trailing-drop block (runs above next cycle) and SL govern
+        // the exit. The pump is captured instead of clipped at +sliver.
+        return null;
+      }
+      // OOR-UP but NOT in-profit → normal OOR timer (fall through below).
+    }
+
+    // OOR-DOWN = token dumped below range; pure depreciation, fees dead. Cut on
+    // the FASTER outOfRangeWaitMinutesDown timer. UNKNOWN/IN/UP-not-profit use
+    // the normal timer (legacy behavior). outOfRangeWaitMinutesDown is clamped to
+    // never exceed the normal limit (a dump should never wait LONGER).
+    const downLimit = Math.min(
+      Number(mgmtConfig.outOfRangeWaitMinutesDown ?? mgmtConfig.outOfRangeWaitMinutes),
+      Number(mgmtConfig.outOfRangeWaitMinutes),
+    );
+    const effectiveLimit =
+      directionalOn && direction === "DOWN" && Number.isFinite(downLimit)
+        ? downLimit
+        : mgmtConfig.outOfRangeWaitMinutes;
+
+    if (minutesOOR >= effectiveLimit) {
+      // Vega FIX#1 — REBALANCE GUARD. Re-centering an OOR-UP pump would buy the
+      // token at the top (the OPPOSITE of intent) — but OOR-UP+profit already
+      // returned above via the trailing path, so a re-center here can only be an
+      // OOR-DOWN (or UNKNOWN/IN) position. We additionally HARD-BLOCK rebalance
+      // for direction UP (defensive: OOR-UP-not-profit must not re-center either).
+      const rebalanceAllowed = !(directionalOn && direction === "UP");
       // Vega Item 9 — Rebalance-on-OOR for high-organic tokens. DEFAULT OFF.
       // When enabled AND organic >= threshold AND under the maxRebalances churn
       // cap, signal REBALANCE_OOR (re-center on the current active bin, keep
@@ -571,6 +651,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       const rebalanceCount = Number(pos.rebalance_count ?? 0);
       const maxRebalances = Number(mgmtConfig.maxRebalances ?? 3);
       if (
+        rebalanceAllowed &&
         mgmtConfig.rebalanceOnOorEnabled === true &&
         Number.isFinite(organic) &&
         organic >= (mgmtConfig.rebalanceOnOorMinOrganic ?? 80) &&
@@ -580,7 +661,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       ) {
         return {
           action: "REBALANCE_OOR",
-          reason: `OOR ${minutesOOR}m (limit ${mgmtConfig.outOfRangeWaitMinutes}m) but organic ${organic} >= ${mgmtConfig.rebalanceOnOorMinOrganic ?? 80} and rebalance_count ${rebalanceCount} < ${maxRebalances} — re-center candidate`,
+          reason: `OOR ${minutesOOR}m (limit ${effectiveLimit}m) but organic ${organic} >= ${mgmtConfig.rebalanceOnOorMinOrganic ?? 80} and rebalance_count ${rebalanceCount} < ${maxRebalances} — re-center candidate`,
           organic_score: organic,
           rebalance_count: rebalanceCount,
           max_rebalances: maxRebalances,
@@ -589,7 +670,9 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       }
       return {
         action: "OUT_OF_RANGE",
-        reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
+        reason: directionalOn && direction === "DOWN"
+          ? `Out of range DOWN for ${minutesOOR}m (down-limit: ${effectiveLimit}m) — token dumped, cutting fast (Vega FIX#1)`
+          : `Out of range for ${minutesOOR}m (limit: ${effectiveLimit}m)`,
       };
     }
   }

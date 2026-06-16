@@ -516,6 +516,15 @@ export function getRawPoolScreeningRejectReason(pool, s) {
   if (!isUsableVolatility(volatility)) {
     return `volatility ${volatility} is unusable`;
   }
+  // Volatility FLOOR (Cassiopeia 2026-06-16, Lyra 39-trade finding). LOW-vol pools
+  // slow-bleed into the stop without realizing a win — bucket [0,2.5) was EV -$0.41,
+  // [2.5,3.5) EV -$0.21, vs [3.5,4.5) EV +$0.34. NO ceiling (high-vol stays EV+).
+  // Fires only when minVolatility > 0 (base default 0 = off; user-config sets 3.0).
+  // The two fail-closed checks above already rejected null/0/non-finite vol, so a
+  // pool reaching here has a genuine usable reading; this gate cuts the bleed band.
+  if (s.minVolatility > 0 && volatility < s.minVolatility) {
+    return `volatility ${volatility} below minVolatility ${s.minVolatility}`;
+  }
   // Fail-closed (anti-pattern #2): null organic = DATA-MISSING (structural gap on
   // the cross-ref endpoint, NOT a genuine low score). organic_unknown is
   // distinguishable from a genuine sub-floor score so enrich-before-gate (which

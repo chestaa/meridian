@@ -371,8 +371,14 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
   const entry = Number(trade.entry_price);
   const cur = Number(snapshot.price);
   if (Number.isFinite(entry) && entry > 0 && Number.isFinite(cur) && cur > 0) {
-    const deviationPct = Math.abs((cur - entry) / entry) * 100;
+    const signedDeviationPct = ((cur - entry) / entry) * 100;
+    const deviationPct = Math.abs(signedDeviationPct);
     const OOR_BAND_PCT = 25;
+    // Vega FIX#1 — paper mirror of OOR direction. No active_bin in paper, so the
+    // price-vs-entry sign IS the direction proxy: price above entry-band = UP
+    // (token pumped), below = DOWN (dumped). Mirrors state.js#oorDirection.
+    const directionalOn = mgmt.oorDirectionalExitEnabled === true;
+    const paperDirection = signedDeviationPct > 0 ? "UP" : "DOWN";
     if (deviationPct > OOR_BAND_PCT) {
       if (!trade.out_of_range_since) trade.out_of_range_since = new Date().toISOString();
     } else {
@@ -380,7 +386,32 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
     }
     if (trade.out_of_range_since) {
       const minutesOOR = Math.floor((Date.now() - new Date(trade.out_of_range_since).getTime()) / 60000);
-      const limit = mgmt.outOfRangeWaitMinutes ?? 30;
+      const normalLimit = mgmt.outOfRangeWaitMinutes ?? 30;
+
+      // OOR-UP + in-profit (fee-inclusive pnl already computed above) → ARM
+      // trailing, do NOT hard-close on the OOR timer. Pump captured; trailing
+      // drop / SL govern the exit. FAIL-SAFE: if flag off → legacy single-timer.
+      if (directionalOn && paperDirection === "UP" && Number.isFinite(pnlPct) && pnlPct > 0) {
+        if (trade.peak_pnl_pct == null || pnlPct > trade.peak_pnl_pct) trade.peak_pnl_pct = pnlPct;
+        trade.notes = Array.isArray(trade.notes) ? trade.notes : [];
+        if (!trade.notes.includes("oor_up_trailing_armed")) {
+          trade.notes.push("oor_up_trailing_armed");
+          log("paper", `Paper OOR-UP in-profit ${trade.pool_name} (${pnlPct.toFixed(2)}%) — trailing armed, holding pump (Vega FIX#1)`);
+        }
+        return null; // no exit — ride the pump
+      }
+
+      // OOR-DOWN → faster cut timer; clamp to never exceed the normal limit.
+      const downLimit = Math.min(
+        Number(mgmt.outOfRangeWaitMinutesDown ?? normalLimit),
+        Number(normalLimit),
+      );
+      const limit =
+        directionalOn && paperDirection === "DOWN" && Number.isFinite(downLimit)
+          ? downLimit
+          : normalLimit;
+      // Guard: never re-center an OOR-UP pump (paper mirror of live guard).
+      const rebalanceAllowed = !(directionalOn && paperDirection === "UP");
       if (minutesOOR >= limit) {
         // Vega Item 9 — paper re-center mirror. High-organic + under cap +
         // flag on → re-center (NOT a close): reset OOR timer, bump count, keep
@@ -391,6 +422,7 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
         const count = Number(trade.rebalance_count ?? 0);
         const maxRebalances = Number(mgmt.maxRebalances ?? 3);
         if (
+          rebalanceAllowed &&
           mgmt.rebalanceOnOorEnabled === true &&
           Number.isFinite(organic) &&
           organic >= (mgmt.rebalanceOnOorMinOrganic ?? 80) &&
@@ -404,7 +436,12 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
           log("paper", `Paper re-center ${trade.pool_name}: rebalance #${trade.rebalance_count} after OOR ${minutesOOR}m`);
           return null; // no exit — remainder keeps running
         }
-        return { action: "OUT_OF_RANGE", reason: `Out of range for ${minutesOOR}m (limit: ${limit}m)` };
+        return {
+          action: "OUT_OF_RANGE",
+          reason: directionalOn && paperDirection === "DOWN"
+            ? `Out of range DOWN for ${minutesOOR}m (down-limit: ${limit}m) — token dumped, cutting fast (Vega FIX#1)`
+            : `Out of range for ${minutesOOR}m (limit: ${limit}m)`,
+        };
       }
     }
   }

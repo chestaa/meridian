@@ -152,6 +152,24 @@ export const config = {
     // thresholds were tuned for; volatility is insulated (read at a 30m floor via
     // getVolatilityTimeframe regardless). Reversible: set "5m".
     timeframe:         u.timeframe         ?? "1h",
+    // Cassiopeia 2026-06-16 — volatility FLOOR (NOT a ceiling). Lyra finding on 39
+    // REAL trades inverted the prior whipsaw hypothesis: LOW-vol pools are the
+    // bleeders, not high-vol. Buckets: vol[0,2.5) EV -$0.41/trade (sum -$4.06,
+    // worst), [2.5,3.5) EV -$0.21 (-$2.07), [3.5,4.5) EV +$0.34 (+$3.09, best),
+    // [4.5+) EV +$0.20 (+$1.95). Win avg vol 3.99, Loss avg 3.34, SL avg 3.01 —
+    // low-vol pools slow-bleed into the stop without ever pumping to a realized win.
+    // NO CEILING (4.5+ still EV-positive — zero evidence for an upper bound).
+    // FLOOR CHOSEN = 3.0 (NOT the 3.5 Lyra proposed): live anti-dormancy probe
+    // (scripts/probe-volatility-floor.js, 1h timeframe, 1000-pool broad page) showed
+    // a HARD 3.5 floor cut the full-gate deployable set to 1 pool/page (near-dormancy,
+    // 0-deploy-day risk), 3.0 → 2 pools, while killing the catastrophic [0,2.5) bucket
+    // (8 of 12 current survivors, Lyra's biggest bleeder). 3.0 trades the mild [2.5,3.5)
+    // bleeder for funnel survival — recoverable once Lyra's SL-fix ships. The raw-gate
+    // count is a FLOOR; runtime adds more via the vol-rescue + native-detail enrich
+    // passes. Base 0 = OFF (safety fallback). user-config sets the real floor (3.0).
+    // FAIL-CLOSED (anti-pattern #2): null/missing/0 vol already rejects upstream
+    // (volatility_unknown / unusable); this floor adds vol<minVolatility → reject.
+    minVolatility:     u.minVolatility     ?? 0,
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 15,  // global fees paid (priority+jito tips). below = bundled/scam. recalibrated 30→15 for low-cap target (now 50k-2M signal band, was $5-80k; 15 SOL floor still appropriate at the lower end of the widened band)
     useDiscordSignals: u.useDiscordSignals ?? false,
@@ -344,6 +362,24 @@ export const config = {
     // Each re-center is 3 tx + slippage, so unbounded churn would bleed the
     // wallet. Default 3.
     maxRebalances:         u.maxRebalances         ?? 3,
+    // Vega FIX#1 (2026-06-16) — OOR DIRECTIONAL exit. Root-cause fix for the
+    // win+$0.04 / loss-$1.33 asymmetry. Single-side SOL deploys (bins_above=0)
+    // go OOR-UP on ANY up-move; the legacy OOR path hard-closed pump and dump
+    // identically. With this ON:
+    //   - OOR-UP (active>upper) + in-profit (fee-incl) → ARM TRAILING, do NOT
+    //     hard-close on the OOR timer (capture the pump; trailing-drop still exits).
+    //   - OOR-DOWN (active<lower) → cut FASTER via outOfRangeWaitMinutesDown
+    //     (< normal outOfRangeWaitMinutes); pure depreciation, fees dead.
+    //   - OOR-UP NOT in-profit → normal OOR timer (no special handling).
+    // FAIL-SAFE (anti-pattern #2): if bin data (active/upper/lower) is missing or
+    // non-finite → direction UNKNOWN → fall back to the NORMAL OOR timer (never
+    // crash, never skip the close). Downside STAYS capped — SL fires above OOR.
+    // Reversibility: oorDirectionalExitEnabled=false → legacy single-`in_range`
+    // OOR behavior on BOTH paper + live (no branching at all).
+    oorDirectionalExitEnabled: u.oorDirectionalExitEnabled ?? false,
+    // OOR-DOWN cut timer (minutes). MUST be <= outOfRangeWaitMinutes; a dump is
+    // pure depreciation so we exit sooner. Default 8 (vs 20-30 normal).
+    outOfRangeWaitMinutesDown: u.outOfRangeWaitMinutesDown ?? 8,
     // Andromeda PR-A — max-drawdown-recovery exit (paper-trades.js).
     // ARM when max_drawdown (peak−trough) >= armPct; FIRE when current pnl
     // recovers deltaPct above trough. Distinct from trailing TP, which gates
@@ -700,6 +736,7 @@ export function reloadScreeningThresholds() {
     if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
     if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
     if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
+    if (fresh.minVolatility  != null) s.minVolatility  = fresh.minVolatility;
     if (fresh.timeframe         != null) s.timeframe         = fresh.timeframe;
     if (fresh.category          != null) s.category          = fresh.category;
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;

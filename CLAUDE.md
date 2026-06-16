@@ -76,6 +76,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | minMcap / maxMcap | screening | 150k / 10M |
 | signalMinMcap / signalMaxMcap | screening | 50k / 2M |
 | minBinStep / maxBinStep | screening | 80 / 125 |
+| minVolatility | screening | 0 (off; live 3.0) |
 | timeframe | screening | "5m" |
 | category | screening | "trending" |
 | minTokenFeesSol | screening | 15 |
@@ -129,6 +130,7 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 Before `deploy_position` executes:
 - `bin_step` must be within `[minBinStep, maxBinStep]`
 - `volatility` must be a positive finite number when provided; fresh pool detail with volatility 0/null is rejected. NOTE: `discoverPools()` runs a refetch-before-reject pass (`refetchVolatilityForUnusable`) — pools reading vol≤0 on the 5m feed are re-fetched at 30m; only those STILL ≤0 at 30m are dropped (avoids stale-feed false-positives like the RICH-SOL miss)
+- **Volatility FLOOR (Cassiopeia 2026-06-16, `minVolatility`):** in `getRawPoolScreeningRejectReason`, after the fail-closed null/0/non-finite checks, a usable vol BELOW `minVolatility` is rejected `volatility N below minVolatility M`. Fires only when `minVolatility > 0` (base default 0 = OFF; user-config sets the real floor). **FLOOR not ceiling** — Lyra's 39-real-trade finding inverted the whipsaw hypothesis: LOW-vol pools slow-bleed into the stop (bucket [0,2.5) EV −$0.41, [2.5,3.5) −$0.21) while [3.5,4.5) is EV +$0.34 and 4.5+ stays +$0.20 (no upper bound). Floor set to **3.0 (NOT 3.5)** by live anti-dormancy probe: a hard 3.5 cut the full-gate page to 1 pool (near-dormancy); 3.0 kills the catastrophic [0,2.5) bucket while keeping the funnel alive. Tests: `scripts/test-volatility-floor.js` (18 assertions). Probe: `scripts/probe-volatility-floor.js`.
 - Total range must be at least `max(35, minBinsBelow)` bins; 1-bin/tiny deploys are refused
 - Position count must be below `maxPositions` (force-fresh scan, no cache)
 - No duplicate pool allowed (same pool_address)
