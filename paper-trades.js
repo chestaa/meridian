@@ -161,6 +161,17 @@ export function recordPaperDeploy(entry) {
     partial_tp_done: false,
     partial_tp_at: null,
     original_amount_sol: Number(entry.amount_sol || 0),
+    // Vega EXIT-3 #1 — paper mirror of break-even stop arm flag (idempotent).
+    // Peaks >= breakEvenArmPct → be_armed true; stop ratchets to breakEvenStopPct
+    // and NEVER ratchets back down. Default false (fixed SL is the only floor).
+    be_armed: false,
+    be_armed_at: null,
+    // Vega EXIT-3 #2 — paper mirror of fee-decay baseline. entry_fee_tvl_ratio
+    // (set above) is the deploy-time baseline; fee_decay_baseline records the
+    // first post-warmup snapshot rate (a real early reading). null until then
+    // → no baseline → no fee-decay exit (fail-safe).
+    fee_decay_baseline: null,
+    fee_decay_baseline_at: null,
     // Vega Item 9 — paper mirror of rebalance-on-OOR. When the position goes
     // OOR past the limit AND is high-organic AND under maxRebalances, the paper
     // model RE-CENTERS (reset the OOR timer, bump rebalance_count, keep the
@@ -215,12 +226,19 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
   if (!trade || trade.status !== "open" || !snapshot) return null;
   const mgmt = mgmtConfigOverride || config.management || {};
 
-  // Andromeda X2 — Max-hold-time forced exit (HIGHEST PRECEDENCE).
+  // Andromeda X2 + Vega EXIT-3 #3 — Max-hold-time forced exit (HIGHEST PRECEDENCE).
   // Time-based forced close runs BEFORE SL/TP/Trailing/DD_RECOVERY so a stuck
-  // position cannot dodge the gate via PnL fluctuation. Inserted first because
-  // a paper trade older than maxHoldMinutes is structurally "stale" — Sirius's
-  // entry signal is no longer load-bearing past 12h.
-  // Reversibility: set maxHoldMinutes=0 (or remove from config) → silent revert.
+  // position cannot dodge the gate via PnL fluctuation.
+  //   - age >= maxHoldOorMinutes (720m) AND OUT OF RANGE → close (max_hold_oor):
+  //     a stale OOR paper position earns nothing; don't babysit past 12h.
+  //   - age >= maxHoldMinutes (1440m / 24h) → close (max_hold_hard) regardless of
+  //     range: entry thesis structurally dead past 24h.
+  //   - age in [720, 1440) AND IN RANGE → keep running (ZINC-type winner tail).
+  // OOR here is the paper price-band proxy (mirrors the OOR block below): the
+  // position is OOR when |price − entry| / entry > OOR_BAND_PCT (25%). FAIL-SAFE:
+  // missing/non-finite age OR price → skip the gate (never force-close on a guess).
+  // BLUECHIP-AWARE: structure ready for a longer/exempt window once bluechip paper
+  // trades carry an is_bluechip flag. Reversibility: maxHoldMinutes=0 → legacy.
   const maxHoldMin = mgmt.maxHoldMinutes;
   if (Number.isFinite(maxHoldMin) && maxHoldMin > 0 && trade.opened_at) {
     const openedMs = new Date(trade.opened_at).getTime();
@@ -229,8 +247,29 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
       if (heldMin >= maxHoldMin) {
         return {
           action: "MAX_HOLD_EXPIRED",
-          reason: `held ${heldMin.toFixed(0)}m exceeds maxHold ${maxHoldMin}m — forced close`,
+          reason: `held ${heldMin.toFixed(0)}m exceeds maxHold ${maxHoldMin}m — forced close (max_hold_hard)`,
         };
+      }
+      const oorLimit = Math.min(
+        Number.isFinite(Number(mgmt.maxHoldOorMinutes))
+          ? Number(mgmt.maxHoldOorMinutes)
+          : maxHoldMin / 2,
+        maxHoldMin,
+      );
+      if (heldMin >= oorLimit) {
+        // Paper OOR proxy: price deviation from entry beyond the 25% band.
+        const e = Number(trade.entry_price);
+        const c = Number(snapshot.price);
+        if (Number.isFinite(e) && e > 0 && Number.isFinite(c) && c > 0) {
+          const devPct = Math.abs(((c - e) / e) * 100);
+          if (devPct > 25) {
+            return {
+              action: "MAX_HOLD_EXPIRED",
+              reason: `held ${heldMin.toFixed(0)}m >= ${oorLimit}m AND out-of-range (dev ${devPct.toFixed(1)}%) — forced close (max_hold_oor)`,
+            };
+          }
+        }
+        // in-range past oorLimit but under hard limit → fall through (tail).
       }
     }
   }
@@ -259,6 +298,38 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
     if (trade.peak_pnl_pct == null || pnlPct > trade.peak_pnl_pct) {
       trade.peak_pnl_pct = pnlPct;
     }
+
+    // Vega EXIT-3 #1 — Break-even stop ARM (paper mirror). Once peak crosses
+    // breakEvenArmPct, be_armed flips true (idempotent, never disarms) and the
+    // effective floor ratchets UP to breakEvenStopPct. Default OFF.
+    if (
+      mgmt.breakEvenStopEnabled === true &&
+      !trade.be_armed &&
+      trade.peak_pnl_pct != null &&
+      Number.isFinite(Number(trade.peak_pnl_pct)) &&
+      Number(trade.peak_pnl_pct) >= Number(mgmt.breakEvenArmPct ?? 5)
+    ) {
+      trade.be_armed = true;
+      trade.be_armed_at = new Date().toISOString();
+      trade.notes = Array.isArray(trade.notes) ? trade.notes : [];
+      trade.notes.push(`break_even_armed: peak ${Number(trade.peak_pnl_pct).toFixed(2)}% >= ${mgmt.breakEvenArmPct ?? 5}% — floor → ${mgmt.breakEvenStopPct ?? 0}%`);
+    }
+
+    // Vega EXIT-3 #1 — Break-even stop (paper mirror). Runs BEFORE the fixed SL
+    // so the HIGHER floor wins: an armed position that round-trips to the
+    // break-even floor exits there instead of riding to -8%. Only TIGHTENS the
+    // stop upward on a winner; never loosens the fixed SL below.
+    if (
+      mgmt.breakEvenStopEnabled === true &&
+      trade.be_armed &&
+      Number(pnlPct) <= Number(mgmt.breakEvenStopPct ?? 0)
+    ) {
+      return {
+        action: "BREAK_EVEN_STOP",
+        reason: `Break-even stop: net PnL ${pnlPct.toFixed(2)}% <= ${mgmt.breakEvenStopPct ?? 0}% after arming at peak ${Number(trade.peak_pnl_pct ?? 0).toFixed(2)}% — modal locked, NOT round-tripping to ${mgmt.stopLossPct}%`,
+      };
+    }
+
     // Stop loss
     if (mgmt.stopLossPct != null && pnlPct <= mgmt.stopLossPct) {
       return { action: "STOP_LOSS", reason: `Stop loss: PnL ${pnlPct.toFixed(2)}% <= ${mgmt.stopLossPct}%` };
@@ -321,6 +392,73 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
         return {
           action: "VELOCITY_EXIT",
           reason: `Velocity exit: 1h price ${pc1h.toFixed(2)}% < -${mgmt.velocityDropPct ?? 15}% AND net_buyers_1h ${nb1h} < 0 while in profit (${pnlPct.toFixed(2)}%) — momentum reversal`,
+        };
+      }
+    }
+
+    // Vega EXIT-3 #2 — Fee-decay exit (paper mirror, the BIGGEST gap).
+    // Community trigger #1: exit when fees slow down. Track current fee/TVL rate
+    // (snapshot.fee_tvl_ratio) vs a per-trade BASELINE (lazily-captured first
+    // post-warmup reading, else entry_fee_tvl_ratio). Exit when current collapses
+    // below feeDecayThreshold × baseline (default 0.30) WHILE in profit — take
+    // profit as fees die. HARD GUARD: in-profit only (pnlPct > 0); a loser is
+    // owned by SL / break-even / OOR. Coordinated with VELOCITY_EXIT: velocity =
+    // PRICE reversal, this = FEE-rate collapse (different inputs, no double-fire —
+    // velocity returns first if both hit). FAIL-SAFE (anti-pattern #2): missing/
+    // non-finite current rate OR no usable baseline → SKIP. Default OFF.
+    if (mgmt.feeDecayExitEnabled === true && pnlPct > 0) {
+      const warmupMin = Number(mgmt.feeDecayWarmupMinutes ?? 30);
+      const minAgeMin = Number(mgmt.feeDecayMinAgeMinutes ?? 60);
+      const threshold = Number(mgmt.feeDecayThreshold ?? 0.30);
+      const curRate = Number(snapshot.fee_tvl_ratio);
+      const openedMs = new Date(trade.opened_at).getTime();
+      const ageMin = Number.isFinite(openedMs) ? (Date.now() - openedMs) / 60000 : NaN;
+
+      // Resolve baseline: the deploy-time entry_fee_tvl_ratio is the PRIMARY
+      // baseline (a real early reading). Only when it is missing/<=0 do we fall
+      // back to a lazily-captured first post-warmup rate. Capturing only when no
+      // entry baseline exists prevents the capture from poisoning the same-tick
+      // check (capturing curRate then comparing curRate against it would never
+      // fire).
+      const entryBaseline =
+        Number.isFinite(Number(trade.entry_fee_tvl_ratio)) && Number(trade.entry_fee_tvl_ratio) > 0
+          ? Number(trade.entry_fee_tvl_ratio)
+          : null;
+
+      if (
+        entryBaseline == null &&
+        trade.fee_decay_baseline == null &&
+        Number.isFinite(curRate) &&
+        curRate > 0 &&
+        Number.isFinite(ageMin) &&
+        ageMin >= warmupMin
+      ) {
+        trade.fee_decay_baseline = curRate;
+        trade.fee_decay_baseline_at = new Date().toISOString();
+        trade.notes = Array.isArray(trade.notes) ? trade.notes : [];
+        trade.notes.push(`fee_decay_baseline: ${curRate}% fee/TVL at ${ageMin.toFixed(0)}m`);
+      }
+
+      const baseline =
+        entryBaseline != null
+          ? entryBaseline
+          : Number.isFinite(Number(trade.fee_decay_baseline)) && Number(trade.fee_decay_baseline) > 0
+            ? Number(trade.fee_decay_baseline)
+            : null;
+
+      if (
+        baseline != null &&
+        Number.isFinite(curRate) &&
+        Number.isFinite(threshold) &&
+        threshold > 0 &&
+        Number.isFinite(minAgeMin) &&
+        Number.isFinite(ageMin) &&
+        ageMin >= minAgeMin &&
+        curRate < baseline * threshold
+      ) {
+        return {
+          action: "FEE_DECAY_EXIT",
+          reason: `Fee-decay exit: fee/TVL ${curRate}% < ${(threshold * 100).toFixed(0)}% of baseline ${baseline}% (= ${(baseline * threshold).toFixed(3)}%) while in profit (${pnlPct.toFixed(2)}%) — fees slowed, taking profit`,
         };
       }
     }

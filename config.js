@@ -483,12 +483,42 @@ export const config = {
     // on peak >= trailingTriggerPct. Toggle internalAgents.drawdownRecoveryEnabled.
     drawdownRecoveryArmPct:  u.drawdownRecoveryArmPct  ?? 10,  // require >= X% drawdown before arming
     drawdownRecoveryDeltaPct: u.drawdownRecoveryDeltaPct ?? 5, // close after X% recovery from trough
-    // Andromeda X2 — Max-hold-time forced exit (paper-trades.js).
-    // Time-based forced close: a paper trade older than maxHoldMinutes is force-
-    // closed regardless of PnL/OOR. Highest precedence in evaluatePaperExit so
+    // Andromeda X2 + Vega EXIT-3 #3 — Max-hold-time forced exit (paper + live).
+    // HIGHEST precedence in both evaluatePaperExit and updatePnlAndCheckExits so
     // SL/TP/Trailing/DD_RECOVERY cannot delay an exit past the holding window.
-    // Reversibility: set to 0 → silent revert to legacy (no time-based gate).
-    maxHoldMinutes:        u.maxHoldMinutes        ?? 720,    // 12h forced exit default
+    // Raised 720→1440 (24h) so a still-IN-RANGE winner (ZINC-type 11h+ tail) is
+    // NOT clipped at the old 12h cap. The IN-RANGE GUARD splits the window:
+    //   - age >= maxHoldOorMinutes (720m) AND OUT-OF-RANGE → close (max_hold_oor)
+    //   - age >= maxHoldMinutes (1440m) → close (max_hold_hard) regardless
+    //   - age 720-1440m AND IN-RANGE → keep running (winner tail).
+    // maxHoldOorMinutes defaults to maxHoldMinutes/2 (=720m) when unset; clamped
+    // to never exceed maxHoldMinutes. Reversibility: maxHoldMinutes=0 → no gate.
+    maxHoldMinutes:        u.maxHoldMinutes        ?? 1440,   // 24h hard forced exit (was 720)
+    maxHoldOorMinutes:     u.maxHoldOorMinutes     ?? 720,    // 12h forced exit IF out-of-range (in-range allowed past this)
+    // ─── Vega EXIT-3 #1 — Break-even stop (paper + live, default OFF) ───────
+    // Once a position peaks >= breakEvenArmPct (fee-inclusive), the effective stop
+    // ratchets UP from the fixed stopLossPct (-8%) to breakEvenStopPct (0% = flat,
+    // or a small positive to lock a sliver of gain). Idempotent (be_armed flag,
+    // never disarms). Checked BEFORE the fixed SL so the higher floor wins — a
+    // winner that round-trips exits at break-even instead of riding back to -8%.
+    // Pure ADD: does NOT remove downside protection (un-armed positions still hit
+    // the fixed SL). Reversibility: breakEvenStopEnabled=false → fixed SL only.
+    breakEvenStopEnabled:  u.breakEvenStopEnabled  ?? false,
+    breakEvenArmPct:       u.breakEvenArmPct       ?? 5,      // peak PnL% that arms the break-even ratchet
+    breakEvenStopPct:      u.breakEvenStopPct      ?? 0,      // ratcheted floor once armed (0 = flat; +1 locks a sliver)
+    // ─── Vega EXIT-3 #2 — Fee-decay exit (paper + live, default OFF) ────────
+    // Community trigger #1 ("exit when fees slow down"). Tracks current fee/TVL
+    // rate vs a per-position baseline (first post-warmup reading, else the
+    // deploy-time fee/TVL). Exits when current < feeDecayThreshold × baseline
+    // (default 0.30 = a 70% collapse in fee velocity) WHILE IN PROFIT — a
+    // profit-taking rule, NOT a cut-loss (losers owned by SL/break-even/OOR).
+    // Coordinated with VELOCITY_EXIT (price reversal) — fee-decay reads FEE rate,
+    // different input, no double-fire. FAIL-SAFE: missing rate / no baseline →
+    // skip (never false-exit). Reversibility: feeDecayExitEnabled=false → no rule.
+    feeDecayExitEnabled:   u.feeDecayExitEnabled   ?? false,
+    feeDecayThreshold:     u.feeDecayThreshold     ?? 0.30,   // exit when current fee rate < 30% of baseline
+    feeDecayWarmupMinutes: u.feeDecayWarmupMinutes ?? 30,     // don't capture baseline before this (skip first-tick spike)
+    feeDecayMinAgeMinutes: u.feeDecayMinAgeMinutes ?? 60,     // don't fire fee-decay before the position has had time to accrue
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,

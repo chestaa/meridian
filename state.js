@@ -101,6 +101,21 @@ export function trackPosition({
     // PARTIAL_TP again for this position. Survives restarts (persisted).
     partial_tp_done: false,
     partial_tp_at: null,
+    // Vega EXIT-3 #1 — break-even stop arm flag (idempotent, persisted). Once a
+    // position peaks >= breakEvenArmPct (fee-inclusive), be_armed flips true and
+    // the effective stop ratchets UP from the fixed SL to break-even — it NEVER
+    // ratchets back down (a later dip cannot disarm it). Mirrors the
+    // partial_tp_done / trailing_active idempotency pattern. Default false = the
+    // fixed SL is the only floor (legacy).
+    be_armed: false,
+    be_armed_at: null,
+    // Vega EXIT-3 #2 — fee-decay baseline. The fee-accrual rate at deploy
+    // (initial_fee_tvl_24h, set above) IS the baseline; this records the
+    // earliest in-window snapshot rate so a collapse is measured against a real
+    // early reading, not the entry estimate alone. Populated lazily on the first
+    // post-warmup tick; null until then (fail-safe: no baseline → no decay exit).
+    fee_decay_baseline: null,
+    fee_decay_baseline_at: null,
     pending_peak_pnl_pct: null,
     pending_peak_started_at: null,
     pending_trailing_current_pnl_pct: null,
@@ -444,6 +459,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     fee_per_tvl_24h,
     price_change_1h_pct,
     net_buyers_1h,
+    age_minutes,
   } = positionData;
   // Vega fix #1 — exit DECISION metric is the fee-inclusive net economic
   // position (current value + fees − deposit, REAL IL embedded in current
@@ -463,6 +479,63 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
+
+  // ── Max-hold-time forced exit (Vega EXIT-3 #3, HIGHEST PRECEDENCE) ──────
+  // Live mirror of paper-trades.js evaluatePaperExit's MAX_HOLD gate, now with
+  // an IN-RANGE GUARD so a winner that is still parking the active bin (the
+  // ZINC-type 11h+ tail) is NOT clipped at the old 12h hard cap.
+  //   - age >= maxHoldOorMinutes (720m) AND OUT OF RANGE → close (max_hold_oor):
+  //     a stale OOR position earns no fees; do not babysit it past 12h.
+  //   - age >= maxHoldMinutes (1440m) → close (max_hold_hard) REGARDLESS of
+  //     range: the entry thesis is structurally dead past 24h.
+  //   - age in [720, 1440) AND IN RANGE → allowed to keep running (winner tail).
+  // Runs BEFORE the confirmed-trailing pickup + every PnL rule so a stuck
+  // position cannot dodge the time gate via PnL fluctuation.
+  // BLUECHIP-AWARE: a longer/exempt window is a one-line override here once the
+  // bluechip path is live (pos.is_bluechip → use maxHoldMinutesBluechip). For
+  // now every deploy is a memecoin so the memecoin window applies.
+  // FAIL-SAFE (anti-pattern #2): age unknown (no age_minutes AND no parseable
+  // deployed_at) → skip the gate entirely (never force-close on a guessed age).
+  // Reversibility: maxHoldMinutes=0 → silent revert (no time gate, legacy).
+  {
+    const hardLimit = Number(mgmtConfig.maxHoldMinutes);
+    if (Number.isFinite(hardLimit) && hardLimit > 0) {
+      let ageMin = Number(age_minutes);
+      if (!Number.isFinite(ageMin) && pos.deployed_at) {
+        const ms = Date.now() - new Date(pos.deployed_at).getTime();
+        ageMin = Number.isFinite(ms) ? Math.floor(ms / 60000) : NaN;
+      }
+      if (Number.isFinite(ageMin)) {
+        // OOR window: default to hardLimit/2 (=720m at the 1440m default) but
+        // honor an explicit maxHoldOorMinutes; clamp so it can never exceed the
+        // hard limit (an OOR position must never get a LONGER leash).
+        const oorLimit = Math.min(
+          Number.isFinite(Number(mgmtConfig.maxHoldOorMinutes))
+            ? Number(mgmtConfig.maxHoldOorMinutes)
+            : hardLimit / 2,
+          hardLimit,
+        );
+        if (ageMin >= hardLimit) {
+          return {
+            action: "MAX_HOLD_EXPIRED",
+            reason: `held ${ageMin}m exceeds maxHold ${hardLimit}m — forced close (max_hold_hard)`,
+          };
+        }
+        // OOR past the OOR window but under the hard limit → cut now. We read the
+        // live range flag directly (in_range === false) so a position OOR right
+        // now is cut even before the OOR timer below would have fired.
+        const isOor = in_range === false || !!pos.out_of_range_since;
+        if (ageMin >= oorLimit && isOor) {
+          return {
+            action: "MAX_HOLD_EXPIRED",
+            reason: `held ${ageMin}m >= ${oorLimit}m AND out-of-range — forced close (max_hold_oor)`,
+          };
+        }
+        // age in [oorLimit, hardLimit) AND in-range → fall through (winner tail
+        // allowed to keep running; trailing/SL still govern its exit).
+      }
+    }
+  }
 
   if (pos.confirmed_trailing_exit_until) {
     if (new Date(pos.confirmed_trailing_exit_until).getTime() > Date.now() && pos.confirmed_trailing_exit_reason) {
@@ -485,6 +558,28 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     log("state", `Position ${position_address} trailing TP activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
   }
 
+  // ── Break-even stop ARM (Vega EXIT-3 #1) ───────────────────────────────
+  // Once a position has peaked >= breakEvenArmPct (fee-inclusive), lock the
+  // modal: be_armed flips true (idempotent, persisted, NEVER disarms). The
+  // effective stop then ratchets UP from the fixed SL to break-even
+  // (breakEvenStopPct, default 0% = exit at flat, +1% optional to lock a sliver
+  // of gain). This is the "winner gives it all back to -8%" fix: a +6% pump that
+  // round-trips now exits at break-even, not at the -8% floor. Pure ADD — does
+  // NOT touch trailing/partial/velocity. Default OFF (breakEvenStopEnabled).
+  // FAIL-SAFE: peak unknown/non-finite → never arms. We use peak_pnl_pct (the
+  // confirmed high-water mark) so a single noisy tick can't arm it spuriously.
+  if (
+    mgmtConfig.breakEvenStopEnabled === true &&
+    !pos.be_armed &&
+    Number.isFinite(Number(pos.peak_pnl_pct)) &&
+    Number(pos.peak_pnl_pct) >= Number(mgmtConfig.breakEvenArmPct ?? 5)
+  ) {
+    pos.be_armed = true;
+    pos.be_armed_at = new Date().toISOString();
+    changed = true;
+    log("state", `Position ${position_address} break-even stop ARMED (peak ${Number(pos.peak_pnl_pct).toFixed(2)}% >= ${mgmtConfig.breakEvenArmPct ?? 5}%) — floor ratcheted to ${mgmtConfig.breakEvenStopPct ?? 0}%`);
+  }
+
   // Update OOR state
   if (in_range === false && !pos.out_of_range_since) {
     pos.out_of_range_since = new Date().toISOString();
@@ -497,6 +592,31 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   if (changed) save(state);
+
+  // ── Break-even stop (Vega EXIT-3 #1) ───────────────────────────────────
+  // Runs BEFORE the fixed SL so the HIGHER floor wins (anti-pattern guard: a
+  // ratcheted break-even at 0% must pre-empt the -8% SL — else the position
+  // would ride all the way back down to -8% and the lock would be meaningless).
+  // Only fires when armed (peak crossed breakEvenArmPct earlier) AND the net
+  // fee-inclusive PnL has fallen to/through the break-even floor. This NEVER
+  // loosens downside protection: it only TIGHTENS the stop upward on a winner;
+  // the fixed SL below still catches a position that was never armed.
+  // FAIL-SAFE: pnl suspicious / null → skip (SL still owns the floor).
+  if (
+    mgmtConfig.breakEvenStopEnabled === true &&
+    pos.be_armed &&
+    !pnl_pct_suspicious &&
+    currentPnlPct != null &&
+    Number.isFinite(Number(currentPnlPct)) &&
+    Number(currentPnlPct) <= Number(mgmtConfig.breakEvenStopPct ?? 0)
+  ) {
+    return {
+      action: "BREAK_EVEN_STOP",
+      reason: `Break-even stop: net PnL ${Number(currentPnlPct).toFixed(2)}% <= ${mgmtConfig.breakEvenStopPct ?? 0}% after arming at peak ${Number(pos.peak_pnl_pct ?? 0).toFixed(2)}% — modal locked, NOT round-tripping to ${mgmtConfig.stopLossPct}%`,
+      peak_pnl_pct: pos.peak_pnl_pct ?? 0,
+      current_pnl_pct: currentPnlPct,
+    };
+  }
 
   // ── Stop loss ──────────────────────────────────────────────────
   if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
@@ -569,6 +689,100 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       action: "VELOCITY_EXIT",
       reason: `Velocity exit: 1h price ${Number(price_change_1h_pct).toFixed(2)}% < -${mgmtConfig.velocityDropPct ?? 15}% AND net_buyers_1h ${net_buyers_1h} < 0 while in profit (${currentPnlPct.toFixed(2)}%) — momentum reversal`,
     };
+  }
+
+  // ── Fee-decay exit (Vega EXIT-3 #2, the BIGGEST gap) ───────────────────
+  // Community trigger #1: "exit when fees start slowing down." We track the
+  // fee-accrual rate (fee_per_tvl_24h) against a per-position BASELINE captured
+  // early in the position's life, and exit when the current rate COLLAPSES below
+  // feeDecayThreshold × baseline (default 0.30 = a 70% drop in fee velocity). At
+  // that point the position is no longer earning its keep, so we take profit
+  // while we still have it — this is a PROFIT-TAKING rule, NOT a cut-loss.
+  //
+  // HARD GUARD — fires ONLY when net IN-PROFIT (currentPnlPct > 0). A loser is
+  // owned by SL / break-even / OOR; fee-decay must never close a position
+  // underwater (that would realize the loss early — the opposite of intent).
+  //
+  // Baseline: prefer the lazily-captured fee_decay_baseline (first post-warmup
+  // reading), else the deploy-time initial_fee_tvl_24h. Captured only once age
+  // >= feeDecayWarmupMinutes so the first-tick spike doesn't poison the baseline.
+  // Exit only after age >= feeDecayMinAgeMinutes so a momentary early dip can't
+  // false-fire before the position has had time to actually accrue.
+  //
+  // Coordinated with VELOCITY_EXIT (above): velocity reads PRICE reversal, this
+  // reads FEE-rate collapse. Different inputs, can't double-fire on the same tick
+  // (velocity returns first if both hit; either way the position closes once).
+  //
+  // FAIL-SAFE (anti-pattern #2): missing/non-finite current rate OR no usable
+  // baseline (null/<=0) → SKIP (never assume decay, never false-exit). Default
+  // OFF (feeDecayExitEnabled). Reversibility: flag false → rule never runs.
+  if (
+    mgmtConfig.feeDecayExitEnabled === true &&
+    !pnl_pct_suspicious &&
+    currentPnlPct != null &&
+    Number.isFinite(Number(currentPnlPct)) &&
+    Number(currentPnlPct) > 0
+  ) {
+    const warmupMin = Number(mgmtConfig.feeDecayWarmupMinutes ?? 30);
+    const minAgeMin = Number(mgmtConfig.feeDecayMinAgeMinutes ?? 60);
+    const threshold = Number(mgmtConfig.feeDecayThreshold ?? 0.30);
+    const curRate = Number(fee_per_tvl_24h);
+    // Resolve age (same robust derivation as the max-hold gate).
+    let feeAgeMin = Number(age_minutes);
+    if (!Number.isFinite(feeAgeMin) && pos.deployed_at) {
+      const ms = Date.now() - new Date(pos.deployed_at).getTime();
+      feeAgeMin = Number.isFinite(ms) ? Math.floor(ms / 60000) : NaN;
+    }
+
+    // Resolve baseline: the deploy-time initial_fee_tvl_24h is the PRIMARY
+    // baseline (a real early reading). Only when it is missing/<=0 do we fall
+    // back to a lazily-captured first post-warmup rate. Capturing only when no
+    // entry baseline exists prevents the capture from poisoning the same-tick
+    // check (capturing curRate then comparing curRate against it would never fire).
+    const entryBaseline =
+      Number.isFinite(Number(pos.initial_fee_tvl_24h)) && Number(pos.initial_fee_tvl_24h) > 0
+        ? Number(pos.initial_fee_tvl_24h)
+        : null;
+
+    if (
+      entryBaseline == null &&
+      pos.fee_decay_baseline == null &&
+      Number.isFinite(curRate) &&
+      curRate > 0 &&
+      Number.isFinite(feeAgeMin) &&
+      feeAgeMin >= warmupMin
+    ) {
+      pos.fee_decay_baseline = curRate;
+      pos.fee_decay_baseline_at = new Date().toISOString();
+      save(state);
+      log("state", `Position ${position_address} fee-decay baseline captured: ${curRate}% fee/TVL at ${feeAgeMin}m`);
+    }
+
+    const baseline =
+      entryBaseline != null
+        ? entryBaseline
+        : Number.isFinite(Number(pos.fee_decay_baseline)) && Number(pos.fee_decay_baseline) > 0
+          ? Number(pos.fee_decay_baseline)
+          : null;
+
+    if (
+      baseline != null &&
+      Number.isFinite(curRate) &&
+      Number.isFinite(threshold) &&
+      threshold > 0 &&
+      Number.isFinite(minAgeMin) &&
+      Number.isFinite(feeAgeMin) &&
+      feeAgeMin >= minAgeMin &&
+      curRate < baseline * threshold
+    ) {
+      return {
+        action: "FEE_DECAY_EXIT",
+        reason: `Fee-decay exit: fee/TVL ${curRate}% < ${(threshold * 100).toFixed(0)}% of baseline ${baseline}% (= ${(baseline * threshold).toFixed(3)}%) while in profit (${Number(currentPnlPct).toFixed(2)}%) — fees slowed, taking profit`,
+        baseline_fee_tvl: baseline,
+        current_fee_tvl: curRate,
+        current_pnl_pct: currentPnlPct,
+      };
+    }
   }
 
   // ── Out of range too long ──────────────────────────────────────
@@ -678,7 +892,6 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // ── Low yield (only after position has had time to accumulate fees) ───
-  const { age_minutes } = positionData;
   const minAgeForYieldCheck = mgmtConfig.minAgeBeforeYieldCheck ?? 60;
   if (
     fee_per_tvl_24h != null &&
