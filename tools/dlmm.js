@@ -28,6 +28,16 @@ import { recordRealizedLoss } from "../account-circuit-breaker.js";
 import { computeLiveRealizedSolDelta } from "../realized-sol.js";
 import { getSigningWallet } from "../wallet-loader.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
+import { isBluechipMintPair } from "./screening.js";
+
+// ── Bluechip income-engine hard-locked belt (Vega — Opsi B) ──
+// Hardcoded ceiling on per-position bluechip SOL, INDEPENDENT of memecoin
+// maxDeployAmount. config.risk.maxBluechipPositionSol may TIGHTEN below this but
+// can NEVER exceed it — the deploy path takes Math.min(belt, config). Mirrors the
+// MAX_LIVE_POSITION_SOL hard-lock pattern: a real-money invariant lives in code,
+// not just in a tunable file. Raising it is an explicit Bro decision (anti-pattern
+// #7: never let a tunable/LLM path size above a hardcoded cap).
+const MAX_BLUECHIP_POSITION_SOL = 0.45;
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
@@ -648,12 +658,23 @@ export async function deployPosition({
   }
 
   const { StrategyType, getBinIdFromPrice, getPriceOfBinByBinId } = await getDLMM();
-  const pool = await getPool(pool_address);
+  const pool = await (_testHooks.getPool || getPool)(pool_address);
   const baseMint = pool.lbPair.tokenXMint.toString();
+  const quoteMint = pool.lbPair.tokenYMint.toString();
   if (isBaseMintOnCooldown(baseMint)) {
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
   }
+
+  // ── Bluechip income-engine mode (Vega — Opsi B, money-path) ──
+  // Dual-mode: when bluechipModeEnabled is ON, bluechip pools (both legs whitelisted)
+  // get the income-engine PRIVILEGES (wide bins, vol-floor exemption, separate cap),
+  // while non-bluechip pools STAY on the memecoin path (strict bins, memecoin cap).
+  // Resolve from the LIVE on-chain pool mints (not LLM-supplied metadata) so the guard
+  // can NEVER be fooled by a mislabelled candidate. bluechipModeEnabled default OFF →
+  // isBluechipDeploy is always false → the memecoin path below is byte-for-byte unchanged.
+  const bluechipModeEnabled = config.screening?.bluechipModeEnabled === true;
+  const isBluechipDeploy = bluechipModeEnabled && isBluechipMintPair(baseMint, quoteMint);
   const activeBin = await pool.getActiveBin();
   const actualBinStep = pool.lbPair.binStep;
   const activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
@@ -706,6 +727,23 @@ export async function deployPosition({
   if (finalAmountY <= 0) {
     throw new Error("Invalid deploy amount: provide a positive amount_y/amount_sol.");
   }
+
+  // ── Bluechip per-position SOL cap (Vega — Opsi B, money-path belt) ──
+  // ONLY a bluechip deploy is subject to this cap (memecoin keeps maxDeployAmount,
+  // unchanged). Effective cap = min(hardcoded belt, config tunable) — config can
+  // tighten BELOW the hardcoded MAX_BLUECHIP_POSITION_SOL but can NEVER exceed it
+  // (anti-pattern #7: a tunable/LLM-driven size can never breach the code-pinned cap).
+  if (isBluechipDeploy) {
+    const bluechipCap = Math.min(
+      MAX_BLUECHIP_POSITION_SOL,
+      Number(config.risk?.maxBluechipPositionSol ?? MAX_BLUECHIP_POSITION_SOL),
+    );
+    if (finalAmountY > bluechipCap) {
+      throw new Error(
+        `Invalid deploy amount: bluechip position ${finalAmountY} SOL exceeds the bluechip cap ${bluechipCap} SOL (hard belt ${MAX_BLUECHIP_POSITION_SOL}).`,
+      );
+    }
+  }
   const isSingleSidedSol = finalAmountX <= 0 && finalAmountY > 0;
   if (isSingleSidedSol && (Number(bins_above ?? 0) > 0 || Number(upside_pct ?? 0) > 0)) {
     throw new Error(
@@ -732,6 +770,35 @@ export async function deployPosition({
     throw new Error(
       `Invalid deploy range: total bins ${totalBins} is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
     );
+  }
+
+  // ── Bins-below CEILING (Vega — Opsi B whitelist privilege gate) ──
+  // ONLY enforced when bluechipModeEnabled is ON, so the memecoin path stays
+  // byte-for-byte unchanged when the master flag is OFF (no new ceiling exists).
+  // With the flag ON:
+  //   - BLUECHIP (whitelist) pools may go WIDE up to bluechipMaxBinsBelow (the income
+  //     engine's broad passive range). This is the privilege the whitelist unlocks.
+  //   - Everything else (non-whitelist pair) is clamped to the memecoin maxBinsBelow.
+  // This IS the whitelist enforcement: a non-bluechip pair simply CANNOT obtain a
+  // wide range while the engine is in bluechip mode → REFUSE. bins_above stays 0
+  // (Opsi B single-side SOL — amount_x is guarded separately above).
+  if (bluechipModeEnabled) {
+    const memecoinMaxBinsBelow = Math.max(
+      minBinsBelow,
+      Number(config.strategy.maxBinsBelow ?? minBinsBelow),
+    );
+    const bluechipCeil = Math.max(
+      memecoinMaxBinsBelow,
+      Math.round(Number(config.strategy.bluechipMaxBinsBelow ?? memecoinMaxBinsBelow)),
+    );
+    const binsCeiling = isBluechipDeploy ? bluechipCeil : memecoinMaxBinsBelow;
+    if (activeBinsBelow > binsCeiling) {
+      throw new Error(
+        isBluechipDeploy
+          ? `Invalid deploy range: bins_below ${activeBinsBelow} exceeds bluechip ceiling ${binsCeiling}.`
+          : `Invalid deploy range: bins_below ${activeBinsBelow} exceeds memecoin ceiling ${binsCeiling}. Wide range is bluechip-whitelist only (pool legs not both whitelisted).`,
+      );
+    }
   }
 
   if (process.env.DRY_RUN === "true") {

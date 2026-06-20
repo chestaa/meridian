@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -1159,6 +1159,29 @@ async function runSafetyChecks(name, args) {
           pass: false,
           reason: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
         };
+      }
+
+      // ── Bluechip per-position SOL cap (Vega — Opsi B, executor suspenders) ──
+      // dlmm.deployPosition is the AUTHORITATIVE belt (it classifies from the live
+      // on-chain pool mints). This is best-effort suspenders using the args metadata:
+      // it fires only when bluechip mode is ON AND both legs are present and classify
+      // as a whitelisted bluechip pair. When the engine is OFF, or the pair can't be
+      // classified here, we fall through to the memecoin maxDeployAmount above and let
+      // dlmm.js make the final call. Memecoin path: untouched when flag OFF.
+      if (config.screening?.bluechipModeEnabled === true) {
+        const quoteMint = args.quote_mint ?? args.quote_address ?? null;
+        if (args.base_mint && quoteMint && isBluechipMintPair(args.base_mint, quoteMint)) {
+          const bluechipCap = Math.min(
+            0.45, // mirrors dlmm.js MAX_BLUECHIP_POSITION_SOL hard belt
+            Number(config.risk?.maxBluechipPositionSol ?? 0.45),
+          );
+          if (amountY > bluechipCap) {
+            return {
+              pass: false,
+              reason: `Bluechip SOL amount ${amountY} exceeds the bluechip cap (${bluechipCap}).`,
+            };
+          }
+        }
       }
 
       // Check SOL balance
