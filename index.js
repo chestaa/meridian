@@ -28,6 +28,7 @@ import {
   isExecutiveMode,
   isMeaningfulReport,
 } from "./telegram.js";
+import { formatAgeIndo, formatPositionsMessage } from "./telegram-display.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, markPartialTpDone } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
@@ -1871,19 +1872,19 @@ function formatHelpText() {
     "/details — verbose digest (technical)",
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
-    "/positions — list open positions",
-    "/pool <n> — detailed info for one open position",
-    "/close <n> — close one position by index",
-    "/closeall — close all open positions",
-    "/set <n> <note> — set note/instruction on position",
-    "/circuit — circuit breaker status | /circuit reset — re-arm",
-    "/digest — on-demand instant pulse (paper PnL, Orion, thresholds, cost, circuit)",
-    "/config — show important runtime config",
-    "/settings — button menu for common config",
-    "/setcfg <key> <value> — update persisted config",
-    "/screen — refresh deterministic candidate list",
-    "/candidates — show latest cached candidates",
-    "/deploy <n> — deploy candidate by cached index",
+    "/positions — lihat posisi terbuka (bernomor)",
+    "/pool 1 — detail satu posisi (ganti 1 dengan nomornya)",
+    "/close 1 — tutup posisi nomor 1",
+    "/closeall — tutup semua posisi",
+    "/set 1 catatanmu — kasih catatan/instruksi ke posisi nomor 1",
+    "/circuit — status circuit breaker | /circuit reset — re-arm",
+    "/digest — ringkasan cepat (PnL paper, Orion, threshold, biaya, circuit)",
+    "/config — lihat config penting yang aktif",
+    "/settings — menu tombol untuk config umum",
+    "/setcfg minTvl 10000 — ubah satu config (key lalu value)",
+    "/screen — refresh daftar kandidat",
+    "/candidates — lihat kandidat terbaru",
+    "/deploy 1 — deploy kandidat nomor 1 dari daftar",
     "/briefing — morning briefing",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
@@ -2219,7 +2220,7 @@ async function telegramHandler(msg) {
     try {
       const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
       const suffix = text === "/status" && positions.total_positions
-        ? `\n\nUse /positions for the numbered list.`
+        ? `\n\nKetik /positions buat lihat daftar posisi bernomor.`
         : "";
       await sendMessage(`${formatWalletStatus(wallet, positions)}${suffix}`).catch(() => {});
     } catch (e) {
@@ -2236,15 +2237,9 @@ async function telegramHandler(msg) {
   if (text === "/positions") {
     try {
       const { positions, total_positions } = await getMyPositions({ force: true });
-      if (total_positions === 0) { await sendMessage("No open positions."); return; }
+      if (total_positions === 0) { await sendMessage("Belum ada posisi terbuka."); return; }
       const cur = config.management.solMode ? "◎" : "$";
-      const lines = positions.map((p, i) => {
-        const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
-        const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
-        const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
-      });
-      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+      await sendMessage(formatPositionsMessage(positions, total_positions, cur));
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }
@@ -2254,17 +2249,20 @@ async function telegramHandler(msg) {
     try {
       const idx = parseInt(poolMatch[1]) - 1;
       const { positions } = await getMyPositions({ force: true });
-      if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
+      if (idx < 0 || idx >= positions.length) { await sendMessage("Nomor tidak valid. Cek /positions dulu buat lihat nomornya."); return; }
       const pos = positions[idx];
+      const cur = config.management.solMode ? "◎" : "$";
+      const rangeStatus = pos.in_range ? "✅ Dalam range" : `⚠️ Keluar range (OOR) ${formatAgeIndo(pos.minutes_out_of_range ?? 0)}`;
       await sendMessage([
-        `${idx + 1}. ${pos.pair}`,
+        `#${idx + 1}  ${pos.pair}`,
+        `Nilai posisi: ${cur}${Number(pos.total_value_usd ?? 0).toFixed(2)}`,
+        `Untung/Rugi: ${pos.pnl_pct ?? "?"}%`,
+        `Fee didapat (income, belum diklaim): ${cur}${Number(pos.unclaimed_fees_usd ?? 0).toFixed(2)}`,
+        `Umur: ${formatAgeIndo(pos.age_minutes)}  |  ${rangeStatus}`,
+        `Range bin: ${pos.lower_bin} → ${pos.upper_bin} (aktif ${pos.active_bin})`,
         `Pool: ${pos.pool}`,
         `Position: ${pos.position}`,
-        `Range: ${pos.lower_bin} → ${pos.upper_bin} | active ${pos.active_bin}`,
-        `PnL: ${pos.pnl_pct ?? "?"}% | fees: ${config.management.solMode ? "◎" : "$"}${pos.unclaimed_fees_usd ?? "?"}`,
-        `Value: ${config.management.solMode ? "◎" : "$"}${pos.total_value_usd ?? "?"}`,
-        `Age: ${pos.age_minutes ?? "?"}m | ${pos.in_range ? "IN RANGE" : `OOR ${pos.minutes_out_of_range ?? 0}m`}`,
-        pos.instruction ? `Note: ${pos.instruction}` : null,
+        pos.instruction ? `Catatan: ${pos.instruction}` : null,
       ].filter(Boolean).join("\n"));
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
@@ -2277,19 +2275,20 @@ async function telegramHandler(msg) {
     try {
       const idx = parseInt(closeMatch[1]) - 1;
       const { positions } = await getMyPositions({ force: true });
-      if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
+      if (idx < 0 || idx >= positions.length) { await sendMessage("Nomor tidak valid. Cek /positions dulu buat lihat nomornya."); return; }
       const pos = positions[idx];
       // Vega fix #4 — dedupe: mark this position so any downstream notifyClose
       // (if /close is ever routed through executor) skips its own emit.
       markManualClose(pos.position);
-      await sendMessage(`Closing ${pos.pair}...`);
+      await sendMessage(`Menutup posisi #${idx + 1} ${pos.pair}...`);
       const result = await closePosition({ position_address: pos.position });
       if (result.success) {
+        const cur = config.management.solMode ? "◎" : "$";
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
-        const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        const claimNote = result.claim_txs?.length ? `\nTx klaim fee: ${result.claim_txs.join(", ")}` : "";
+        await sendMessage(`✅ Posisi ${pos.pair} ditutup\nUntung/Rugi: ${cur}${result.pnl_usd ?? "?"}\nTx tutup: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
       } else {
-        await sendMessage(`❌ Close failed: ${result.error || result.message || 'Close failed'}`);
+        await sendMessage(`❌ Gagal menutup posisi: ${result.error || result.message || 'Close failed'}`);
       }
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
@@ -2324,10 +2323,10 @@ async function telegramHandler(msg) {
       const idx = parseInt(setMatch[1]) - 1;
       const note = setMatch[2].trim();
       const { positions } = await getMyPositions({ force: true });
-      if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
+      if (idx < 0 || idx >= positions.length) { await sendMessage("Nomor tidak valid. Cek /positions dulu buat lihat nomornya."); return; }
       const pos = positions[idx];
       setPositionInstruction(pos.position, note);
-      await sendMessage(`✅ Note set for ${pos.pair}:\n"${note}"`);
+      await sendMessage(`✅ Catatan tersimpan untuk posisi #${idx + 1} ${pos.pair}:\n"${note}"`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }
