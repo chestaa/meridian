@@ -94,6 +94,31 @@ export const config = {
       { minConf: 80, maxConf: 90,  mult: 1.0 },  // 80-90 → 1x
       { minConf: 90, maxConf: 101, mult: 1.5 },  // 90+   → 1.5x (capped at maxDeployAmount)
     ],
+    // ── Auto-compound sizing (Vega, money-path) ──────────────────────────────
+    // When ON, computeDeployAmount lets the position scale with the wallet:
+    // deployable (= wallet − gasReserve) × positionSizePct, clamped between
+    // deployAmountSol (floor) and maxDeployAmount (ceiling). As profit grows the
+    // wallet, deployable grows, so the position grows — until a bound binds.
+    // Symmetric: after a loss the wallet shrinks, deployable shrinks, the next
+    // position shrinks (auto de-risk). This is compounding in BOTH directions.
+    //
+    // The flag only GOVERNS THE BOUNDS, never disables them: with the flag OFF
+    // computeDeployAmount returns the fixed floor (legacy behavior, fully
+    // reversible). With the flag ON the two extra anti-over-leverage bounds below
+    // apply ON TOP of the floor/ceiling clamp.
+    autoCompoundEnabled: u.autoCompoundEnabled ?? false,
+    // Concentration cap: a single position may never exceed this fraction of the
+    // TOTAL wallet (not deployable — total, so the buffer is even more
+    // conservative). maxPositions=1 means this fraction IS the single-position
+    // exposure. Default 0.60 → at most 60% of wallet in one LP, ≥40% + gas always
+    // held back. NEVER auto-raised above 0.70 without an explicit Bro decision.
+    maxConcentrationPct: numericConfig(u.maxConcentrationPct) ?? 0.60,
+    // Absolute hard ceiling (SOL). A second, hardcoded-default belt INDEPENDENT of
+    // the configurable maxDeployAmount: no matter how large the wallet grows or
+    // how maxDeployAmount is mis-set, a single auto-compounded position can never
+    // exceed this. This is the "unbounded wallet" guard — Bro raises it
+    // explicitly when the strategy graduates to larger size. Default 1.0 SOL.
+    autoCompoundHardCeilingSol: numericConfig(u.autoCompoundHardCeilingSol) ?? 1.0,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -716,25 +741,74 @@ export const config = {
 
 /**
  * Compute the optimal deploy amount for a given wallet balance.
- * Scales position size with wallet growth (compounding).
+ * Scales position size with wallet growth (auto-compounding) when enabled.
  *
- * Formula: clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)
+ * Base formula (always): clamp(deployable × positionSizePct,
+ *                               floor=deployAmountSol, ceil=maxDeployAmount)
+ * where deployable = max(0, walletSol − gasReserve)  ← gas ALWAYS reserved first.
  *
- * Examples (defaults: gasReserve=0.2, positionSizePct=0.35, floor=0.5):
- *   0.8 SOL wallet → 0.6 SOL deploy  (floor)
- *   2.0 SOL wallet → 0.63 SOL deploy
- *   3.0 SOL wallet → 0.98 SOL deploy
- *   4.0 SOL wallet → 1.33 SOL deploy
+ * Auto-compound (config.risk.autoCompoundEnabled === true) ADDS two
+ * anti-over-leverage bounds on top of the clamp:
+ *   1. Concentration cap — result ≤ walletSol × maxConcentrationPct (default
+ *      0.60). A single position never eats more than this fraction of the TOTAL
+ *      wallet, so a buffer + gas always remain.
+ *   2. Absolute hard ceiling — result ≤ autoCompoundHardCeilingSol (default 1.0).
+ *      Independent of the configurable maxDeployAmount; the "unbounded wallet"
+ *      guard. Only Bro raises it.
+ *
+ * Compound is SYMMETRIC: wallet grows from profit → deployable grows → position
+ * grows (up to whichever bound binds); wallet shrinks from loss → position
+ * shrinks (auto de-risk). The position can ONLY grow when realized profit has
+ * already grown the wallet — never on leverage.
+ *
+ * When autoCompoundEnabled === false: legacy behavior — the original
+ * clamp(deployable × pct, floor, ceil) with NO concentration/hard-ceiling
+ * bounds. With today's locked floor === ceil this returns exactly the fixed
+ * amount, identical to pre-auto-compound production. Fully reversible.
+ *
+ * @param {number} walletSol - current live SOL balance
+ * @param {object} cfg - config (test seam; defaults to live config)
  */
-export function computeDeployAmount(walletSol) {
-  const reserve  = config.management.gasReserve      ?? 0.2;
-  const pct      = config.management.positionSizePct ?? 0.35;
-  const floor    = config.management.deployAmountSol;
-  const ceil     = config.risk.maxDeployAmount;
-  const deployable = Math.max(0, walletSol - reserve);
+export function computeDeployAmount(walletSol, cfg = config) {
+  const reserve  = cfg.management.gasReserve      ?? 0.2;
+  const pct      = cfg.management.positionSizePct ?? 0.35;
+  const floor    = cfg.management.deployAmountSol;
+  const ceil     = cfg.risk.maxDeployAmount;
+  const autoCompound = cfg.risk.autoCompoundEnabled === true;
+
+  const wallet     = Number.isFinite(walletSol) ? walletSol : 0;
+  const deployable = Math.max(0, wallet - reserve);
   const dynamic    = deployable * pct;
-  const result     = Math.min(ceil, Math.max(floor, dynamic));
-  return parseFloat(result.toFixed(2));
+
+  // Flag OFF → legacy clamp only (no concentration/hard-ceiling bounds).
+  // With locked floor===ceil this is the fixed amount = pre-compound behavior.
+  if (!autoCompound) {
+    const legacy = Math.min(ceil, Math.max(floor, dynamic));
+    return parseFloat(Math.max(0, legacy).toFixed(2));
+  }
+
+  // 1. Base compound clamp: floor ≤ (deployable × pct) ≤ ceil.
+  let result = Math.min(ceil, Math.max(floor, dynamic));
+
+  // 2. Concentration cap — fraction of TOTAL wallet (anti over-leverage).
+  const concPct = numericConfig(cfg.risk.maxConcentrationPct) ?? 0.60;
+  const concentrationCap = wallet * concPct;
+  result = Math.min(result, concentrationCap);
+
+  // 3. Absolute hard ceiling (SOL) — independent belt, unbounded-wallet guard.
+  const hardCeiling = numericConfig(cfg.risk.autoCompoundHardCeilingSol) ?? 1.0;
+  result = Math.min(result, hardCeiling);
+
+  // 4. Gas-reserve hard ceiling — a position can NEVER exceed what is deployable
+  // after gas, EVEN when the floor would lift it higher on a tiny wallet. This
+  // dominates the floor: gas is sacred, leverage is never created. When the
+  // wallet can't fund the floor, the result falls below it (and below dust) —
+  // the executor's minDeploy guard (max(0.1, deployAmountSol)) is the suspenders
+  // that then refuses the undeployable amount rather than over-committing gas.
+  result = Math.min(result, deployable);
+
+  // Never negative.
+  return parseFloat(Math.max(0, result).toFixed(2));
 }
 
 /**
