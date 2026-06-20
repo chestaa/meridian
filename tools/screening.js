@@ -54,6 +54,15 @@ const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 // if the SOL-quote pre-filter is ever disabled (defense in depth).
 const QUOTE_ORGANIC_EXEMPT_MINTS = new Set([WSOL_MINT, USDC_MINT]);
 
+// Blue-chip BASE mints exempt from the market-regime downtrend pause (Cassiopeia —
+// STOP BLEED T3). A blue-chip base token (wSOL, USDC, USDT, major bridged BTC/ETH)
+// has a SYMMETRIC LP payoff and keeps paying fees both ways in a downtrend, so it
+// must NOT be paused like a memecoin narrow-range pool. For now (no bluechip mode)
+// the deployable funnel is all memecoins, so this set just future-proofs the gate —
+// adding the Phase 1 bluechip allow-list later is a one-line edit here.
+const USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+const BLUECHIP_BASE_MINTS = new Set([WSOL_MINT, USDC_MINT, USDT_MINT]);
+
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
@@ -406,6 +415,189 @@ export function solQuoteRejectReason(pool, s) {
   if (quoteMint == null || quoteMint === "") return "non_sol_quote_undeployable";
   if (quoteMint !== WSOL_MINT) return "non_sol_quote_undeployable";
   return null;
+}
+
+// ─── Market-regime detection (Cassiopeia — STOP BLEED T3) ──────────────────────
+//
+// ROOT CAUSE of T3 bleed (-$4.67): memecoin narrow-range pools deployed into a
+// FALLING market keep getting stopped out — price drifts down out of the active
+// bin, we cut at the stop, repeat. A DLMM single-side-SOL narrow position has an
+// ASYMMETRIC payoff in a downtrend (limited upside if it bounces, full bleed if it
+// keeps falling), so the rational move is: pause MEMECOIN deploys while the broad
+// market is trending down. (A blue-chip/symmetric-payoff pool is fine in a
+// downtrend — fees keep paying both ways — so this gate is built to EXEMPT
+// blue-chip profiles when that mode exists. For now every deploy is a memecoin.)
+//
+// DETECTION: simplest reliable broad-market signal = SOL 24h price change. SOL is
+// the beta of the whole Solana memecoin complex; when SOL bleeds, memecoins bleed
+// harder. We REUSE the boss-report price source (Jupiter v3 + CoinGecko fallback)
+// — CoinGecko's simple/price already returns 24h change with one extra query flag
+// (include_24hr_change=true), so we get trend with NO history store, NO new infra.
+const MARKET_REGIME_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min — regime is market-wide, not per-pool; one fetch per cycle
+let _marketRegimeCache = null; // { regime, sol24hChangePct, reasoning, source, ts }
+
+/**
+ * Classify a SOL 24h % change into a market regime. PURE + unit-tested.
+ *
+ * FAIL-SAFE (anti-pattern #2): a null / non-finite change (fetch failed, source
+ * down) returns NEUTRAL with a `data_missing` reason — we do NOT freeze the bot
+ * blind, but we also do NOT pretend the market is fine. NEUTRAL = deploy normally
+ * (we never had regime data before this gate, so missing-data behavior == legacy).
+ *
+ * @param {number|null} sol24hChangePct - SOL 24h price change in PERCENT (e.g. -7.2)
+ * @param {object} s - thresholds; reads regimeDowntrendThresholdPct (e.g. -5),
+ *   optional regimeUptrendThresholdPct (e.g. +5) for the UPTREND label.
+ * @returns {{regime:string, reasoning:string}} regime ∈ UPTREND|NEUTRAL|DOWNTREND
+ */
+export function classifyRegime(sol24hChangePct, s) {
+  // strictNumeric (not numeric): Number(null)===0 would FABRICATE a 0% change from
+  // missing data (anti-pattern #2) and mislabel a dead feed as NEUTRAL-band. We must
+  // tell "no data" (→ fail-safe NEUTRAL with a data_missing reason) apart from a
+  // genuine 0% move (→ NEUTRAL because the market really is flat).
+  const pct = strictNumeric(sol24hChangePct);
+  if (pct == null) {
+    return { regime: "NEUTRAL", reasoning: "regime data missing — fail-safe NEUTRAL (deploy as legacy)" };
+  }
+  // Downtrend threshold is a NEGATIVE percent (default -5). A more-negative move
+  // (pct <= threshold) = downtrend. Be defensive: accept it written as -5 or 5.
+  const downRaw = numeric(s?.regimeDowntrendThresholdPct);
+  const downThresh = downRaw == null ? -5 : -Math.abs(downRaw);
+  const upRaw = numeric(s?.regimeUptrendThresholdPct);
+  const upThresh = upRaw == null ? 5 : Math.abs(upRaw);
+  if (pct <= downThresh) {
+    return { regime: "DOWNTREND", reasoning: `SOL 24h ${pct.toFixed(2)}% <= ${downThresh}% downtrend threshold` };
+  }
+  if (pct >= upThresh) {
+    return { regime: "UPTREND", reasoning: `SOL 24h ${pct.toFixed(2)}% >= +${upThresh}% uptrend threshold` };
+  }
+  return { regime: "NEUTRAL", reasoning: `SOL 24h ${pct.toFixed(2)}% within [${downThresh}%, +${upThresh}%] neutral band` };
+}
+
+/**
+ * Fetch SOL 24h % change from the multi-source chain reused from boss-report.
+ * CoinGecko simple/price with include_24hr_change=true carries the trend directly.
+ * Jupiter v3 has no 24h-change field, so CoinGecko is the trend source; we keep a
+ * spot-price source as a liveness probe only. Returns null on total failure.
+ *
+ * @returns {Promise<{changePct:number|null, source:string|null}>}
+ */
+async function fetchSol24hChangePct() {
+  const SOL = WSOL_MINT;
+  // CoinGecko gives 24h change for free with one flag — primary trend source.
+  try {
+    const res = await fetch(
+      "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=true",
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (res.ok) {
+      const d = await res.json();
+      const chg = Number(d?.solana?.usd_24h_change);
+      if (Number.isFinite(chg)) return { changePct: chg, source: "coingecko" };
+    }
+  } catch { /* fall through */ }
+  // Birdeye-free fallback: Jupiter v3 carries priceChange24h on some payloads.
+  for (const url of [
+    `https://lite-api.jup.ag/price/v3?ids=${SOL}`,
+    `https://api.jup.ag/price/v3?ids=${SOL}`,
+  ]) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue;
+      const d = await res.json();
+      const entry = d?.[SOL];
+      // v3 exposes priceChange24h as a percent on some responses; absent on others.
+      const chg = Number(entry?.priceChange24h);
+      if (Number.isFinite(chg)) return { changePct: chg, source: "jupiter-v3" };
+    } catch { /* try next */ }
+  }
+  return { changePct: null, source: null };
+}
+
+/**
+ * Detect the current market regime (UPTREND / NEUTRAL / DOWNTREND). Cached for
+ * MARKET_REGIME_CACHE_TTL_MS so a screening cycle fetches at most once (regime is
+ * market-wide, not per-pool — never fetch per candidate). Returns the classified
+ * regime plus the raw 24h change, source, and human reasoning for logs/Telegram.
+ *
+ * FAIL-SAFE (anti-pattern #2): on total fetch failure we return NEUTRAL (deploy as
+ * legacy) and log a warning — we do NOT freeze the bot blind, and we do NOT pretend
+ * the market is fine. The gate only PAUSES on a CONFIRMED downtrend.
+ *
+ * @param {object} [opts]
+ * @param {object} [opts.s] - effective screening thresholds (classification knobs)
+ * @param {boolean} [opts.force] - bypass cache (tests / manual probe)
+ * @returns {Promise<{regime:string, sol24hChangePct:number|null, reasoning:string, source:string|null}>}
+ */
+export async function detectMarketRegime({ s = null, force = false } = {}) {
+  const thresholds = s || (typeof config !== "undefined" ? config.screening : {});
+  const now = Date.now();
+  if (!force && _marketRegimeCache && (now - _marketRegimeCache.ts) < MARKET_REGIME_CACHE_TTL_MS) {
+    return _marketRegimeCache;
+  }
+  const { changePct, source } = await fetchSol24hChangePct();
+  const { regime, reasoning } = classifyRegime(changePct, thresholds);
+  const result = { regime, sol24hChangePct: changePct, reasoning, source, ts: now };
+  if (changePct == null) {
+    log("screening", `Market regime: data unavailable (all price sources failed) — fail-safe NEUTRAL, deploy as legacy`);
+  } else {
+    log("screening", `Market regime: ${regime} (SOL 24h ${changePct.toFixed(2)}% via ${source}) — ${reasoning}`);
+  }
+  _marketRegimeCache = result;
+  return result;
+}
+
+/** Test/seam helper: clear the regime cache so detectMarketRegime refetches. */
+export function _resetMarketRegimeCache() { _marketRegimeCache = null; }
+
+/**
+ * Is this pool a MEMECOIN / narrow-range / high-vol profile (the bleed-prone kind
+ * the downtrend pause targets)? Built to EXEMPT blue-chip profiles for the future
+ * Phase 1 bluechip mode — a blue-chip base token has a SYMMETRIC payoff and is
+ * fine in a downtrend (fees pay both ways), so it must NOT be paused.
+ *
+ * For NOW (no bluechip mode), every deployable pool is single-side-SOL memecoin /
+ * narrow → returns true unless the BASE mint is a recognized blue-chip. The
+ * structure is here so wiring a bluechip allow-list later is a one-line change.
+ *
+ * @param {object} pool - condensed pool (reads pool.base.mint)
+ * @returns {boolean} true = memecoin/narrow (pausable); false = blue-chip (exempt)
+ */
+export function isMemecoinNarrowProfile(pool) {
+  const baseMint = pool?.base?.mint || null;
+  // Blue-chip BASE token (wSOL/USDC and major bridged assets) → symmetric payoff,
+  // exempt from the downtrend pause. (Quote is already always wSOL for this bot.)
+  if (baseMint && BLUECHIP_BASE_MINTS.has(baseMint)) return false;
+  // Everything else is a memecoin / narrow-range profile → pausable in downtrend.
+  return true;
+}
+
+/**
+ * Market-regime gate (Cassiopeia — STOP BLEED T3). PURE decision fn.
+ *
+ * PAUSE deploy when (regime === DOWNTREND) AND (pool is a memecoin/narrow profile).
+ * This is a STRICTER condition — it never loosens any other gate; it only ADDS a
+ * downtrend pause for the bleed-prone pool class. Blue-chip profiles are EXEMPT
+ * (symmetric payoff is fine in a downtrend) — ready for the Phase 1 bluechip mode.
+ *
+ * ANTI-DORMANCY: this fires ONLY on a CONFIRMED downtrend (SOL <= threshold). In
+ * NEUTRAL / UPTREND it returns null → deploy normally. The 10-min cache TTL +
+ * threshold (-5% default) mean we are not stuck "downtrend forever" — the moment
+ * SOL recovers above the threshold the gate releases on the next cycle.
+ *
+ * FAIL-SAFE (anti-pattern #2): detectMarketRegime already maps missing data →
+ * NEUTRAL (never DOWNTREND), so a fetch failure NEVER pauses deploys here. The
+ * gate only ever pauses on a regime we positively measured as DOWNTREND.
+ *
+ * @param {object} pool - condensed pool (reads pool.base.mint for profile)
+ * @param {{regime:string}} regimeResult - output of detectMarketRegime()
+ * @param {object} s - effective screening thresholds (reads marketRegimeGateEnabled)
+ * @returns {string|null} reject reason or null (deploy allowed / gate off / exempt)
+ */
+export function marketRegimeGateRejectReason(pool, regimeResult, s) {
+  if (s?.marketRegimeGateEnabled !== true) return null;   // gate off → no-op
+  if (!regimeResult || regimeResult.regime !== "DOWNTREND") return null; // only pause on confirmed downtrend
+  if (!isMemecoinNarrowProfile(pool)) return null;        // blue-chip exempt (Phase 1 ready)
+  return "market_regime_downtrend_memecoin_paused";
 }
 
 /**
@@ -1586,6 +1778,32 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     "screening",
     `Pre-rank: ${pools.length} gate-passed pool(s) → top-${eligible.length} by score enter enrichment+judge (cost-flat at limit=${limit})`,
   );
+
+  // Market-regime gate (Cassiopeia — STOP BLEED T3). Runs BEFORE all enrichment
+  // (PVP/Jupiter audit/OKX) AND before the LLM judge so a downtrend-paused pool
+  // costs nothing. Detect regime ONCE per cycle (cached 10 min; one price fetch,
+  // not per-pool). PAUSE memecoin/narrow pools on a CONFIRMED SOL downtrend; blue-
+  // chip profiles are EXEMPT (symmetric payoff, fine in a downtrend — Phase 1
+  // ready). FAIL-SAFE: missing regime data → NEUTRAL → deploy as legacy (never a
+  // blind freeze). ANTI-DORMANCY: only fires on regime===DOWNTREND, releases the
+  // moment SOL recovers above the threshold next cycle.
+  if (eff.marketRegimeGateEnabled === true && eligible.length > 0) {
+    const regimeResult = await detectMarketRegime({ s: eff });
+    const beforeRegime = eligible.length;
+    const kept = eligible.filter((p) => {
+      const reason = marketRegimeGateRejectReason(p, regimeResult, eff);
+      if (reason) {
+        log("screening", `Market-regime gate: paused ${p.name} — ${reason} (${regimeResult.reasoning})`);
+        pushFilteredReason(filteredOut, p, reason);
+        return false;
+      }
+      return true;
+    });
+    eligible.splice(0, eligible.length, ...kept);
+    if (eligible.length < beforeRegime) {
+      log("screening", `Market-regime DOWNTREND paused ${beforeRegime - eligible.length} memecoin pool(s) — STOP BLEED (SOL 24h ${regimeResult.sol24hChangePct == null ? "n/a" : regimeResult.sol24hChangePct.toFixed(2) + "%"})`);
+    }
+  }
 
   // Deployability pre-filter (Cassiopeia, Lyra cost-cut) — runs BEFORE all
   // enrichment (PVP/Jupiter audit/OKX) and BEFORE the LLM judge. We deploy

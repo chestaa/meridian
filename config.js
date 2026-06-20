@@ -305,6 +305,25 @@ export const config = {
     // FAIL-SAFE: missing quote mint → reject (anti-pattern #2). Reject reason:
     // non_sol_quote_undeployable. Set false to disable (no filter).
     requireSolQuote: u.requireSolQuote ?? true,
+    // ─── Market-regime gate (Cassiopeia — STOP BLEED T3) ───
+    // ROOT CAUSE of T3 bleed (-$4.67): memecoin narrow-range pools deployed into a
+    // FALLING market get stopped out repeatedly (price drifts down out of the active
+    // bin → cut at stop → repeat). A single-side-SOL narrow position has an
+    // ASYMMETRIC payoff in a downtrend (limited bounce upside, full bleed if it keeps
+    // falling). FIX: PAUSE memecoin deploys while the broad market trends down. This
+    // is a STRICTER condition (adds a pause) — it does NOT loosen any other gate.
+    // Detection: SOL 24h % change (SOL is the beta of the Solana memecoin complex),
+    // reusing the boss-report price chain (CoinGecko include_24hr_change → no history
+    // store). regime DOWNTREND when SOL 24h <= regimeDowntrendThresholdPct.
+    // CONDITIONAL: only memecoin/narrow profiles are paused — blue-chip base tokens
+    // (symmetric payoff) are EXEMPT (Phase 1 bluechip mode ready). FAIL-SAFE
+    // (anti-pattern #2): regime fetch failure → NEUTRAL (deploy as legacy), NEVER a
+    // blind freeze and NEVER a false DOWNTREND. ANTI-DORMANCY: fires ONLY on a
+    // confirmed downtrend; releases the moment SOL recovers above the threshold.
+    // Reject reason: market_regime_downtrend_memecoin_paused. Reloadable.
+    marketRegimeGateEnabled:     u.marketRegimeGateEnabled     ?? true,
+    regimeDowntrendThresholdPct: u.regimeDowntrendThresholdPct ?? -5,  // SOL 24h <= -5% = downtrend (pause memecoin)
+    regimeUptrendThresholdPct:   u.regimeUptrendThresholdPct   ?? 5,   // SOL 24h >= +5% = uptrend (label only; doesn't gate)
   },
 
   // ─── Position Management ────────────────
@@ -770,6 +789,9 @@ export function reloadScreeningThresholds() {
     if (fresh.tokenAgeSweetSpotLowHours  != null) s.tokenAgeSweetSpotLowHours  = fresh.tokenAgeSweetSpotLowHours;
     if (fresh.tokenAgeSweetSpotHighHours != null) s.tokenAgeSweetSpotHighHours = fresh.tokenAgeSweetSpotHighHours;
     if (fresh.requireSolQuote     !== undefined) s.requireSolQuote = fresh.requireSolQuote;
+    if (fresh.marketRegimeGateEnabled     !== undefined) s.marketRegimeGateEnabled = fresh.marketRegimeGateEnabled;
+    if (fresh.regimeDowntrendThresholdPct != null) s.regimeDowntrendThresholdPct = fresh.regimeDowntrendThresholdPct;
+    if (fresh.regimeUptrendThresholdPct   != null) s.regimeUptrendThresholdPct = fresh.regimeUptrendThresholdPct;
     if (fresh.minMeaningfulProfitSol != null) config.management.minMeaningfulProfitSol = fresh.minMeaningfulProfitSol;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;

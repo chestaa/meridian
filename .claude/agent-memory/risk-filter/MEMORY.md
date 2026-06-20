@@ -12,3 +12,4 @@
 - [Timeframe empty-window bottleneck (2026-06-13)](project-timeframe-empty-window-bottleneck.md) — post-breadth 1/1031 pass was timeframe=5m EMPTY WINDOW (vol/fee=0 for 271/300), NOT bad gates; fix 5m→1h + maxBinStep 125→200; quality gates PROTECTIVE, kept; commit 7610145
 - [fee/TVL IL-coverage floor (2026-06-14)](project-feetvl-il-coverage-floor.md) — floor 0.05→0.13 base / 0.10→0.15 live + feeTvlHighBonus ON (w400); universe BIMODAL = ~no dormancy cost; kills win-tiny/loss-big IL asymmetry; commit b036b8c
 - [Volatility FLOOR (2026-06-16)](project-volatility-floor.md) — minVolatility FLOOR not ceiling; low-vol slow-bleed (Lyra 39 trades); floor 3.0 NOT 3.5 by live probe (3.5=1 pool dormancy); fail-closed, base 0=off
+- [Market-regime gate (2026-06-20)](project-market-regime-gate.md) — STOP BLEED T3: pause memecoin deploys on SOL 24h ≤-5% downtrend; bluechip-exempt-ready; strictNumeric fail-safe NEUTRAL; 35 tests
