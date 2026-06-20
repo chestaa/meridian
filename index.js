@@ -2239,7 +2239,16 @@ async function telegramHandler(msg) {
       const { positions, total_positions } = await getMyPositions({ force: true });
       if (total_positions === 0) { await sendMessage("Belum ada posisi terbuka."); return; }
       const cur = config.management.solMode ? "◎" : "$";
-      await sendMessage(formatPositionsMessage(positions, total_positions, cur));
+      // Live SL/TP config for the trade-card (honest labels — DLMM has no hard
+      // TP price, so formatTpLabel maps to the real trailing/fee-harvest exit).
+      const cardOpts = {
+        stopLossPct: config.management.stopLossPct,
+        takeProfitPct: config.management.takeProfitPct,
+        trailingTakeProfit: config.management.trailingTakeProfit,
+        trailingTriggerPct: config.management.trailingTriggerPct,
+        trailingDropPct: config.management.trailingDropPct,
+      };
+      await sendMessage(formatPositionsMessage(positions, total_positions, cur, cardOpts));
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }

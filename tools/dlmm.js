@@ -1560,6 +1560,10 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
           age_minutes:        binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState,
           minutes_out_of_range: minutesOutOfRange(positionAddress),
           instruction:        tracked?.instruction ?? null,
+          // Entry deploy size in SOL (from tracked deploy record). Used by the
+          // /positions trade-card to show "Entry: $X (Y SOL)" honestly. null if
+          // the deploy was never tracked (e.g. discovered-only position).
+          amount_sol:         tracked?.amount_sol ?? null,
           // Vega Item 6 — 1h velocity signal (same Jupiter source as paper).
           // null when stats unavailable → velocity exit safely no-ops.
           price_change_1h_pct: velocityByMint[pool.tokenXMint]?.price_change_1h_pct ?? null,
