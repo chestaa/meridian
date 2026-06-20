@@ -215,6 +215,17 @@ export async function deployFromOrionVerdict(orionVerdict, candidate, context = 
     bot_pct: numberOrNull(candidate?.ti?.audit?.bot_holders_pct ?? pool.bot_pct),
     top10_pct: numberOrNull(candidate?.ti?.audit?.top_holders_pct ?? pool.top10_pct),
     dev_sold_all: Boolean(pool.dev_sold_all),
+    // Vega 2026-06-20 — 429 ride-through fallback. The discovery fetch THIS cycle
+    // already pulled + gate-passed this pool's live metrics seconds ago. We carry
+    // those verified threshold fields + a timestamp so validateDeployPoolThresholds
+    // can REUSE them (no re-fetch → no 429) when its own re-fetch 429-exhausts.
+    // This is NOT a guard bypass: the data is a fresh verified live snapshot, only
+    // accepted inside a bounded TTL; outside TTL or absent → fail-close as before.
+    discovered_at: Date.now(),
+    tvl: numberOrNull(pool.tvl ?? pool.liquidity),
+    fee_active_tvl_ratio: numberOrNull(pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio),
+    volatility: numberOrNull(volatility),
+    bin_step: numberOrNull(pool.bin_step),
   };
 
   const args = {

@@ -18,6 +18,8 @@ import {
   __setSnapshotFetchForTests,
   __resetSnapshotFetchForTests,
   __fetchFreshPoolDetailForTests,
+  buildReuseDetailFromSnapshot,
+  __validateDeployPoolThresholdsForTests,
 } from "../tools/executor.js";
 
 let passed = 0;
@@ -77,7 +79,7 @@ console.log("\n[b] 429 every attempt → retries exhausted → THROWS → caller
   catch (e) { threw = true; msg = e.message; }
 
   assert(threw, "threw after exhausting retries (fail-closed PRESERVED)");
-  assert(calls === 4, `total attempts = 1 + 3 retries (calls=${calls})`);
+  assert(calls === 6, `total attempts = 1 + 5 retries (calls=${calls})`);
   assert(msg.includes("429") || msg.toLowerCase().includes("api error"), `error propagated (${msg})`);
   __resetSnapshotFetchForTests();
 }
@@ -175,6 +177,102 @@ console.log("\n[g] deploy_position is NOT wrapped in retry (anti-pattern #4 guar
   await __fetchFreshPoolDetailForTests(POOL);
   assert(urls.length === 1, `snapshot fetch hit once (read-only, no deploy retry) (urls=${urls.length})`);
   assert(urls[0].includes("/pools") && urls[0].includes(POOL), "fetched the pool-discovery snapshot URL only");
+  __resetSnapshotFetchForTests();
+}
+
+// ── (h) raised budget: 429 burst recovers at attempt 5 (was IMPOSSIBLE @3) ─
+console.log("\n[h] 429 x4 then 200 → ride-through within RAISED 5-retry budget (Lyra 06-20 longer burst)");
+{
+  let calls = 0;
+  __setSnapshotFetchForTests(async () => {
+    calls += 1;
+    if (calls <= 4) return errResponse(429, "Too Many Requests");
+    return okResponse({ pool_address: POOL, volatility: 5 });
+  }, [0, 0, 0, 0, 0]);
+  let detail = null, threw = false;
+  try { detail = await __fetchFreshPoolDetailForTests(POOL); } catch (_e) { threw = true; }
+  assert(!threw && calls === 5 && detail, `4x429 burst rode through to attempt 5 (calls=${calls}) — would have fail-closed at old budget`);
+  __resetSnapshotFetchForTests();
+}
+
+// ── (i) buildReuseDetailFromSnapshot — TTL + fail-closed completeness matrix ─
+console.log("\n[i] buildReuseDetailFromSnapshot — reuse-discovery TTL + fail-closed matrix");
+{
+  const now = 1_000_000_000_000;
+  const fresh = { discovered_at: now - 1000, tvl: 50000, fee_active_tvl_ratio: 0.15, volatility: 5, bin_step: 100 };
+  const r = buildReuseDetailFromSnapshot(fresh, now);
+  assert(r && r.tvl === 50000 && r._reused_from_discovery === true, "fresh complete snapshot → reusable detail built");
+  assert(r && r.dlmm_params.bin_step === 100, "bin_step carried into dlmm_params shape");
+
+  const stale = { ...fresh, discovered_at: now - (6 * 60 * 1000) }; // 6min > 5min TTL
+  assert(buildReuseDetailFromSnapshot(stale, now) === null, "stale snapshot (>5min TTL) → null (fail-close)");
+
+  assert(buildReuseDetailFromSnapshot({ ...fresh, tvl: null }, now) === null, "missing tvl → null (fail-closed, anti-pattern #2)");
+  assert(buildReuseDetailFromSnapshot({ ...fresh, fee_active_tvl_ratio: null }, now) === null, "missing fee/TVL → null (fail-closed)");
+  assert(buildReuseDetailFromSnapshot({ ...fresh, volatility: null }, now) === null, "missing volatility → null (fail-closed)");
+  assert(buildReuseDetailFromSnapshot({ ...fresh, discovered_at: null }, now) === null, "missing discovered_at → null (fail-closed)");
+  assert(buildReuseDetailFromSnapshot(null, now) === null, "null snapshot → null");
+  assert(buildReuseDetailFromSnapshot({ discovered_at: now + 99999, tvl: 1, fee_active_tvl_ratio: 1, volatility: 1 }, now) === null, "future timestamp (negative age) → null");
+}
+
+// ── (j) 429-EXHAUST + fresh discovery snapshot → REUSE → deploy verify PASSES ─
+console.log("\n[j] re-fetch 429-exhausts BUT fresh discovery snapshot present → reuse → PASS (income unblock)");
+{
+  __setSnapshotFetchForTests(async () => errResponse(429, "Too Many Requests"), [0, 0, 0, 0, 0]);
+  const res = await __validateDeployPoolThresholdsForTests({
+    pool_address: POOL,
+    fee_tvl_ratio: 0.15,
+    candidate_snapshot: {
+      discovered_at: Date.now(),
+      tvl: 50000,
+      fee_active_tvl_ratio: 0.15,
+      volatility: 5,
+      bin_step: 100,
+    },
+  });
+  assert(res.pass === true, `deploy verify PASSED via discovery-snapshot reuse despite total 429 (reason=${res.reason || "n/a"})`);
+  __resetSnapshotFetchForTests();
+}
+
+// ── (k) 429-EXHAUST + NO reusable snapshot → FAIL-CLOSE (preserved) ──────────
+console.log("\n[k] re-fetch 429-exhausts + NO fresh snapshot → fail-close snapshot_verify_failed (preserved)");
+{
+  __setSnapshotFetchForTests(async () => errResponse(429, "Too Many Requests"), [0, 0, 0, 0, 0]);
+  const res = await __validateDeployPoolThresholdsForTests({
+    pool_address: POOL,
+    // no candidate_snapshot → no fallback possible
+  });
+  assert(res.pass === false, "fail-closed when no reusable snapshot");
+  assert(String(res.reason).includes("snapshot_verify_failed"), `reason marks snapshot_verify_failed (${res.reason})`);
+  __resetSnapshotFetchForTests();
+}
+
+// ── (l) 429-EXHAUST + STALE snapshot → FAIL-CLOSE (TTL guards staleness) ─────
+console.log("\n[l] re-fetch 429-exhausts + STALE snapshot (>TTL) → fail-close (no stale-data deploy)");
+{
+  __setSnapshotFetchForTests(async () => errResponse(429, "Too Many Requests"), [0, 0, 0, 0, 0]);
+  const res = await __validateDeployPoolThresholdsForTests({
+    pool_address: POOL,
+    fee_tvl_ratio: 0.15,
+    candidate_snapshot: {
+      discovered_at: Date.now() - (10 * 60 * 1000), // 10min stale
+      tvl: 50000, fee_active_tvl_ratio: 0.15, volatility: 5, bin_step: 100,
+    },
+  });
+  assert(res.pass === false && String(res.reason).includes("snapshot_verify_failed"), `stale snapshot NOT reused → fail-close (${res.reason})`);
+  __resetSnapshotFetchForTests();
+}
+
+// ── (m) NON-transient (404) exhaust → NO reuse even with fresh snapshot ──────
+console.log("\n[m] non-transient 404 → NO reuse even with fresh snapshot (reuse is 429-only ride-through)");
+{
+  __setSnapshotFetchForTests(async () => errResponse(404, "Not Found"), [0, 0, 0, 0, 0]);
+  const res = await __validateDeployPoolThresholdsForTests({
+    pool_address: POOL,
+    fee_tvl_ratio: 0.15,
+    candidate_snapshot: { discovered_at: Date.now(), tvl: 50000, fee_active_tvl_ratio: 0.15, volatility: 5, bin_step: 100 },
+  });
+  assert(res.pass === false && String(res.reason).includes("snapshot_verify_failed"), `404 fail-closes regardless of snapshot (reuse gated on transient only) (${res.reason})`);
   __resetSnapshotFetchForTests();
 }
 

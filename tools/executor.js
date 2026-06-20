@@ -114,8 +114,63 @@ function poolDetailVolatility(pool) {
  * It must NEVER be applied to deploy_position itself — the deploy TX stays
  * single-attempt. State after a failed deploy is unknown; retrying is forbidden.
  */
-const SNAPSHOT_FETCH_MAX_RETRIES = 3; // total attempts = 1 + 3 retries
-const SNAPSHOT_FETCH_BACKOFF_MS = [1000, 2000, 4000]; // ride-through transient burst
+// Vega 2026-06-20 — raised 3→5 (total 6 attempts) to ride through LONGER 429
+// bursts (Lyra: 06-20 AM 7 cycles, 0 deploy, pools ENTER'd by Orion but
+// snapshot-verify 429-exhausted at the old 4-attempt budget). Backoff lengthened
+// to 1/2/4/8/16s so the full ride-through spans ~31s of burst before fail-close.
+// This governs ONLY the read-only snapshot fetch — deploy_position TX is untouched.
+const SNAPSHOT_FETCH_MAX_RETRIES = 5; // total attempts = 1 + 5 retries
+const SNAPSHOT_FETCH_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000]; // ride-through transient burst
+
+// Vega 2026-06-20 — reuse-discovery-data fallback TTL. When the pre-deploy
+// re-fetch 429-EXHAUSTS, we may verify against the discovery snapshot captured
+// THIS cycle (carried in args.candidate_snapshot) — but ONLY if it is fresher
+// than this TTL. The discovery→judge→deploy path is synchronous within one cycle
+// (seconds), so 5min is a generous-but-bounded staleness ceiling. Outside TTL,
+// or if any threshold field is missing → NO fallback → fail-close (preserved).
+const DISCOVERY_REUSE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Vega — build a `detail`-shaped object from the discovery snapshot so the
+ * SAME threshold checks (TVL / fee-TVL / volatility / bin_step) can run against
+ * it WITHOUT a re-fetch. Pure + exported for unit tests.
+ *
+ * Returns null (→ caller fail-closes) unless ALL of:
+ *   - snapshot present with a numeric `discovered_at`
+ *   - snapshot age <= DISCOVERY_REUSE_TTL_MS (not stale)
+ *   - the threshold fields it needs (tvl, fee_active_tvl_ratio, volatility) are
+ *     present finite numbers — fail-closed on any missing field (anti-pattern #2)
+ *
+ * This is NOT a guard bypass: the data is itself a verified live snapshot from
+ * the discovery fetch seconds earlier, accepted only inside a tight TTL.
+ */
+export function buildReuseDetailFromSnapshot(snapshot, now = Date.now()) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const discoveredAt = numberOrNull(snapshot.discovered_at);
+  if (discoveredAt == null || discoveredAt <= 0) return null;
+  const age = now - discoveredAt;
+  if (!Number.isFinite(age) || age < 0 || age > DISCOVERY_REUSE_TTL_MS) return null;
+
+  const tvl = numberOrNull(snapshot.tvl);
+  const feeActiveTvlRatio = numberOrNull(snapshot.fee_active_tvl_ratio);
+  const volatility = numberOrNull(snapshot.volatility);
+  // Fail-closed: require the gate-bearing metrics to be POSITIVE finite numbers.
+  // numberOrNull(null) === 0 (Number(null)===0), so a `> 0` check (not just
+  // `!= null`) is required to reject missing/zero metrics — a deployable pool
+  // can never legitimately have 0 TVL / 0 fee-TVL / 0 volatility (anti-pattern #2).
+  // bin_step is optional (executor falls back to the on-chain pool object);
+  // volume/bot/top10 are the fresh-snapshot drift guard's job, not this gate.
+  if (!(tvl > 0) || !(feeActiveTvlRatio > 0) || !(volatility > 0)) return null;
+
+  return {
+    tvl,
+    fee_active_tvl_ratio: feeActiveTvlRatio,
+    volatility,
+    dlmm_params: { bin_step: numberOrNull(snapshot.bin_step) },
+    _reused_from_discovery: true,
+    _snapshot_age_ms: age,
+  };
+}
 
 export function isTransientFetchError(err) {
   if (!err) return false;
@@ -158,7 +213,7 @@ export function __fetchFreshPoolDetailForTests(poolAddress, timeframe) {
 /**
  * Vega — bounded retry-with-backoff for the pre-deploy snapshot READ fetch.
  * Retries ONLY transient errors (429/502/503/504/timeout) up to
- * SNAPSHOT_FETCH_MAX_RETRIES with exponential backoff (~1s/2s/4s). Non-transient
+ * SNAPSHOT_FETCH_MAX_RETRIES with exponential backoff (~1s/2s/4s/8s/16s). Non-transient
  * errors throw immediately (no retry). When ALL retries are exhausted the last
  * error propagates → caller fail-closes (snapshot_verify_failed). This is
  * ride-through for transient bursts, NOT a guard bypass.
@@ -305,15 +360,33 @@ async function validateDeployPoolThresholds(args) {
     detail = await fetchFreshPoolDetail(args.pool_address);
     if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
   } catch (error) {
-    // FAIL-CLOSED (anti-pattern #2/#3): retry-with-backoff already ran inside
-    // fetchFreshPoolDetail for transient 429/5xx/timeout. Reaching here means the
-    // snapshot could NOT be verified (retries exhausted or permanent error) —
-    // we REFUSE to deploy on stale/unverified data. snapshot_verify_failed marker
-    // lets monitoring tell a transient-exhaustion reject from a threshold breach.
-    return {
-      pass: false,
-      reason: `snapshot_verify_failed: could not verify pool screening thresholds before deploy: ${error.message}`,
-    };
+    // Vega 2026-06-20 — 429 ride-through fallback. The bounded retry-with-backoff
+    // already ran inside fetchFreshPoolDetail (6 attempts, ~31s) for transient
+    // 429/5xx/timeout. If we land here on a TRANSIENT error AND the discovery
+    // snapshot from THIS cycle is fresh enough, verify against THAT (no re-fetch
+    // → no 429) instead of fail-closing on a valid ENTER'd deploy. This is a
+    // ride-through, NOT a bypass: the reused data is itself a verified live
+    // snapshot inside a tight TTL, and the SAME threshold checks run on it below.
+    if (isTransientFetchError(error)) {
+      const reused = buildReuseDetailFromSnapshot(args.candidate_snapshot);
+      if (reused) {
+        log(
+          "snapshot_verify_reuse",
+          `pre-deploy re-fetch 429-exhausted for ${args.pool_address}; verifying against discovery snapshot age=${reused._snapshot_age_ms}ms (no re-fetch)`,
+        );
+        detail = reused;
+      }
+    }
+    if (!detail) {
+      // FAIL-CLOSED (anti-pattern #2/#3): non-transient error, retries exhausted
+      // with NO reusable fresh discovery snapshot, or snapshot stale/incomplete.
+      // We REFUSE to deploy on stale/unverified data. snapshot_verify_failed
+      // marker lets monitoring tell a transient-exhaustion reject from a breach.
+      return {
+        pass: false,
+        reason: `snapshot_verify_failed: could not verify pool screening thresholds before deploy: ${error.message}`,
+      };
+    }
   }
 
   const tvl = poolDetailTvl(detail);
@@ -362,10 +435,18 @@ async function validateDeployPoolThresholds(args) {
     try {
       volatilityDetail = await fetchFreshPoolDetail(args.pool_address, volatilityTimeframe);
     } catch (error) {
-      return {
-        pass: false,
-        reason: `snapshot_verify_failed: could not verify pool ${volatilityTimeframe} volatility before deploy: ${error.message}`,
-      };
+      // Vega 2026-06-20 — same 429 ride-through: if this secondary volatility
+      // re-fetch transient-exhausts but `detail` already came from the reused
+      // discovery snapshot, fall back to it (its volatility is the deploy-tf
+      // value, sufficient for the floor check). Else fail-close (preserved).
+      if (isTransientFetchError(error) && detail?._reused_from_discovery) {
+        volatilityDetail = detail;
+      } else {
+        return {
+          pass: false,
+          reason: `snapshot_verify_failed: could not verify pool ${volatilityTimeframe} volatility before deploy: ${error.message}`,
+        };
+      }
     }
   }
 
@@ -394,6 +475,12 @@ async function validateDeployPoolThresholds(args) {
   }
 
   return { pass: true };
+}
+
+// Test seam: exercise the full pre-deploy threshold verify (incl. 429 ride-through
+// + reuse-discovery fallback) against an injected snapshot fetch.
+export function __validateDeployPoolThresholdsForTests(args) {
+  return validateDeployPoolThresholds(args);
 }
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
