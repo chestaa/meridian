@@ -63,6 +63,36 @@ const QUOTE_ORGANIC_EXEMPT_MINTS = new Set([WSOL_MINT, USDC_MINT]);
 const USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 const BLUECHIP_BASE_MINTS = new Set([WSOL_MINT, USDC_MINT, USDT_MINT]);
 
+// ─── Bluechip income-engine mint set (Cassiopeia — Wave 2 / Phase 1) ──────────
+//
+// The income engine LPs DEEP, STABLE pools (SOL-USDC, JLP, JitoSOL, mSOL, major
+// LSTs) for steady fees with a (near-)SYMMETRIC payoff — the opposite profile from
+// the memecoin narrow-range path. A pool is "bluechip-eligible" only when BOTH legs
+// are in this curated set: a pool with one bluechip leg and one random memecoin leg
+// is NOT a stable LP (it carries the memecoin's directional risk). These are the
+// inherently-liquid, rug-immune, audited assets where the question is "is the fee
+// yield worth the IL" rather than "is this a scam."
+//
+// Live-verified (2026-06-20 probe): at TVL>=200k, BOTH-leg bluechip pools = 23, of
+// which ~8 carry real volume (>50k/24h). SOL-USDC alone has 4 deep deployable pools
+// (bs 4/10/20/80) running 32-75% APR on full TVL. So the funnel is FEW-but-DEEP —
+// exactly the income-engine thesis (cf. memecoin path which is many-but-shallow).
+//
+// NOTE: mSOL/bSOL/JLP mints are the canonical Solana addresses. JLP base mcap is
+// huge (~$770M pool token) so the memecoin mcap band would reject it — bluechip
+// mode uses its OWN band (see bluechipPoolGateRejectReason). Extend this set as new
+// blue-chip LSTs/stables qualify (one-line add per mint).
+const JLP_MINT  = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4";
+const JITOSOL_MINT = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
+const MSOL_MINT = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So";
+const BSOL_MINT = "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1";
+const JUPSOL_MINT = "jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v";
+const CBBTC_MINT = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"; // Coinbase wrapped BTC
+const BLUECHIP_INCOME_MINTS = new Set([
+  WSOL_MINT, USDC_MINT, USDT_MINT,
+  JLP_MINT, JITOSOL_MINT, MSOL_MINT, BSOL_MINT, JUPSOL_MINT, CBBTC_MINT,
+]);
+
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
@@ -622,6 +652,149 @@ export function marketRegimeGateRejectReason(pool, regimeResult, s) {
  * @param {object} s - effective screening thresholds (minQuoteOrganic)
  * @returns {string|null} reject reason or null (passes / exempt / floor disabled).
  */
+// ─── Bluechip dual-mode (Cassiopeia — Wave 2 / Phase 1) ───────────────────────
+//
+// DESIGN GUARANTEE: bluechip mode is a SEPARATE, PARALLEL path gated behind
+// `bluechipModeEnabled` (default FALSE). When off, every function below is inert
+// and the memecoin path is byte-for-byte unchanged. Turning the flag on requires
+// Bro + Vega (deploy structure) sign-off — see the memory note. This file only
+// owns DISCOVERY + GATE (which pools are bluechip-LP-worthy), never the deploy.
+
+/**
+ * Read both leg mints from a pool regardless of shape (raw token_x/token_y OR
+ * condensed base/quote). Returns { base, quote } mints (may be null).
+ */
+function poolLegMints(pool) {
+  const base = pool?.token_x?.address ?? pool?.base?.mint ?? pool?.base_mint ?? null;
+  const quote = pool?.token_y?.address ?? pool?.quote?.mint ?? null;
+  return { base, quote };
+}
+
+/**
+ * Classify a pool as "bluechip" vs "memecoin" by mint set. PURE + unit-tested.
+ *
+ * A pool is BLUECHIP only when BOTH legs are in BLUECHIP_INCOME_MINTS. The both-leg
+ * rule is deliberate and conservative: SOL-USDC / JLP-USDC / JitoSOL-SOL are stable
+ * symmetric LPs; a bluechip-QUOTED memecoin (e.g. PEPE-USDC) is NOT bluechip — it
+ * inherits the memecoin's directional/rug risk and belongs in the memecoin gate.
+ *
+ * FAIL-SAFE (anti-pattern #2): if either leg mint is missing we CANNOT confirm both
+ * legs are bluechip → classify as "memecoin" (the stricter path). We never default
+ * an unknown pool into the laxer-rug bluechip lane.
+ *
+ * @param {object} pool - raw or condensed pool
+ * @returns {"bluechip"|"memecoin"} classification
+ */
+export function classifyPoolMode(pool) {
+  const { base, quote } = poolLegMints(pool);
+  if (!base || !quote) return "memecoin"; // unknown legs → stricter path (fail-safe)
+  if (BLUECHIP_INCOME_MINTS.has(base) && BLUECHIP_INCOME_MINTS.has(quote)) return "bluechip";
+  return "memecoin";
+}
+
+/**
+ * Is bluechip mode active for THIS pool? True only when the flag is on AND the pool
+ * classifies as bluechip. Centralizes the branch so callers never re-derive it.
+ *
+ * @param {object} pool - raw or condensed pool
+ * @param {object} s - effective screening thresholds (reads bluechipModeEnabled)
+ * @returns {boolean}
+ */
+export function isBluechipPool(pool, s) {
+  if (s?.bluechipModeEnabled !== true) return false;
+  return classifyPoolMode(pool) === "bluechip";
+}
+
+/**
+ * Bluechip income-engine GATE (Cassiopeia — Wave 2 / Phase 1). PURE + fail-closed.
+ *
+ * A DIFFERENT gate from the memecoin path because the risk profile is inverted:
+ *   - Bluechip assets are audited/rug-immune → the rug/mint/freeze/bot/top10/
+ *     dev_sold_all gates are IRRELEVANT (a stablecoin has no "dev", LST mint
+ *     authorities are protocol-controlled by design). We do NOT run them here.
+ *   - The memecoin mcap band (50k-2M signal / 150k-10M native) WRONGLY rejects
+ *     bluechips: SOL mcap is ~$40B, JLP ~$770M. Bluechip uses its OWN band
+ *     (bluechipMinMcap default $50M — these ARE large caps; that's the point).
+ *   - The volatility FLOOR (minVolatility 3.0, built for memecoins) MUST NOT apply:
+ *     bluechips are LOW-vol BY DESIGN (SOL-USDC vola ~0.1) and low vol is GOOD here
+ *     (stable = less IL). Applying a 3.0 floor would reject 100% of bluechips —
+ *     the exact inversion trap. Instead bluechip has a vol CEILING (too-wild =
+ *     not actually stable) and NO floor.
+ *   - The market-regime downtrend pause already EXEMPTS bluechips (symmetric payoff
+ *     pays both ways in a downtrend) via isMemecoinNarrowProfile — verified: a
+ *     bluechip base mint returns false there, so the pause never fires on them.
+ *
+ * What bluechip DOES gate (the income-engine risk surface):
+ *   - DEEP liquidity floor — bluechipMinTvl (default $200k). Thin "bluechip" pools
+ *     have no real depth; the whole point is deploying into deep stable pools.
+ *   - CONSISTENT volume floor — bluechipMinVolume (default $50k/24h). A deep pool
+ *     with no flow pays no fees (e.g. the live bonk-SOL bs25 $634k TVL / $2k vol /
+ *     near-0 fee/TVL — deep but DEAD). Volume is what generates the income.
+ *   - FEE-YIELD floor — bluechipMinFeeTvlRatio (default 0.03, ~11% APR on full TVL
+ *     at 24h). The income engine must clear a yield bar or it's not worth the IL.
+ *     LOWER than the memecoin fee/TVL floor (0.13) because bluechip IL is far
+ *     smaller — a 11-15% steady stable yield is the target, not memecoin churn.
+ *   - VOLATILITY CEILING — bluechipMaxVolatility (default 1.5). A "bluechip" pool
+ *     reading wild vol isn't behaving stably (de-peg / thin book); cap it out.
+ *   - Mcap floor — bluechipMinMcap (default $50M). Confirms genuinely large-cap.
+ *
+ * FAIL-CLOSED (anti-pattern #2): every numeric input is strictNumeric-checked;
+ * missing TVL/volume/fee-yield/mcap → reject with a *_unknown reason, NEVER default
+ * to a passing value. A bluechip pool we cannot risk-rank does not deploy.
+ *
+ * Returns a reject reason string, or null if the pool clears every bluechip gate.
+ * Caller is responsible for only invoking this on isBluechipPool() === true pools.
+ *
+ * @param {object} pool - raw or condensed pool
+ * @param {object} s - effective screening thresholds (bluechip* keys)
+ * @returns {string|null}
+ */
+export function bluechipPoolGateRejectReason(pool, s) {
+  const tvl = strictNumeric(pool?.tvl ?? pool?.active_tvl);
+  const volume = strictNumeric(pool?.volume ?? pool?.volume_window);
+  const feeTvl = strictNumeric(pool?.fee_active_tvl_ratio);
+  const mcap = strictNumeric(pool?.token_x?.market_cap ?? pool?.mcap ?? pool?.market_cap);
+  const volatility = strictNumeric(pool?.volatility);
+
+  const minTvl = numeric(s?.bluechipMinTvl);
+  const minVol = numeric(s?.bluechipMinVolume);
+  const minFeeTvl = numeric(s?.bluechipMinFeeTvlRatio);
+  const minMcap = numeric(s?.bluechipMinMcap);
+  const maxVola = numeric(s?.bluechipMaxVolatility);
+
+  // DEEP-liquidity floor.
+  if (minTvl != null && minTvl > 0) {
+    if (tvl == null) return "bluechip_tvl_unknown";
+    if (tvl < minTvl) return `bluechip tvl ${tvl} below bluechipMinTvl ${minTvl}`;
+  }
+  // CONSISTENT-volume floor (deep-but-dead protection).
+  if (minVol != null && minVol > 0) {
+    if (volume == null) return "bluechip_volume_unknown";
+    if (volume < minVol) return `bluechip volume ${volume} below bluechipMinVolume ${minVol}`;
+  }
+  // FEE-YIELD floor (the income bar).
+  if (minFeeTvl != null && minFeeTvl > 0) {
+    if (feeTvl == null) return "bluechip_fee_tvl_unknown";
+    if (feeTvl < minFeeTvl) return `bluechip fee/TVL ${feeTvl} below bluechipMinFeeTvlRatio ${minFeeTvl}`;
+  }
+  // Large-cap confirmation.
+  if (minMcap != null && minMcap > 0) {
+    if (mcap == null) return "bluechip_mcap_unknown";
+    if (mcap < minMcap) return `bluechip mcap ${mcap} below bluechipMinMcap ${minMcap}`;
+  }
+  // VOLATILITY CEILING (NOT a floor — inverse of the memecoin gate). A wild reading
+  // means it isn't behaving as a stable bluechip (de-peg / thin book). We do NOT
+  // reject low/zero vol here — low vol is the EXPECTED, GOOD state for a bluechip.
+  if (maxVola != null && maxVola > 0) {
+    // Missing vol is tolerated for bluechip (a stable pool legitimately reads ~0
+    // vol; unlike the memecoin floor we do not need a positive vol to deploy).
+    if (volatility != null && volatility > maxVola) {
+      return `bluechip volatility ${volatility} above bluechipMaxVolatility ${maxVola}`;
+    }
+  }
+  return null;
+}
+
 export function quoteOrganicGateRejectReason(pool, s) {
   const minQuoteOrganic = numeric(s?.minQuoteOrganic);
   // Floor disabled / unset / non-positive → quote-organic not gated at all.

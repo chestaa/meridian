@@ -324,6 +324,24 @@ export const config = {
     marketRegimeGateEnabled:     u.marketRegimeGateEnabled     ?? true,
     regimeDowntrendThresholdPct: u.regimeDowntrendThresholdPct ?? -5,  // SOL 24h <= -5% = downtrend (pause memecoin)
     regimeUptrendThresholdPct:   u.regimeUptrendThresholdPct   ?? 5,   // SOL 24h >= +5% = uptrend (label only; doesn't gate)
+    // ─── Bluechip income-engine dual-mode (Cassiopeia — Wave 2 / Phase 1) ───
+    // SEPARATE, PARALLEL path for deep STABLE pools (SOL-USDC, JLP, JitoSOL, LSTs).
+    // Default OFF — turning it on needs Bro + Vega (deploy structure: two-sided
+    // wide-range) sign-off. When off, every bluechip fn is inert and the memecoin
+    // path is byte-for-byte unchanged. The risk profile is INVERTED vs memecoin:
+    // bluechip is rug-immune (no rug/mint/freeze/bot/top10 gates), LOW-vol-is-GOOD
+    // (volatility CEILING not floor — the memecoin minVolatility 3.0 NEVER applies),
+    // large-cap (own mcap band, not the memecoin 50k-2M), and regime-downtrend EXEMPT
+    // (symmetric payoff). What it DOES gate: deep TVL, consistent volume, fee-yield,
+    // vol-ceiling, large mcap. FAIL-CLOSED (anti-pattern #2): missing input → reject.
+    // Live-verified feasibility (2026-06-20): 23 both-leg bluechip pools at TVL>=200k,
+    // ~8 with real volume; SOL-USDC alone = 4 deep pools @ 32-75% APR on full TVL.
+    bluechipModeEnabled:    u.bluechipModeEnabled    ?? false,   // MASTER flag — Bro+Vega to enable
+    bluechipMinTvl:         u.bluechipMinTvl         ?? 200_000, // deep-liquidity floor (income engine = deep pools)
+    bluechipMinVolume:      u.bluechipMinVolume      ?? 50_000,  // consistent-flow floor (deep-but-dead protection)
+    bluechipMinFeeTvlRatio: u.bluechipMinFeeTvlRatio ?? 0.03,    // ~11% APR on full TVL @ 24h — income bar (LOWER than memecoin 0.13: bluechip IL is far smaller)
+    bluechipMinMcap:        u.bluechipMinMcap        ?? 50_000_000, // large-cap confirmation ($50M+); SOL ~$40B, JLP ~$770M
+    bluechipMaxVolatility:  u.bluechipMaxVolatility  ?? 1.5,     // vol CEILING (not floor) — wild reading = not actually stable / de-peg
   },
 
   // ─── Position Management ────────────────
@@ -792,6 +810,12 @@ export function reloadScreeningThresholds() {
     if (fresh.marketRegimeGateEnabled     !== undefined) s.marketRegimeGateEnabled = fresh.marketRegimeGateEnabled;
     if (fresh.regimeDowntrendThresholdPct != null) s.regimeDowntrendThresholdPct = fresh.regimeDowntrendThresholdPct;
     if (fresh.regimeUptrendThresholdPct   != null) s.regimeUptrendThresholdPct = fresh.regimeUptrendThresholdPct;
+    if (fresh.bluechipModeEnabled    !== undefined) s.bluechipModeEnabled    = fresh.bluechipModeEnabled;
+    if (fresh.bluechipMinTvl         != null) s.bluechipMinTvl         = fresh.bluechipMinTvl;
+    if (fresh.bluechipMinVolume      != null) s.bluechipMinVolume      = fresh.bluechipMinVolume;
+    if (fresh.bluechipMinFeeTvlRatio != null) s.bluechipMinFeeTvlRatio = fresh.bluechipMinFeeTvlRatio;
+    if (fresh.bluechipMinMcap        != null) s.bluechipMinMcap        = fresh.bluechipMinMcap;
+    if (fresh.bluechipMaxVolatility  != null) s.bluechipMaxVolatility  = fresh.bluechipMaxVolatility;
     if (fresh.minMeaningfulProfitSol != null) config.management.minMeaningfulProfitSol = fresh.minMeaningfulProfitSol;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;

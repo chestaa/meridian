@@ -13,3 +13,4 @@
 - [fee/TVL IL-coverage floor (2026-06-14)](project-feetvl-il-coverage-floor.md) — floor 0.05→0.13 base / 0.10→0.15 live + feeTvlHighBonus ON (w400); universe BIMODAL = ~no dormancy cost; kills win-tiny/loss-big IL asymmetry; commit b036b8c
 - [Volatility FLOOR (2026-06-16)](project-volatility-floor.md) — minVolatility FLOOR not ceiling; low-vol slow-bleed (Lyra 39 trades); floor 3.0 NOT 3.5 by live probe (3.5=1 pool dormancy); fail-closed, base 0=off
 - [Market-regime gate (2026-06-20)](project-market-regime-gate.md) — STOP BLEED T3: pause memecoin deploys on SOL 24h ≤-5% downtrend; bluechip-exempt-ready; strictNumeric fail-safe NEUTRAL; 35 tests
+- [Bluechip income-engine (2026-06-20)](project-bluechip-income-engine.md) — Wave 2 dual-mode: classifier+gate+flags built (OFF); INVERTED profile (vol CEILING not floor, own mcap band, no rug gates); live: 23 deep pools, SOL-USDC 32-75% APR; deploy=Vega design-only
