@@ -1,5 +1,5 @@
 {
-  "ts": "2026-06-20T02:12:07.330Z",
+  "ts": "2026-06-20T02:17:12.042Z",
   "wallet": {
     "pubkey": "DgA9MZ…1Hiu",
     "sol_free": 0.740464,
@@ -22,7 +22,7 @@
     "halted": false,
     "realized_loss_sol": 0
   },
-  "llm_cost_24h_usd": 0.1758,
+  "llm_cost_24h_usd": 0.1778,
   "services_active": [
     "meridian",
     "signal-runner",
@@ -33,7 +33,7 @@
     "dryRun": true,
     "oor_wait_min": 20,
     "oor_cooldown_h": 6,
-    "deploy_amount_sol": 0.18,
+    "deploy_amount_sol": 0.45,
     "max_positions": 1,
     "max_bot_pct": 20,
     "max_bundlers_pct": 20,
