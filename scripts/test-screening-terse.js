@@ -10,7 +10,7 @@
 // Pure JS, no LLM, no network. Run via:
 //   node scripts/test-screening-terse.js
 
-import { formatScreeningTerse, plainReason } from "../agents/andromeda.js";
+import { formatScreeningTerse, plainReason, shouldNotifyScreeningCycle, formatDormantRollup } from "../agents/andromeda.js";
 
 let passed = 0;
 let failed = 0;
@@ -109,6 +109,71 @@ const JARGON = ["bin_step", "fee_active_tvl_ratio", "fee_active_tvl", "organic_s
   const out = formatScreeningTerse({ universe: 500, passed: 1, deployed: true, poolName: "FOO-SOL", amountSol: null, at: FIXED });
   contains(out, "✅ DEPLOY: FOO-SOL ?", "deploy missing amount → '?'");
   ok(lineCount(out) <= 5, "≤5 lines even with missing data");
+}
+
+// ─── 9. REASON ACCURACY: pool reached judge → judge verdict, NOT "fee kekecilan" ──
+// The bug: an Orion no-enter verdict whose text merely mentions fees got mapped
+// to "fee kekecilan" even though the pool already passed the fee floor.
+{
+  // Pool passed filter (passed>0) and the judge text mentions fees → must be judge ga ENTER.
+  const out = formatScreeningTerse({ universe: 1031, passed: 1, deployed: false, reason: "fees too low to justify the IL risk, not worth entering", at: FIXED });
+  console.log("\n[reached judge, verdict mentions fees]\n" + out + "\n");
+  contains(out, "judge ga ENTER", "passed pool + fee-mentioning verdict → judge ga ENTER (NOT fee kekecilan)");
+  notContains(out, "fee kekecilan", "NOT mis-mapped to fee kekecilan");
+
+  // passedFilter=true with a WATCH verdict → WATCH.
+  ok(plainReason("WATCH — wait for organic to confirm", true) === "judge WATCH (belum ENTER)", "passedFilter + WATCH → judge WATCH");
+  // passedFilter=true with generic/empty → judge ga ENTER (not 'ga ada kandidat').
+  ok(plainReason("", true) === "judge ga ENTER", "passedFilter + empty → judge ga ENTER");
+  ok(plainReason("the candidate did not clear my bar", true) === "judge ga ENTER", "passedFilter + generic → judge ga ENTER");
+
+  // passedFilter=false: an EXPLICIT gate string still maps to the pool-quality phrase.
+  ok(plainReason("fee_active_tvl_ratio 0.03 below minFeeActiveTvlRatio", false) === "fee kekecilan", "gate string + not-passed → fee kekecilan (still accurate)");
+}
+
+// ─── 10. SPAM CONTROL: who gets a per-cycle notif ────────────────────────
+{
+  // (a) DEPLOY → always notify.
+  const dep = shouldNotifyScreeningCycle({ deployed: true }, { dormantStreak: 0 });
+  ok(dep.notify === true && dep.kind === "deploy", "(a) DEPLOY → notify (kind=deploy)");
+
+  // (b) routine dormant no-deploy → suppressed (no notify) for non-rollup cycles.
+  const d1 = shouldNotifyScreeningCycle({ deployed: false, reason: "no candidates" }, { dormantStreak: 1, rollupEvery: 8 });
+  ok(d1.notify === false && d1.kind === "none", "(b) dormant cycle 1 → suppressed");
+  const d7 = shouldNotifyScreeningCycle({ deployed: false, reason: "judge no enter" }, { dormantStreak: 7, rollupEvery: 8 });
+  ok(d7.notify === false, "(b) dormant cycle 7 → still suppressed");
+
+  // (b') throttled rollup at the Nth consecutive dormant cycle.
+  const d8 = shouldNotifyScreeningCycle({ deployed: false, reason: "no candidates" }, { dormantStreak: 8, rollupEvery: 8 });
+  ok(d8.notify === true && d8.kind === "rollup", "(b') dormant cycle 8 → ONE rollup notif");
+  const d16 = shouldNotifyScreeningCycle({ deployed: false, reason: "no candidates" }, { dormantStreak: 16, rollupEvery: 8 });
+  ok(d16.notify === true && d16.kind === "rollup", "(b') dormant cycle 16 → rollup again");
+
+  // (c) material: cycle threw (failed) → notify.
+  const failCycle = shouldNotifyScreeningCycle({ deployed: false, failed: true, reason: "boom" }, { dormantStreak: 3 });
+  ok(failCycle.notify === true && failCycle.kind === "material", "(c) failed cycle → notify (material)");
+
+  // (d) material: infra reason (429 / balance / positions full) → notify even mid-streak.
+  const rl = shouldNotifyScreeningCycle({ deployed: false, reason: "fetch failed: 429 Too Many Requests" }, { dormantStreak: 3 });
+  ok(rl.notify === true && rl.kind === "material", "(d) 429 → notify (material), not suppressed");
+  // "posisi penuh" is a ROUTINE dormant state, NOT material — must stay suppressed.
+  const full = shouldNotifyScreeningCycle({ deployed: false, reason: "max positions reached" }, { dormantStreak: 3, rollupEvery: 8 });
+  ok(full.notify === false && full.kind === "none", "max positions = routine dormant → suppressed (not material)");
+
+  // legacy/verbose override: notifyDormant=true → every cycle notifies.
+  const verbose = shouldNotifyScreeningCycle({ deployed: false, reason: "no candidates" }, { dormantStreak: 1, notifyDormant: true });
+  ok(verbose.notify === true, "notifyDormantCycles=true → notify every cycle (legacy)");
+}
+
+// ─── 11. Dormant rollup format ───────────────────────────────────────────
+{
+  const out = formatDormantRollup({ count: 8, dominantReason: "no candidates", lastAt: FIXED });
+  console.log("[dormant rollup]\n" + out + "\n");
+  ok(lineCount(out) === 2, "rollup is 2 lines");
+  contains(out, "🔍 Screening 09.30 WIB", "rollup line1: header");
+  contains(out, "8 cycle no-deploy berturut", "rollup line2: streak count");
+  contains(out, "ga ada kandidat lolos", "rollup line2: plain dominant reason");
+  for (const j of JARGON) notContains(out, j, `rollup no jargon: ${j}`);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

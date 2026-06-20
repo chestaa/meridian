@@ -41,7 +41,7 @@ import { appendDecision } from "./decision-log.js";
 import { recordPaperDeploy, refreshPaperTrades } from "./paper-trades.js";
 import { getCircuitStatus, manualReset as circuitReset } from "./account-circuit-breaker.js";
 import { judgeCandidates, formatOrionVerdicts } from "./agents/orion.js";
-import { formatDeployReport, formatNoDeployReport, andromedaEnabled, formatScreeningTerse } from "./agents/andromeda.js";
+import { formatDeployReport, formatNoDeployReport, andromedaEnabled, formatScreeningTerse, formatDormantRollup, shouldNotifyScreeningCycle } from "./agents/andromeda.js";
 import { deployFromOrionVerdict, vegaDeterministicDeployEnabled } from "./agents/vega.js";
 import { runDeterministicManagement, managerDeterministicEnabled } from "./agents/manager.js";
 import { rebalanceOnOor } from "./agents/rebalance.js";
@@ -117,6 +117,10 @@ let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
+// Sirius dormant-cycle throttle: count consecutive routine no-deploy cycles so we
+// emit one rollup notif instead of beronding Bro every 15 min. Reset on deploy.
+let _dormantStreak = 0;
+let _dormantDominantReason = null;
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
 
 // ─── Burner balance-drain monitor (Sirius Pillar B fix #4) ───────
@@ -1300,15 +1304,40 @@ ${andromedaOn ? terseReportSteps : legacyReportSteps}
       // exec-silenced path so they stay quiet in executive mode as before.
       const funnelRan = funnel.universe != null || funnel.deployed || funnel.failed;
       if (funnelRan) {
-        const terse = formatScreeningTerse(funnel);
+        // Sirius spam-control: maintain the dormant streak, then let
+        // shouldNotifyScreeningCycle decide whether Bro hears about this cycle.
+        // DEPLOY + material (circuit/error/infra) always notify; routine dormant
+        // no-deploy is suppressed and surfaced as one rollup every Nth cycle.
+        if (funnel.deployed) {
+          _dormantStreak = 0;
+          _dormantDominantReason = null;
+        } else {
+          _dormantStreak += 1;
+          _dormantDominantReason = funnel.reason || _dormantDominantReason;
+        }
+        const notifyDormant = config.internalAgents?.notifyDormantCycles === true;
+        const rollupEvery = Number(config.internalAgents?.dormantRollupEvery) || 8;
+        const decision = shouldNotifyScreeningCycle(funnel, {
+          notifyDormant,
+          dormantStreak: _dormantStreak,
+          rollupEvery,
+        });
+        const terse = decision.kind === "rollup"
+          ? formatDormantRollup({ count: _dormantStreak, dominantReason: _dormantDominantReason })
+          : formatScreeningTerse(funnel);
         // finalizeTerse REPLACES the whole live message (drops the tool-step echo
         // that finalize() would leave above the footer) → true 2–5 line notif.
-        if (liveMessage) await liveMessage.finalizeTerse(terse).catch(() => {});
-        // Terse notif always carries a DEPLOY / NO DEPLOY verdict marker, so it
-        // passes isMeaningfulReport in executive mode (a cycle that scanned the
-        // universe is always worth one 2–5 line line of signal).
-        else if (!isExecutiveMode() || isMeaningfulReport(terse)) {
-          sendMessage(terse).catch(() => { });
+        // When suppressing a dormant cycle we still finalize the live message so
+        // it doesn't dangle, but we do NOT push a fresh sendMessage to Bro.
+        if (liveMessage) {
+          if (decision.notify) await liveMessage.finalizeTerse(terse).catch(() => {});
+          else await liveMessage.finalizeTerse(terse).catch(() => {}); // collapse silently in place
+        } else if (decision.notify) {
+          // Terse/rollup notif always carries a verdict marker, so it passes
+          // isMeaningfulReport in executive mode.
+          if (!isExecutiveMode() || isMeaningfulReport(terse)) {
+            sendMessage(terse).catch(() => { });
+          }
         }
       } else if (screenReport) {
         // Pre-check skip / boilerplate — unchanged legacy path.

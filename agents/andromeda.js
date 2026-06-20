@@ -242,11 +242,19 @@ function wibTime(date = new Date()) {
 // Translate a raw/technical no-deploy reason into a short plain-language phrase.
 // Pattern-match on the substance, fall back to a generic phrase — NEVER leak
 // raw gate names or metric keys to Bro.
-export function plainReason(raw) {
-  if (!raw) return "ga ada kandidat lolos";
+//
+// `passedFilter` (optional): when true, the pool reached the LLM judge, i.e. it
+// ALREADY cleared every deterministic screen (fee/TVL floor, TVL, volume, rug,
+// holders, mcap band, ...). On this path the real reason can ONLY be a judge
+// verdict (WATCH / no-ENTER) — so judge checks run FIRST and the pool-quality
+// jargon below is NOT consulted (it was the bug: Orion verdict text that merely
+// MENTIONS "fee" got mis-mapped to "fee kekecilan" even though the pool passed
+// the fee floor). Infra failures are still checked first regardless.
+export function plainReason(raw, passedFilter = false) {
+  if (!raw) return passedFilter ? "judge ga ENTER" : "ga ada kandidat lolos";
   const s = String(raw).toLowerCase();
 
-  // Infra / fetch failures
+  // Infra / fetch failures — always checked first (orthogonal to the funnel).
   if (/\b429\b|rate.?limit|too many requests/.test(s)) return "API rate-limit (429)";
   if (/\b(403|forbidden|waf)\b/.test(s)) return "API ditolak (403)";
   if (/\b5\d\d\b|timeout|timed out|econn|fetch fail|network/.test(s)) return "API error";
@@ -254,10 +262,18 @@ export function plainReason(raw) {
   if (/insufficient sol/.test(s)) return "SOL kurang buat deploy";
   if (/max positions/.test(s)) return "posisi udah penuh";
 
+  // Judge verdicts — checked BEFORE pool-quality jargon. When a pool reached the
+  // judge it passed all deterministic gates, so a WATCH/no-ENTER verdict is the
+  // accurate reason even if the verdict text happens to mention fees/TVL/etc.
+  if (/\bwatch\b/.test(s)) return "judge WATCH (belum ENTER)";
+  if (/no.?enter|did not enter|not worth|\bskip\b/.test(s)) return "judge ga ENTER";
+
   // No-candidate funnel outcomes
   if (/no candidates?|all filtered|did not qualify|no candidate met/.test(s)) return "ga ada kandidat lolos";
 
-  // Pool-quality reasons (translate jargon → human)
+  // Pool-quality reasons (translate jargon → human). Only reached when the pool
+  // did NOT pass the filter (passedFilter=false) OR the raw reason is an explicit
+  // gate string, never an Orion free-text verdict.
   if (/fee.?(active.?)?tvl|fee\/tvl|fee.?gen|fee.*(low|kecil|below)/.test(s)) return "fee kekecilan";
   if (/tvl.*(low|thin|below|tipis|min)/.test(s)) return "pool TVL tipis";
   if (/tvl.*(high|above|max)/.test(s)) return "pool TVL kegedean";
@@ -273,12 +289,8 @@ export function plainReason(raw) {
   if (/organic/.test(s)) return "aktivitas pool ga organik";
   if (/cooldown/.test(s)) return "pool lagi cooldown";
 
-  // LLM judge verdicts
-  if (/\bwatch\b/.test(s)) return "judge WATCH (belum ENTER)";
-  if (/no enter|did not enter|skip/.test(s)) return "judge ga ENTER";
-
   // Generic fallback — short, no jargon
-  return "ga ada yang lolos bar deploy";
+  return passedFilter ? "judge ga ENTER" : "ga ada yang lolos bar deploy";
 }
 
 function fmtSolShort(v) {
@@ -323,9 +335,77 @@ export function formatScreeningTerse(funnel = {}) {
     return lines.join("\n");
   }
 
+  // passed > 0 → the pool reached the judge, so it already cleared every
+  // deterministic gate. Tell plainReason so it never mis-maps a judge verdict
+  // to a pool-quality phrase ("fee kekecilan").
+  const reachedJudge = passed > 0;
   lines.push(`${universeStr} pool → ${passed} lolos filter → judge`);
-  lines.push(`Hasil: NO DEPLOY (${plainReason(funnel.reason)})`);
+  lines.push(`Hasil: NO DEPLOY (${plainReason(funnel.reason, reachedJudge)})`);
   return lines.join("\n");
+}
+
+/**
+ * Build a single ROLLUP notif summarizing a run of consecutive dormant
+ * (routine no-deploy) cycles. Sent instead of beronding Bro every 15 min.
+ *
+ * @param {object} state - { count, dominantReason, firstAt, lastAt }
+ * Returns a 2-line plain-language summary. Never throws.
+ */
+export function formatDormantRollup(state = {}) {
+  const at = state.lastAt instanceof Date ? state.lastAt : new Date();
+  const count = num(state.count) ?? 0;
+  const reason = plainReason(state.dominantReason, false);
+  return [
+    `🔍 Screening ${wibTime(at)} WIB`,
+    `Sepi: ${count} cycle no-deploy berturut (alasan dominan: ${reason})`,
+  ].join("\n");
+}
+
+/**
+ * Decide whether a finished screening cycle warrants a per-cycle Telegram notif.
+ *
+ * Bro Dikta does NOT want to be beronding "NO DEPLOY (fee kekecilan)" every
+ * 15 min when the market is dormant. Per-cycle notifs are reserved for MATERIAL
+ * events; routine dormant no-deploy cycles are suppressed and instead surfaced
+ * as one throttled rollup (see formatDormantRollup) + the daily summary.
+ *
+ * @param {object} funnel - the cycle funnel (deployed / failed / reason / passed)
+ * @param {object} opts
+ *   - notifyDormant {boolean}     - config override: notify EVERY cycle (legacy/verbose)
+ *   - dormantStreak {number}      - count of consecutive dormant cycles INCLUDING this one
+ *   - rollupEvery {number}        - emit one rollup notif every Nth dormant cycle (default 8)
+ *
+ * Returns { notify: boolean, kind: "deploy"|"material"|"rollup"|"none" }.
+ * Pure — never reads/writes external state, never throws.
+ */
+export function shouldNotifyScreeningCycle(funnel = {}, opts = {}) {
+  const notifyDormant = opts.notifyDormant === true;
+  const rollupEvery = Number.isFinite(opts.rollupEvery) && opts.rollupEvery > 0
+    ? Math.floor(opts.rollupEvery)
+    : 8;
+  const streak = Number.isFinite(opts.dormantStreak) ? opts.dormantStreak : 0;
+
+  // 1. DEPLOY — always notify (the whole point).
+  if (funnel.deployed) return { notify: true, kind: "deploy" };
+
+  // 2. Material event — infra failure / circuit / real error. The cycle THREW
+  //    or hit an orthogonal infra reason (429/403/5xx/balance/positions full).
+  if (funnel.failed) return { notify: true, kind: "material" };
+  const reason = String(funnel.reason || "").toLowerCase();
+  // NOTE: "max positions" and "insufficient SOL" are ROUTINE dormant states
+  // (posisi penuh / nunggu saldo), NOT errors — they stay suppressed/throttled
+  // like any other no-deploy. Only genuine infra failures count as material.
+  const infra = /\b429\b|rate.?limit|too many requests|\b(403|forbidden|waf)\b|\b5\d\d\b|timeout|timed out|econn|fetch fail|network|balance unreadable/.test(reason);
+  if (infra) return { notify: true, kind: "material" };
+
+  // 3. Legacy/verbose override — notify every cycle.
+  if (notifyDormant) return { notify: true, kind: "material" };
+
+  // 4. Routine dormant no-deploy — suppress, but surface ONE rollup every Nth
+  //    consecutive dormant cycle so a long dry spell isn't silent forever.
+  if (streak > 0 && streak % rollupEvery === 0) return { notify: true, kind: "rollup" };
+
+  return { notify: false, kind: "none" };
 }
 
 // Convenience: detect whether Andromeda formatting is active. Lets callers
