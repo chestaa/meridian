@@ -111,6 +111,68 @@ export function isBluechipMintPair(baseMint, quoteMint) {
   return BLUECHIP_INCOME_MINTS.has(baseMint) && BLUECHIP_INCOME_MINTS.has(quoteMint);
 }
 
+// Broad-discovery page cache (Cassiopeia — 429 ROOT-CAUSE FIX, 2026-06-20).
+// Lyra: `fetchPoolDiscoveryPage` pulls page_size=1000 EVERY screening cycle
+// (~every 15-30 min) and 3 separate services (meridian + signal-runner +
+// auto-screener) hammer the same Meteora Pool-Discovery endpoint → chronic 429,
+// trending up 5→13/hr → deploys blocked. The pool universe does NOT shift
+// meaningfully over a few minutes, so a short-TTL cache of the RAW 1000-pool
+// page lets repeated cycles (and the snapshot-verify reuse path) reuse the same
+// fetch instead of re-hitting the API. Keyed by the EXACT request params
+// (page_size + filters + timeframe + category + sort_by) so a different filter
+// set / timeframe / sort never serves a stale or wrong page.
+//
+// CONSTRAINTS held:
+//  - Breadth UNTOUCHED: we cache the full 1000-pool raw page; the strict client
+//    gate runs normally on top of it every cycle.
+//  - Quality UNTOUCHED: only the RAW fetch is cached, not the gate result. Gate,
+//    enrichment, vol-refetch all run fresh on the cached raw set each cycle.
+//  - FAIL-SAFE (anti-pattern #2): cache miss / expired → fresh fetch. A failed
+//    fetch is NEVER cached (error propagates, no poisoning). An empty result is
+//    only cached if the API genuinely returned an empty page — never deploy on a
+//    fabricated empty cache (the gate downstream already refuses an empty funnel).
+//  - We serve a DEEP CLONE: downstream stamps mutate pool objects (volatility
+//    refetch, source tags); handing out the cached reference would corrupt the
+//    cache across cycles. Clone isolates each cycle.
+// TTL is configurable (broadDiscoveryCacheTtlMin, default 7 min — mid 5-10 band:
+// long enough to collapse same-cycle thundering-herd, short enough that no deploy
+// rides a >7-min-stale universe). Set 0 → cache OFF (fully reversible).
+const _discoveryPageCache = new Map(); // key -> { data: object, ts: number }
+
+function _discoveryCacheKey({ page_size, filters, timeframe, category, sort_by }) {
+  return JSON.stringify({ page_size, filters, timeframe, category, sort_by: sort_by || null });
+}
+
+function _discoveryCacheTtlMs() {
+  const min = numeric(config.screening?.broadDiscoveryCacheTtlMin);
+  // default 7 min; <=0 disables the cache (always-fresh fetch).
+  if (min == null) return 7 * 60 * 1000;
+  return Math.max(0, min) * 60 * 1000;
+}
+
+/**
+ * Read-only cache peek for the Vega snapshot-verify reuse path: returns the
+ * cached raw discovery page (deep-cloned) if a fresh (within-TTL) entry exists
+ * for the given request key, else null. Lets snapshot-verify reuse the
+ * discovery fetch instead of re-hitting the API (its own 429 source). Never
+ * triggers a fetch — pure read. Exported.
+ */
+export function peekDiscoveryCache(reqParams) {
+  const ttl = _discoveryCacheTtlMs();
+  if (ttl <= 0) return null;
+  const key = _discoveryCacheKey(reqParams);
+  const hit = _discoveryPageCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > ttl) return null;
+  return JSON.parse(JSON.stringify(hit.data));
+}
+
+/** Test/ops hook — clear both discovery caches (page + per-pool detail). Exported. */
+export function clearDiscoveryCache() {
+  _discoveryPageCache.clear();
+  _discoveryDetailCache.clear();
+}
+
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
@@ -994,6 +1056,23 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category,
   // volume:desc, tvl:desc supported). When the broad page_size still clips the
   // universe, the highest-ranked pools by this key are pulled FIRST — so the cream
   // survives even at the page ceiling. Never narrows the result set, only orders it.
+
+  // 429 ROOT-CAUSE CACHE (Cassiopeia, 2026-06-20): serve a within-TTL cached raw
+  // page for an IDENTICAL request key before hitting the API. Collapses the
+  // same-cycle / multi-service thundering-herd that drives the chronic 429.
+  // Returns a DEEP CLONE so downstream pool-object stamps never corrupt the cache.
+  const reqParams = { page_size, filters, timeframe, category, sort_by };
+  const ttl = _discoveryCacheTtlMs();
+  const cacheKey = ttl > 0 ? _discoveryCacheKey(reqParams) : null;
+  if (cacheKey) {
+    const hit = _discoveryPageCache.get(cacheKey);
+    if (hit && Date.now() - hit.ts <= ttl) {
+      const ageSec = Math.round((Date.now() - hit.ts) / 1000);
+      log("screening", `Discovery cache HIT (age ${ageSec}s, TTL ${Math.round(ttl / 1000)}s) — reusing raw page, no API call`);
+      return JSON.parse(JSON.stringify(hit.data));
+    }
+  }
+
   const url = `${POOL_DISCOVERY_BASE}/pools?` +
     `page_size=${page_size}` +
     `&filter_by=${encodeURIComponent(filters)}` +
@@ -1004,13 +1083,50 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category,
   const res = await fetch(url);
 
   if (!res.ok) {
+    // FAIL-SAFE: never cache an error. A 429/5xx propagates so the caller's
+    // existing .catch(() => null) handles it — we do NOT serve a poisoned entry
+    // and we do NOT overwrite a still-fresh prior cache hit with a failure.
     throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
   }
 
-  return res.json();
+  const data = await res.json();
+  // Cache only a successful fetch (any shape the API returns, incl. genuinely
+  // empty). Store the freshly-parsed object; we clone on READ, not on write, so
+  // the stored object is never the one downstream mutates.
+  if (cacheKey) {
+    _discoveryPageCache.set(cacheKey, { data, ts: Date.now() });
+  }
+  return JSON.parse(JSON.stringify(data));
+}
+
+// Per-pool detail cache (Cassiopeia — 429 ROOT-CAUSE FIX, 2026-06-20). The detail
+// endpoint is hit per-pool by applyVolatilityTimeframe (a LATENT up-to-1000-fetch
+// fan-out whenever timeframe<30m — currently dormant at live timeframe=1h but a
+// 429 bomb if the timeframe is lowered), refetchVolatilityForUnusable, the native-
+// detail enrich pass, AND the snapshot-verify reuse path. They all converge on the
+// SAME endpoint, so a short-TTL cache keyed by (poolAddress+timeframe) collapses
+// duplicate hits within and across those passes in one cycle. Detail volatility is
+// the most time-sensitive field, so the TTL is short (detail-specific, default 5
+// min) — tied to broadDiscoveryDetailCacheTtlMin. FAIL-SAFE identical to the page
+// cache: miss/expired → fresh fetch; a failed fetch is never cached; cloned on read.
+const _discoveryDetailCache = new Map(); // `${poolAddress}|${timeframe}` -> { detail, ts }
+
+function _discoveryDetailCacheTtlMs() {
+  const min = numeric(config.screening?.broadDiscoveryDetailCacheTtlMin);
+  if (min == null) return 5 * 60 * 1000; // 5 min — vol is time-sensitive
+  return Math.max(0, min) * 60 * 1000;
 }
 
 async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
+  const ttl = _discoveryDetailCacheTtlMs();
+  const cacheKey = ttl > 0 && poolAddress ? `${poolAddress}|${timeframe}` : null;
+  if (cacheKey) {
+    const hit = _discoveryDetailCache.get(cacheKey);
+    if (hit && Date.now() - hit.ts <= ttl) {
+      return hit.detail == null ? null : JSON.parse(JSON.stringify(hit.detail));
+    }
+  }
+
   const url = `${POOL_DISCOVERY_BASE}/pools?` +
     `page_size=1` +
     `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
@@ -1019,11 +1135,17 @@ async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
   const res = await fetch(url);
 
   if (!res.ok) {
+    // FAIL-SAFE: never cache an error — propagate so the targeted vol-rescue /
+    // enrich passes treat it as "unavailable" (leave field unusable → gate decides).
     throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
   }
 
   const data = await res.json();
-  return (data.data || [])[0] ?? null;
+  const detail = (data.data || [])[0] ?? null;
+  if (cacheKey) {
+    _discoveryDetailCache.set(cacheKey, { detail, ts: Date.now() });
+  }
+  return detail == null ? null : JSON.parse(JSON.stringify(detail));
 }
 
 async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {

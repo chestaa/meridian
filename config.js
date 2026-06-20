@@ -267,6 +267,22 @@ export const config = {
     broadMcapCeil:           u.broadMcapCeil           ?? 50_000_000, // WIDE — above strict maxMcap (10M). Strict ceil runs client-side.
     broadMinTvl:             u.broadMinTvl             ?? 1_000,  // WIDE — below strict minTvl (10k). Strict tvl floor runs client-side.
     broadSortBy:             u.broadSortBy             ?? "fee_active_tvl_ratio:desc", // free server pre-sort: if page_size clips, the highest fee/TVL pools are pulled first
+    // 429 ROOT-CAUSE FIX (Cassiopeia, 2026-06-20): TTL (minutes) for the raw
+    // broad-discovery page cache in fetchPoolDiscoveryPage. The pool universe is
+    // stable over a few minutes, so within-TTL cycles (and the snapshot-verify
+    // reuse path) reuse the cached 1000-pool fetch instead of re-hitting Meteora —
+    // collapsing the same-cycle / multi-service thundering-herd that drives the
+    // chronic 429. 7 min = mid 5-10 band (long enough to dedup the herd, short
+    // enough that no deploy rides a stale universe). FAIL-SAFE: miss/expired →
+    // fresh fetch; a failed fetch is never cached. Set 0 → cache OFF (reversible).
+    // Breadth + quality UNTOUCHED: only the RAW page is cached; the strict client
+    // gate, enrichment, and vol-refetch all run fresh on the cached set each cycle.
+    broadDiscoveryCacheTtlMin: u.broadDiscoveryCacheTtlMin ?? 7,
+    // Per-pool DETAIL cache TTL (minutes) for fetchPoolDiscoveryDetail — hit by the
+    // volatility-timeframe fan-out, vol-rescue, native-detail enrich, and snapshot-
+    // verify reuse, all on the same endpoint. Shorter than the page TTL (5 min)
+    // because detail volatility is the most time-sensitive field. Set 0 → OFF.
+    broadDiscoveryDetailCacheTtlMin: u.broadDiscoveryDetailCacheTtlMin ?? 5,
     // ─── Item (a) Fee-Gen-Token signal — balanced two-sided flow (SCORE BONUS ONLY) ───
     // NEVER a gate (dormancy risk — a one-sided pump can still be a fine LP).
     // Pool Discovery API exposes NO per-side fee field (verified live: only aggregate
@@ -824,6 +840,8 @@ export function reloadScreeningThresholds() {
     if (fresh.broadMcapCeil  != null) s.broadMcapCeil  = fresh.broadMcapCeil;
     if (fresh.broadMinTvl    != null) s.broadMinTvl    = fresh.broadMinTvl;
     if (fresh.broadSortBy    != null) s.broadSortBy    = fresh.broadSortBy;
+    if (fresh.broadDiscoveryCacheTtlMin != null) s.broadDiscoveryCacheTtlMin = fresh.broadDiscoveryCacheTtlMin;
+    if (fresh.broadDiscoveryDetailCacheTtlMin != null) s.broadDiscoveryDetailCacheTtlMin = fresh.broadDiscoveryDetailCacheTtlMin;
     if (fresh.feeGenSymmetryBonusEnabled !== undefined) s.feeGenSymmetryBonusEnabled = fresh.feeGenSymmetryBonusEnabled;
     if (fresh.feeGenSymmetryWeight != null) s.feeGenSymmetryWeight = fresh.feeGenSymmetryWeight;
     if (fresh.feeTvlHighBonusEnabled !== undefined) s.feeTvlHighBonusEnabled = fresh.feeTvlHighBonusEnabled;
