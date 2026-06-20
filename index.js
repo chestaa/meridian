@@ -2253,11 +2253,17 @@ async function telegramHandler(msg) {
       const pos = positions[idx];
       const cur = config.management.solMode ? "◎" : "$";
       const rangeStatus = pos.in_range ? "✅ Dalam range" : `⚠️ Keluar range (OOR) ${formatAgeIndo(pos.minutes_out_of_range ?? 0)}`;
+      // Total kalau ditutup = PnL harga + fee (additif, sama seperti list view).
+      const pnlSafe = Number.isFinite(Number(pos.pnl_usd)) ? Number(pos.pnl_usd) : 0;
+      const feesSafe = Number.isFinite(Number(pos.unclaimed_fees_usd)) ? Number(pos.unclaimed_fees_usd) : 0;
+      const totalNum = pnlSafe + feesSafe;
+      const totalStr = totalNum >= 0 ? `+${cur}${totalNum.toFixed(2)}` : `-${cur}${Math.abs(totalNum).toFixed(2)}`;
       await sendMessage([
         `#${idx + 1}  ${pos.pair}`,
+        `Kalau ditutup sekarang (≈ sebelum gas): ${totalStr}`,
         `Nilai posisi: ${cur}${Number(pos.total_value_usd ?? 0).toFixed(2)}`,
-        `Untung/Rugi: ${pos.pnl_pct ?? "?"}%`,
-        `Fee didapat (income, belum diklaim): ${cur}${Number(pos.unclaimed_fees_usd ?? 0).toFixed(2)}`,
+        `Untung/Rugi (harga saja): ${cur}${pnlSafe.toFixed(2)} (${pos.pnl_pct ?? "?"}%)`,
+        `Fee didapat (income, belum diklaim): ${cur}${feesSafe.toFixed(2)}`,
         `Umur: ${formatAgeIndo(pos.age_minutes)}  |  ${rangeStatus}`,
         `Range bin: ${pos.lower_bin} → ${pos.upper_bin} (aktif ${pos.active_bin})`,
         `Pool: ${pos.pool}`,
