@@ -60,8 +60,13 @@ check("single: pnl rounded to 2dp (+$3.44)", msg1.includes("+$3.44"));
 check("single: fee rounded to 2dp ($2.81)", msg1.includes("$2.81"));
 check("single: fee labeled as INCOME/didapat (not a cost)",
   /Fee didapat \(income/.test(msg1));
-check("single: PnL labeled with fee-exclusion caveat",
-  /Untung\/Rugi \(belum termasuk fee\)/.test(msg1));
+check("single: PnL labeled HARGA-saja + fee-exclusion caveat",
+  /Untung\/Rugi \(harga saja, belum termasuk fee\)/.test(msg1));
+// ── Total line: PnL(harga) + fee, additif (Lyra: no overlap) ───────
+check("single: Total line present", /Total kalau ditutup sekarang/.test(msg1));
+check("single: Total carries 'sebelum gas' caveat", msg1.includes("≈ sebelum gas"));
+// 3.437 + 2.8095 = 6.2465 → +$6.25
+check("single: Total = pnl+fee (+$6.25)", msg1.includes("+$6.25"));
 check("single: age in jam-menit (5j 4m)", msg1.includes("5j 4m"));
 check("single: in-range status plain", msg1.includes("Dalam range"));
 check("single: NO raw 'PnL:' jargon label", !/\bPnL:/.test(msg1));
@@ -81,6 +86,10 @@ check("multi: concrete close example present", msg2.includes("/close 1"));
 check("multi: negative pnl renders with minus (-$1.50)", msg2.includes("-$1.50"));
 check("multi: OOR status shown for out-of-range pos", msg2.includes("Keluar range"));
 check("multi: second pos age 2j 5m", msg2.includes("2j 5m"));
+// Loss case: pos#1 pnl -1.5 + fee 0.5 = -1.0 (net still loss, computed right)
+check("multi: loss-case Total = pnl+fee (-$1.00)", msg2.includes("-$1.00"));
+// pos#2 pnl 2.0 + fee 1.0 = 3.0 (winner total)
+check("multi: winner Total = pnl+fee (+$3.00)", msg2.includes("+$3.00"));
 
 // ── empty + solMode ───────────────────────────────────────────────
 check("empty → plain 'belum ada posisi'", formatPositionsMessage([], 0) === "Belum ada posisi terbuka.");
@@ -95,6 +104,9 @@ try { sparseMsg = formatPositionsMessage(sparse, 1, "$"); } catch { crashed = tr
 check("sparse: does not crash on missing fields", !crashed);
 check("sparse: missing value → $0.00", sparseMsg.includes("$0.00"));
 check("sparse: missing age → ?", sparseMsg.includes("Umur: ?"));
+// Graceful null: pnl_usd + unclaimed_fees_usd both missing → Total +$0.00, no NaN
+check("sparse: Total present, no NaN", /Total kalau ditutup sekarang.*\$0\.00/.test(sparseMsg));
+check("sparse: NO 'NaN' leaks anywhere", !sparseMsg.includes("NaN"));
 
 // ── audit: /help text in index.js carries NO abstract placeholders ─
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

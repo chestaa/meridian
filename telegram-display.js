@@ -28,21 +28,31 @@ export function formatPositionsMessage(positions, totalPositions, cur = "$") {
   if (!Array.isArray(positions) || positions.length === 0) {
     return "Belum ada posisi terbuka.";
   }
+  // Render a signed currency amount: "+$3.44" / "-$1.50". Non-finite → treat as 0.
+  const signedAmount = (num) => {
+    const v = Number.isFinite(num) ? num : 0;
+    return v >= 0 ? `+${cur}${v.toFixed(2)}` : `-${cur}${Math.abs(v).toFixed(2)}`;
+  };
   const blocks = positions.map((p, i) => {
     const n = i + 1;
     const pnlNum = Number(p.pnl_usd);
-    const pnl = (Number.isFinite(pnlNum) ? pnlNum : 0) >= 0
-      ? `+${cur}${(Number.isFinite(pnlNum) ? pnlNum : 0).toFixed(2)}`
-      : `-${cur}${Math.abs(pnlNum).toFixed(2)}`;
-    const fees = `${cur}${Number(p.unclaimed_fees_usd ?? 0).toFixed(2)}`;
+    const feesNum = Number(p.unclaimed_fees_usd);
+    const pnlSafe = Number.isFinite(pnlNum) ? pnlNum : 0;
+    const feesSafe = Number.isFinite(feesNum) ? feesNum : 0;
+    const pnl = signedAmount(pnlNum);
+    const fees = `${cur}${feesSafe.toFixed(2)}`;
+    // Total kalau ditutup sekarang = PnL harga + fee (Lyra: additif, no overlap).
+    // Loss case aman: pnlSafe bisa negatif, total = pnl + fee bisa net +/-.
+    const total = signedAmount(pnlSafe + feesSafe);
     const value = `${cur}${Number(p.total_value_usd ?? 0).toFixed(2)}`;
     const age = formatAgeIndo(p.age_minutes);
     const status = p.in_range ? "✅ Dalam range" : "⚠️ Keluar range (OOR)";
     return [
       `#${n}  ${p.pair}`,
       `   Nilai posisi: ${value}`,
-      `   Untung/Rugi (belum termasuk fee): ${pnl}`,
+      `   Untung/Rugi (harga saja, belum termasuk fee): ${pnl}`,
       `   Fee didapat (income, belum diklaim): ${fees}`,
+      `   Total kalau ditutup sekarang (≈ sebelum gas): ${total}`,
       `   Umur: ${age}  |  ${status}`,
     ].join("\n");
   });
