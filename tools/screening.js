@@ -88,10 +88,28 @@ const MSOL_MINT = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So";
 const BSOL_MINT = "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1";
 const JUPSOL_MINT = "jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v";
 const CBBTC_MINT = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"; // Coinbase wrapped BTC
-const BLUECHIP_INCOME_MINTS = new Set([
+export const BLUECHIP_INCOME_MINTS = new Set([
   WSOL_MINT, USDC_MINT, USDT_MINT,
   JLP_MINT, JITOSOL_MINT, MSOL_MINT, BSOL_MINT, JUPSOL_MINT, CBBTC_MINT,
 ]);
+
+/**
+ * Pure whitelist predicate on a RAW mint pair (NOT a pool object). This is the
+ * deploy-side authoritative guard used by dlmm.deployPosition / executor — a pool
+ * is bluechip-deployable ONLY when BOTH legs are in BLUECHIP_INCOME_MINTS. Single
+ * source of truth shared with classifyPoolMode (which derives legs from a pool obj).
+ * FAIL-CLOSED: any missing/empty leg → false (never let an unknown mint into the
+ * laxer bluechip lane). Exported so the money path imports the SAME curated set —
+ * no second mint list to drift.
+ *
+ * @param {string} baseMint  - token X mint (base58)
+ * @param {string} quoteMint - token Y mint (base58)
+ * @returns {boolean} true iff BOTH legs are whitelisted bluechip income mints
+ */
+export function isBluechipMintPair(baseMint, quoteMint) {
+  if (!baseMint || !quoteMint) return false;
+  return BLUECHIP_INCOME_MINTS.has(baseMint) && BLUECHIP_INCOME_MINTS.has(quoteMint);
+}
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
@@ -626,7 +644,14 @@ export function isMemecoinNarrowProfile(pool) {
 export function marketRegimeGateRejectReason(pool, regimeResult, s) {
   if (s?.marketRegimeGateEnabled !== true) return null;   // gate off → no-op
   if (!regimeResult || regimeResult.regime !== "DOWNTREND") return null; // only pause on confirmed downtrend
-  if (!isMemecoinNarrowProfile(pool)) return null;        // blue-chip exempt (Phase 1 ready)
+  // Bluechip dual-mode exempt (Cassiopeia — Wave 2). isMemecoinNarrowProfile only
+  // recognizes wSOL/USDC/USDT BASE mints as bluechip, so a both-leg bluechip with a
+  // NON-stable base (JitoSOL-SOL, mSOL-SOL) would slip through as "memecoin" and get
+  // paused. When bluechipModeEnabled is ON, a classified bluechip pool has a SYMMETRIC
+  // payoff (fees pay both ways in a downtrend) → EXEMPT. Flag OFF → isBluechipPool
+  // false → falls through to the legacy isMemecoinNarrowProfile check unchanged.
+  if (isBluechipPool(pool, s)) return null;
+  if (!isMemecoinNarrowProfile(pool)) return null;        // blue-chip BASE exempt (legacy)
   return "market_regime_downtrend_memecoin_paused";
 }
 
@@ -793,6 +818,31 @@ export function bluechipPoolGateRejectReason(pool, s) {
     }
   }
   return null;
+}
+
+/**
+ * Does a bluechip pool have a wSOL leg? PURE + unit-tested. (Cassiopeia ↔ Vega coord.)
+ *
+ * Vega's deploy path (Opsi B) is SINGLE-SIDE SOL — the executor refuses amount_x>0,
+ * so the bot can only seed a position with SOL. That means a bluechip pool is
+ * DEPLOYABLE under Opsi B only if one of its legs is wSOL (SOL-USDC, SOL-USDT,
+ * JitoSOL-SOL, ...). A bluechip pool with NO wSOL leg (e.g. JLP-USDC, USDC-USDT)
+ * is still DISCOVERABLE/rankable for income intel, but cannot be single-side-SOL
+ * deployed — it would need Vega's Opsi A (two-sided) which does not exist yet.
+ *
+ * We mark (not silently drop) such pools so the funnel stays honest: discovery
+ * surfaces them, but getTopCandidates filters them from the deployable set while
+ * `requireBluechipWsolLeg` is on (default true, the Opsi-B-only guarantee). Flip it
+ * off once Vega ships two-sided deploy and JLP-USDC-style pools become deployable.
+ *
+ * Reads both shapes via poolLegMints (raw token_x/token_y OR condensed base/quote).
+ *
+ * @param {object} pool
+ * @returns {boolean} true iff either leg mint === wSOL
+ */
+export function bluechipHasWsolLeg(pool) {
+  const { base, quote } = poolLegMints(pool);
+  return base === WSOL_MINT || quote === WSOL_MINT;
 }
 
 export function quoteOrganicGateRejectReason(pool, s) {
@@ -1525,8 +1575,20 @@ export function buildDiscoveryFilters(s) {
   // bounds, so we cannot drop a pool the client would pass. broadMinTvl is a low sanity
   // floor (kills 0-TVL dust without touching the strict client minTvl).
   const mcapFloor = numeric(s.broadMcapFloor);
-  const mcapCeil  = numeric(s.broadMcapCeil);
+  let   mcapCeil  = numeric(s.broadMcapCeil);
   const tvlFloor  = numeric(s.broadMinTvl);
+  // Bluechip dual-mode (Cassiopeia — Wave 2): the memecoin broad ceiling (50M) would
+  // drop SOL-USDC (SOL ~$40B) at the SERVER, before the client gate runs — the exact
+  // discovery-miss the bluechip band must avoid. When the flag is ON, RAISE the broad
+  // ceiling to bluechipBroadMcapCeil ($1T default) so large-cap bluechips survive the
+  // server pre-filter. This stays a SUPERSET: memecoin pools above the memecoin maxMcap
+  // are still rejected CLIENT-side, and bluechips are gated by the bluechip band — the
+  // server can only let MORE through, never drop a deployable pool. Flag OFF → ceiling
+  // unchanged (byte-for-byte memecoin behavior).
+  if (s.bluechipModeEnabled === true) {
+    const bcCeil = numeric(s.bluechipBroadMcapCeil);
+    if (bcCeil != null && (mcapCeil == null || bcCeil > mcapCeil)) mcapCeil = bcCeil;
+  }
   return [
     ...sanity,
     mcapFloor != null ? `base_token_market_cap>=${mcapFloor}` : null,
@@ -1764,7 +1826,14 @@ export async function discoverPools({
 
   const filteredExamples = [];
   const thresholdedRawPools = rawPools.filter((pool) => {
-    const reason = getRawPoolScreeningRejectReason(pool, s);
+    // Bluechip dual-mode branch (Cassiopeia — Wave 2). When bluechipModeEnabled is
+    // FALSE, isBluechipPool() is ALWAYS false → every pool takes the memecoin gate
+    // below, byte-for-byte unchanged. When ON, a both-leg-bluechip pool is routed to
+    // its OWN inverted gate (vol-CEILING not floor, no rug/mcap-band/vol-floor) and
+    // SKIPS the memecoin gate entirely; a memecoin pool is untouched.
+    const reason = isBluechipPool(pool, s)
+      ? bluechipPoolGateRejectReason(pool, s)
+      : getRawPoolScreeningRejectReason(pool, s);
     if (!reason) return true;
     filteredExamples.push({ name: pool.name || pool.pool_address || "unknown pool", reason });
     if (pool.discord_signal) log("screening", `Discord signal filtered: ${pool.name || pool.pool_address} — ${reason}`);
@@ -1893,28 +1962,38 @@ export async function getTopCandidates({ limit = 10 } = {}) {
 
   const eligible = pools
     .filter((p) => {
-      const tokenAgeHours = Number(p.token_age_hours ?? 0);
-      if (Number.isFinite(tokenAgeHours) && tokenAgeHours > 0 && tokenAgeHours < 8) {
-        pushFilteredReason(filteredOut, p, `token age ${tokenAgeHours}h below live safety floor 8h`);
-        return false;
-      }
-      const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
-      if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) {
-        pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${minTvl}`);
-        return false;
-      }
-      if (Number.isFinite(maxTvl) && maxTvl > 0 && tvl > maxTvl) {
-        pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${maxTvl}`);
-        return false;
-      }
-      const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
-      if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0 && (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < minFeeActiveTvlRatio)) {
-        pushFilteredReason(filteredOut, p, `fee/active-TVL ${Number.isFinite(feeActiveTvlRatio) ? feeActiveTvlRatio : "unknown"} below minFeeActiveTvlRatio ${minFeeActiveTvlRatio}`);
-        return false;
-      }
-      if (!isUsableVolatility(p.volatility)) {
-        pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
-        return false;
+      // Bluechip dual-mode (Cassiopeia — Wave 2). When the flag is OFF, isBluechip is
+      // ALWAYS false → the full memecoin numeric gate stack below runs unchanged.
+      // When ON, a bluechip pool SKIPS the memecoin-specific numeric gates (token-age
+      // 8h floor, memecoin minTvl/maxTvl, memecoin minFeeActiveTvlRatio, the
+      // isUsableVolatility vol-FLOOR) — those are inverted/irrelevant for bluechip.
+      // Its OWN gate (bluechipPoolGateRejectReason) runs in the dedicated block below.
+      // The non-mode-specific guards (open position / cooldown) STILL apply to both.
+      const isBluechip = isBluechipPool(p, eff);
+      if (!isBluechip) {
+        const tokenAgeHours = Number(p.token_age_hours ?? 0);
+        if (Number.isFinite(tokenAgeHours) && tokenAgeHours > 0 && tokenAgeHours < 8) {
+          pushFilteredReason(filteredOut, p, `token age ${tokenAgeHours}h below live safety floor 8h`);
+          return false;
+        }
+        const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
+        if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) {
+          pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${minTvl}`);
+          return false;
+        }
+        if (Number.isFinite(maxTvl) && maxTvl > 0 && tvl > maxTvl) {
+          pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${maxTvl}`);
+          return false;
+        }
+        const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
+        if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0 && (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < minFeeActiveTvlRatio)) {
+          pushFilteredReason(filteredOut, p, `fee/active-TVL ${Number.isFinite(feeActiveTvlRatio) ? feeActiveTvlRatio : "unknown"} below minFeeActiveTvlRatio ${minFeeActiveTvlRatio}`);
+          return false;
+        }
+        if (!isUsableVolatility(p.volatility)) {
+          pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
+          return false;
+        }
       }
       if (occupiedPools.has(p.pool)) {
         pushFilteredReason(filteredOut, p, "already have an open position in this pool");
@@ -1986,6 +2065,15 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   if (eff.requireSolQuote === true && eligible.length > 0) {
     const beforeSq = eligible.length;
     const kept = eligible.filter((p) => {
+      // Bluechip RELAX (Cassiopeia ↔ Vega): the SOL-quote filter rejects any non-wSOL
+      // QUOTE (it assumes single-side-SOL needs a wSOL quote). A bluechip pair may be
+      // USDC/USDT-QUOTED with a wSOL BASE (e.g. SOL-USDC: base=wSOL, quote=USDC) — that
+      // pool IS single-side-SOL deployable (seed the wSOL base side) yet this filter
+      // would wrongly drop it. So for bluechip pools we DEFER deployability to the
+      // wSOL-LEG check below (either leg = wSOL), which is the true Opsi-B condition.
+      // Flag OFF → isBluechipPool false → memecoin pools hit the strict quote filter
+      // unchanged.
+      if (isBluechipPool(p, eff)) return true;
       const reason = solQuoteRejectReason(p, eff);
       if (reason) {
         log("screening", `Deployability: dropped ${p.name} — ${reason} (quote=${p.quote?.symbol || p.quote?.mint || "unknown"})`);
@@ -1996,6 +2084,40 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     });
     eligible.splice(0, eligible.length, ...kept);
     if (eligible.length < beforeSq) log("screening", `SOL-quote filter removed ${beforeSq - eligible.length} undeployable pool(s)`);
+  }
+
+  // Bluechip income-engine GATE + deployability (Cassiopeia — Wave 2). Runs only when
+  // bluechipModeEnabled (default OFF → entirely inert, memecoin path unchanged). Two
+  // parts, both fail-closed:
+  //   1) bluechipPoolGateRejectReason on the ENRICHED condensed pool (re-validates
+  //      deep-TVL / consistent-volume / fee-yield / mcap / vol-CEILING — the inverted
+  //      profile). Discovery already gated on the raw shape, but enrichment may have
+  //      back-filled fields, so we re-gate on the final numbers (defense in depth).
+  //   2) Deployability: under Vega's Opsi B (single-side SOL) a bluechip pool is
+  //      deployable ONLY if it has a wSOL leg. requireBluechipWsolLeg (default true)
+  //      drops non-wSOL-leg bluechips (JLP-USDC, USDC-USDT) from the DEPLOYABLE set —
+  //      they remain discoverable intel but Opsi B cannot seed them. Flip the flag off
+  //      once Vega ships two-sided (Opsi A) deploy.
+  if (eff.bluechipModeEnabled === true && eligible.length > 0) {
+    const beforeBc = eligible.length;
+    const requireWsolLeg = eff.requireBluechipWsolLeg !== false; // default true (Opsi B)
+    const kept = eligible.filter((p) => {
+      if (!isBluechipPool(p, eff)) return true; // memecoin pool — untouched here
+      const reason = bluechipPoolGateRejectReason(p, eff);
+      if (reason) {
+        log("screening", `Bluechip gate: dropped ${p.name} — ${reason}`);
+        pushFilteredReason(filteredOut, p, reason);
+        return false;
+      }
+      if (requireWsolLeg && !bluechipHasWsolLeg(p)) {
+        log("screening", `Bluechip deployability: dropped ${p.name} — no_wsol_leg_opsi_b_undeployable (quote=${p.quote?.symbol || "?"})`);
+        pushFilteredReason(filteredOut, p, "bluechip_no_wsol_leg_opsi_b_undeployable");
+        return false;
+      }
+      return true;
+    });
+    eligible.splice(0, eligible.length, ...kept);
+    if (eligible.length < beforeBc) log("screening", `Bluechip gate/deployability removed ${beforeBc - eligible.length} pool(s)`);
   }
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
@@ -2058,6 +2180,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
               freeze_disabled: audit.freezeAuthorityDisabled ?? null,
             }
           : null;
+
+        // Bluechip exempt (Cassiopeia — Wave 2): bot/top10 concentration is meaningless
+        // for stablecoins/LSTs (a stablecoin's "top holders" are protocols/CEXes by
+        // design). Flag OFF → never reached as bluechip. Audit still surfaced above.
+        if (isBluechipPool(p, eff)) return true;
 
         if (botGateActive) {
           if (botPct == null) {
@@ -2238,6 +2365,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     {
       const beforeRug = eligible.length;
       const kept = eligible.filter((p) => {
+        // Bluechip exempt (Cassiopeia — Wave 2): a stablecoin has no "dev", LST mint/
+        // freeze authorities are protocol-controlled by design → rug/mint/freeze gates
+        // are irrelevant. Flag OFF → never reached as bluechip.
+        if (isBluechipPool(p, eff)) return true;
         const reason = rugGateRejectReason(p, eff);
         if (reason) {
           log("screening", `Rug gate: dropped ${p.name} — ${reason}`);
@@ -2257,6 +2388,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     {
       const beforeDsa = eligible.length;
       const kept = eligible.filter((p) => {
+        // Bluechip exempt (Cassiopeia — Wave 2): no "dev" to have sold. Flag OFF →
+        // never reached as bluechip.
+        if (isBluechipPool(p, eff)) return true;
         if (devSoldAllShouldReject(p, eff)) {
           const reason = eff.devSoldAllRequiresHighConcentration === false
             ? "dev_sold_all"
@@ -2278,6 +2412,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (config.dryRun === false && eff.tvlMcapGateEnabled === true) {
       const beforeTm = eligible.length;
       const kept = eligible.filter((p) => {
+        // Bluechip exempt (Cassiopeia — Wave 2): the TVL/MC<0.2 thesis is a memecoin
+        // fee-concentration heuristic. A bluechip's mcap is enormous (SOL ~$40B) so the
+        // ratio is meaninglessly tiny; the bluechip gate already enforces deep-TVL +
+        // fee-yield floors. Flag OFF → never reached as bluechip.
+        if (isBluechipPool(p, eff)) return true;
         const reason = tvlMcapGateRejectReason(p, eff);
         if (reason) {
           const tvl = numeric(p.tvl ?? p.active_tvl);

@@ -73,6 +73,14 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    // ── Bluechip per-position SOL cap (Vega — Opsi B, money-path) ──
+    // SEPARATE hard cap for bluechip deploys, INDEPENDENT of memecoin maxDeployAmount.
+    // Default 0.45 SOL — deliberately conservative + equal to current memecoin sizing,
+    // NOT auto-raised: bluechip carries lower IL risk, but a wider range parks more
+    // notional per bin, so we do NOT loosen the cap without an explicit Bro decision.
+    // dlmm.js also pins a hardcoded MAX_BLUECHIP_POSITION_SOL belt — config can only
+    // TIGHTEN below it, never exceed it (the deploy money path takes the min of both).
+    maxBluechipPositionSol: numericConfig(u.maxBluechipPositionSol) ?? 0.45,
     // Vega Item 7 — Dynamic sizing by Orion confidence. Tiers MULTIPLY the
     // base deploy amount, then computeDynamicDeployAmount HARD-CAPS at
     // maxDeployAmount (belt). The executor's amountY > maxDeployAmount reject
@@ -342,6 +350,17 @@ export const config = {
     bluechipMinFeeTvlRatio: u.bluechipMinFeeTvlRatio ?? 0.03,    // ~11% APR on full TVL @ 24h — income bar (LOWER than memecoin 0.13: bluechip IL is far smaller)
     bluechipMinMcap:        u.bluechipMinMcap        ?? 50_000_000, // large-cap confirmation ($50M+); SOL ~$40B, JLP ~$770M
     bluechipMaxVolatility:  u.bluechipMaxVolatility  ?? 1.5,     // vol CEILING (not floor) — wild reading = not actually stable / de-peg
+    // Broad-discovery mcap ceiling raised ONLY when bluechip mode is on: the memecoin
+    // broadMcapCeil (50M) would drop SOL-USDC (SOL ~$40B) at the SERVER before the
+    // client gate ever sees it. This wider ceiling keeps the broad result a SUPERSET
+    // (still client-gated by both memecoin maxMcap AND the bluechip band). Default
+    // 1e12 = $1T, comfortably above any real bluechip cap. Inert while flag OFF.
+    bluechipBroadMcapCeil:  u.bluechipBroadMcapCeil  ?? 1_000_000_000_000,
+    // Opsi-B (single-side SOL) deployability guard: a bluechip pool is deployable only
+    // if it has a wSOL leg. Default true → non-wSOL-leg bluechips (JLP-USDC, USDC-USDT)
+    // are discoverable intel but filtered from the DEPLOYABLE set. Flip OFF once Vega
+    // ships two-sided (Opsi A) deploy. Reject: bluechip_no_wsol_leg_opsi_b_undeployable.
+    requireBluechipWsolLeg: u.requireBluechipWsolLeg ?? true,
   },
 
   // ─── Position Management ────────────────
@@ -472,6 +491,15 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    // ── Bluechip income-engine wide-range ceiling (Vega — Opsi B, money-path) ──
+    // Memecoin keeps the [minBinsBelow, maxBinsBelow] (≈[35,69]) clamp — UNCHANGED.
+    // A BLUECHIP pool (both legs whitelisted, bluechipModeEnabled on) may deploy a
+    // WIDE single-side-SOL range up to bluechipMaxBinsBelow. WIDER is the whole point:
+    // a deep stable pool wants a broad passive range so the active bin stays in-range
+    // for days (income engine), not a tight memecoin scalp band. bins_above stays 0
+    // (Opsi B — single-side SOL; two-sided/amount_x is Opsi A / Phase 2, NOT this).
+    // Reuses the existing isWideRange (>69) createExtendedEmptyPosition SDK path.
+    bluechipMaxBinsBelow: numericConfig(u.bluechipMaxBinsBelow) ?? 250,
     // ── Item (b) — Volume-regime strategy spread (Andromeda plan) ──
     // When enabled AND no explicit strategy is passed, pickRegimeStrategy()
     // chooses spot (HIGH volume → tight fee capture) vs bid_ask (LOW volume →
@@ -816,6 +844,8 @@ export function reloadScreeningThresholds() {
     if (fresh.bluechipMinFeeTvlRatio != null) s.bluechipMinFeeTvlRatio = fresh.bluechipMinFeeTvlRatio;
     if (fresh.bluechipMinMcap        != null) s.bluechipMinMcap        = fresh.bluechipMinMcap;
     if (fresh.bluechipMaxVolatility  != null) s.bluechipMaxVolatility  = fresh.bluechipMaxVolatility;
+    if (fresh.bluechipBroadMcapCeil  != null) s.bluechipBroadMcapCeil  = fresh.bluechipBroadMcapCeil;
+    if (fresh.requireBluechipWsolLeg !== undefined) s.requireBluechipWsolLeg = fresh.requireBluechipWsolLeg;
     if (fresh.minMeaningfulProfitSol != null) config.management.minMeaningfulProfitSol = fresh.minMeaningfulProfitSol;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
