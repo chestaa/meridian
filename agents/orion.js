@@ -16,6 +16,7 @@
 import "dotenv/config";
 import OpenAI from "openai";
 import { config, computeDeployAmount } from "../config.js";
+import { isBluechipPool } from "../tools/screening.js";
 import { pickModel } from "../agent.js";
 import { log } from "../logger.js";
 import { recordLlmUsage } from "../llm-usage.js";
@@ -82,6 +83,44 @@ const SYSTEM_PROMPT = [
   "If you'd enter, suggest recommended_bins_below in [35,69]: low vol -> 35, vol>=5 -> 69, linear.",
 ].join(" ");
 
+// ─── Bluechip-aware judge block (Orion — MIRRORS the code carve-out) ──────────
+// The deterministic gate (Cassiopeia screening.js bluechipPoolGateRejectReason +
+// Vega executor binStep exemption) already PASSES whitelisted both-legs bluechip
+// pairs with SMALL bin_step (0, bluechipMaxBinStep] and fee/TVL >= bluechipMinFeeTvlRatio.
+// The static memecoin-shaped SYSTEM_PROMPT above was making the judge SKIP those
+// pools ("bin_step far below 80-125", "low volatility", "fee/TVL below floor")
+// BEFORE deploy_position was ever reached. When bluechip mode is on we APPEND this
+// block AND each candidate carries a deterministic candidate.is_bluechip flag (from
+// isBluechipPool — the SAME curated whitelist the code carve-out uses) so the judge
+// never has to guess which lane a pool is in. Inert when the flag is OFF (memecoin
+// path byte-for-byte unchanged).
+function buildSystemPrompt() {
+  if (config.screening?.bluechipModeEnabled !== true) return SYSTEM_PROMPT;
+  const s = config.screening;
+  const bcMaxBinStep = s?.bluechipMaxBinStep ?? 200;
+  const bcMinFeeTvl  = s?.bluechipMinFeeTvlRatio ?? 0.03;
+  const bcMaxVola    = s?.bluechipMaxVolatility ?? 1.5;
+  const bcMinTvl     = s?.bluechipMinTvl ?? 200_000;
+  const bcMaxBinsBelow = config.strategy?.bluechipMaxBinsBelow ?? 250;
+  const bluechipBlock = [
+    "",
+    "BLUECHIP INCOME-ENGINE MODE IS ON. Each candidate has candidate.is_bluechip:",
+    "true means BOTH legs are whitelisted deep/stable/rug-immune assets",
+    "(SOL/USDC/USDT/JLP/JitoSOL/mSOL/bSOL/jupSOL/cbBTC). A bluechip is a",
+    "FUNDAMENTALLY DIFFERENT profile — judge it on the income-engine thesis, NOT the",
+    "memecoin narrow/volatile thesis. For an is_bluechip=true candidate:",
+    `- SMALL bin_step (1/4/10/20...) is CORRECT for a deep stable book — accept any positive bin_step up to ${bcMaxBinStep}. NEVER skip a bluechip for a small bin_step or a "bin_step below 80-125".`,
+    "- LOW / near-zero volatility is GOOD (stable = less impermanent loss). NEVER skip a bluechip for low volatility. The volatility>0 requirement does NOT apply to bluechips.",
+    `- The income fee/TVL bar is ${bcMinFeeTvl} (≈11%+ APR on full TVL @ 24h), NOT the memecoin 0.10 floor. A bluechip at fee/TVL >= ${bcMinFeeTvl} is a worthwhile income position — bluechip IL is far smaller so a lower yield is justified. Do NOT skip a bluechip for "low fee/TVL" above ${bcMinFeeTvl}.`,
+    "- Narrative, smart wallets, top10/bundlers, hype, and the minTokenFeesSol floor are memecoin risk signals and are IRRELEVANT to a stable bluechip. Do NOT skip on them.",
+    `- DEEP TVL (>= $${bcMinTvl.toLocaleString("en-US")}) is the EDGE here, not a red flag — depth lets a tight peg range capture steady fees. The profit-share micro/thin tier still applies (our take must be non-trivial), but do NOT skip a deep bluechip merely for being large.`,
+    `ENTER an is_bluechip=true candidate when: fee/TVL >= ${bcMinFeeTvl}, TVL is deep, volume is not dead, and volatility is NOT wildly high. The ONLY volatility concern is vola ABOVE ${bcMaxVola} (a "stable" pair reading that high is de-pegging / thin book) -> then skip. Otherwise lean ENTER.`,
+    `For a bluechip enter, recommended_bins_below may be WIDE — up to ${bcMaxBinsBelow} (wide range = the whole point: fewer rebalances, steady fees across a stable band). The [35,69] memecoin range does NOT bound bluechips.`,
+    "If candidate.is_bluechip is false/absent, apply the standard (memecoin) rules above unchanged.",
+  ].join(" ");
+  return SYSTEM_PROMPT + " " + bluechipBlock;
+}
+
 function compactCandidate(c) {
   const pool = c.pool || {};
   const sw = c.sw || {};
@@ -122,6 +161,11 @@ function compactCandidate(c) {
     smart_wallet_names: Array.isArray(sw?.in_pool) ? sw.in_pool.map(w => w.name).slice(0, 5) : [],
     narrative: (n?.narrative || "").slice(0, 280) || null,
     memory: typeof mem === "string" ? mem.slice(0, 280) : null,
+    // Deterministic bluechip flag — MIRRORS the code carve-out (same curated
+    // BLUECHIP_INCOME_MINTS whitelist via isBluechipPool). False when bluechip mode
+    // is off, so the judge only ever sees true on a both-legs-whitelisted pair while
+    // the master flag is on. Lets the judge classify the lane without guessing.
+    is_bluechip: isBluechipPool(pool, config.screening),
   };
 }
 
@@ -207,7 +251,7 @@ async function judgeOne(candidate, context) {
   };
 
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: buildSystemPrompt() },
     { role: "user", content: JSON.stringify(userPayload) },
   ];
 
