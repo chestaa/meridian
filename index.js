@@ -39,6 +39,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { consumeKnownOutflowSol } from "./deploy-outflow-ledger.js";
 import { recordPaperDeploy, refreshPaperTrades } from "./paper-trades.js";
 import { getCircuitStatus, manualReset as circuitReset } from "./account-circuit-breaker.js";
 import { judgeCandidates, formatOrionVerdicts } from "./agents/orion.js";
@@ -163,11 +164,21 @@ export function __getLastBalanceSampleForTest() { return _lastBalanceSample; }
  *  - solNow must be > 0 to ever compute a drop  → a 0/sentinel read can NEVER
  *    produce a 100% drop (defends the phantom-drain class of bug at the math layer
  *    too, belt-and-suspenders with the wallet.js sol:null fix).
+ *
+ * DEPLOY-AWARE (Vega honesty-audit 2026-06-21 FIX #2): opts.knownOutflowSol is the
+ * SOL that a recently-successful deploy moved out of the wallet into the LP (a
+ * KNOWN, EXPECTED outflow, NOT a drain). We credit it back into the observed
+ * balance before computing the drop, so a fall fully explained by a deploy is not
+ * flagged. Only the portion of the drop NOT explained by the known outflow is
+ * measured — a real drain occurring alongside a deploy is STILL caught. The credit
+ * never raises the effective balance above the previous baseline (clamped), so it
+ * cannot manufacture a fake gain.
  */
 export function decideBalanceDrainAction(prev, balSnap, now, opts = {}) {
   const windowMs = opts.windowMs ?? BALANCE_DRAIN_WINDOW_MS;
   const thresholdPct = opts.thresholdPct ?? BALANCE_DRAIN_THRESHOLD_PCT;
   const confirmPct = opts.confirmPct ?? BALANCE_DRAIN_CONFIRM_PCT;
+  const knownOutflowSol = Number(opts.knownOutflowSol) > 0 ? Number(opts.knownOutflowSol) : 0;
 
   // 1) Reject unreadable samples outright — never store, never compute.
   if (!balSnap || balSnap.error === true) return { action: "skip", reason: "read_error" };
@@ -179,11 +190,20 @@ export function decideBalanceDrainAction(prev, balSnap, now, opts = {}) {
     return { action: "store" };
   }
 
+  // 2b) Deploy-aware: credit the known deploy outflow back into the observed
+  //     balance so the EXPECTED drop is not counted as a drain. Clamp to the prior
+  //     baseline so a credit can never fabricate a gain. The drop is then measured
+  //     against this adjusted figure — any drop BEYOND the known deploy still counts.
+  const adjustedSolNow = Math.min(prev.sol, solNow + knownOutflowSol);
+
   // 3) Guard solNow > 0 so a 0-read can never compute a 100% drop. A 0 read that
   //    survived the error checks is a genuine empty wallet — that is a real (but
   //    not necessarily drain-shaped) state; treat as confirm-worthy below via pct.
-  const dropPct = ((prev.sol - solNow) / prev.sol) * 100;
+  const dropPct = ((prev.sol - adjustedSolNow) / prev.sol) * 100;
   if (dropPct <= thresholdPct) {
+    // Store the TRUE observed balance (not the adjusted one) as the new baseline —
+    // the modal really did leave the wallet, so the next cycle compares against the
+    // real post-deploy balance.
     return { action: "store", dropPct };
   }
   if (dropPct >= confirmPct) {
@@ -208,7 +228,17 @@ export async function runBalanceDrainMonitor(balSnap, deps = {}) {
       log("balance_drain_error", `notifyBalanceDrain failed: ${e.message}`)));
   const store = deps.store ?? ((sample) => { _lastBalanceSample = sample; });
 
-  const decision = decideBalanceDrainAction(_lastBalanceSample, balSnap, now, deps.opts);
+  // Deploy-aware (FIX #2): consume any recently-recorded deploy outflow so an
+  // EXPECTED wallet drop (modal → LP) is credited and not flagged as a drain. The
+  // ledger expires entries on its own window, so a stale deploy can't suppress a
+  // later real drain. Injectable for tests.
+  const windowMs = deps.opts?.windowMs ?? BALANCE_DRAIN_WINDOW_MS;
+  const knownOutflowSol = deps.knownOutflowSol != null
+    ? Number(deps.knownOutflowSol)
+    : consumeKnownOutflowSol(now, windowMs);
+  const mergedOpts = { ...(deps.opts || {}), knownOutflowSol };
+
+  const decision = decideBalanceDrainAction(_lastBalanceSample, balSnap, now, mergedOpts);
 
   if (decision.action === "skip") {
     log("balance_drain_warn", `Balance sample skipped (${decision.reason}) — not stored, no compute`);

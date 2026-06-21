@@ -44,6 +44,49 @@ function pnlPct(entryPrice, currentPrice) {
   return Number((((currentPrice - entryPrice) / entryPrice) * 100).toFixed(2));
 }
 
+// Vega honesty-audit 2026-06-21 FIX #3 — sane price-proxy PnL for paper trades.
+//
+// ROOT CAUSE of the 6827% / 7585% garbage: the snapshot price source was NOT
+// guaranteed to be the SAME unit as entry_price. entry_price is recorded from the
+// pool-quoted price (`pool.price` at deploy). The snapshot fell back from
+// `detail.pool_price` to `token.price` (a USD price from Jupiter) when the pool
+// detail was missing — a DIFFERENT unit, off by the SOL/USD factor (~150x) → a
+// fabricated multi-thousand-percent move on a position that barely moved.
+//
+// FIX: (1) only ever compare same-unit pool-quoted prices (caller drops the
+// cross-unit token.price fallback for the PnL math); (2) a sanity band — a single
+// LP holding cannot realistically swing past PROXY_SANE_RATIO_MAX/MIN within a
+// paper-soak window; a ratio outside the band is a unit-mismatch / stale-snapshot
+// artifact, NOT a real PnL. We return null (uncomputable) and a reason rather than
+// recording absurd numbers. FAIL-SAFE: missing/non-finite price → null, never a
+// fabricated figure.
+//
+// NOTE: a clamp would still poison the validation average with a fake boundary
+// value, so for the absurd-ratio case we mark UNCOMPUTABLE (null) — the snapshot
+// simply carries no PnL that cycle, exactly like a missing-price cycle. A genuine
+// large memecoin move drives the position far OOR (earning nothing) and is handled
+// by the OOR exit, so suppressing its unreliable price-proxy PnL loses no signal.
+export const PROXY_SANE_RATIO_MAX = 10;   // > +900% in one holding window ⇒ suspect
+export const PROXY_SANE_RATIO_MIN = 0.1;  // < -90% in one holding window ⇒ suspect
+
+export function computePriceProxyPnl(entryPrice, currentPrice) {
+  const e = Number(entryPrice);
+  const c = Number(currentPrice);
+  if (!Number.isFinite(e) || e <= 0 || !Number.isFinite(c) || c <= 0) {
+    return { pnl_pct: null, uncomputable: true, reason: "missing_or_nonpositive_price" };
+  }
+  const ratio = c / e;
+  if (ratio > PROXY_SANE_RATIO_MAX || ratio < PROXY_SANE_RATIO_MIN) {
+    // Almost certainly a unit mismatch / stale snapshot — do NOT fabricate PnL.
+    return {
+      pnl_pct: null,
+      uncomputable: true,
+      reason: `implausible_price_ratio ${ratio.toFixed(2)} (entry=${e}, current=${c}) — likely unit mismatch/stale`,
+    };
+  }
+  return { pnl_pct: Number(((ratio - 1) * 100).toFixed(2)), uncomputable: false, reason: null };
+}
+
 // Cassiopeia P1 #9 — flag whether all key risk fields were populated at entry.
 function computeRiskDataComplete(entry) {
   return (
@@ -193,13 +236,23 @@ async function buildSnapshot(trade) {
   ]);
 
   const token = tokenInfo?.results?.[0] || null;
-  const currentPrice = num(detail?.pool_price) ?? num(token?.price);
-  const priceProxy = pnlPct(trade.entry_price, currentPrice);
+  // FIX #3 — entry_price is the POOL-QUOTED price (pool.price at deploy). The
+  // snapshot MUST compare a same-unit pool-quoted price. We read detail.pool_price
+  // ONLY — the old `?? token.price` fallback pulled a USD price (different unit,
+  // ~150x off) and produced the 6827%/7585% garbage. If pool_price is unavailable
+  // the proxy is uncomputable this cycle (null), NOT fabricated from a wrong unit.
+  const currentPrice = num(detail?.pool_price);
+  const proxy = computePriceProxyPnl(trade.entry_price, currentPrice);
+  const priceProxy = proxy.pnl_pct; // null when missing-price OR implausible ratio
+  if (proxy.uncomputable && currentPrice != null) {
+    log("paper_warn", `Price-proxy uncomputable for ${trade.pool_name}: ${proxy.reason}`);
+  }
   const feeInclusive = computeFeeInclusivePnl(trade, priceProxy);
   const snapshot = {
     ts: nowIso(),
     price: currentPrice,
     price_proxy_pnl_pct: priceProxy,
+    price_proxy_uncomputable: proxy.uncomputable || undefined,
     fee_inclusive_pnl_pct: feeInclusive.fee_inclusive_pnl_pct,
     fees_earned_pct: feeInclusive.fees_earned_pct,
     estimated_il_pct: feeInclusive.estimated_il_pct,

@@ -2256,6 +2256,16 @@ export async function closePosition({ position_address, reason }) {
         sol_deployed: tracked.amount_sol ?? null,
         sol_received: Number.isFinite(withdrawnSol) ? withdrawnSol : null,
         fees_claimed_sol: Number.isFinite(feesSol) ? feesSol : null,
+        // Vega honesty-audit 2026-06-21 — SINGLE SOURCE OF TRUTH. Return the EXACT
+        // realized-SOL figure that was written into the ledger (lessons.json) so the
+        // Telegram notif reports the IDENTICAL number. The executor may REFINE this
+        // with a measured wallet-delta (same economic quantity, now modal-corrected),
+        // but if the wallet snapshot is unavailable the notif falls back to THIS
+        // ledger figure rather than recomputing a divergent one.
+        ledger_realized_sol_delta: closeRsd?.realized_sol_delta ?? null,
+        ledger_realized_sol_delta_pct: closeRsd?.realized_sol_delta_pct ?? null,
+        ledger_realized_sol_method: closeRsd?.method ?? null,
+        ledger_realized_sol_estimate: closeRsd?.estimate ?? null,
       };
     }
 

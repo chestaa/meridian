@@ -23,6 +23,7 @@ import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsO
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
+import { recordDeployOutflow } from "../deploy-outflow-ledger.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -948,6 +949,16 @@ export async function executeTool(name, args) {
         // { dry_run: true, would_deploy: { pool_address, amount_y, bins_below, ... } }
         const isDry = result?.dry_run === true || process.env.DRY_RUN === "true";
         const wd = result?.would_deploy || {};
+        // Vega honesty-audit 2026-06-21 FIX #2 — record the modal as a KNOWN,
+        // EXPECTED outflow so the burner drain monitor does NOT false-flag the
+        // wallet drop caused by SOL moving into the LP. LIVE only — a paper deploy
+        // moves no real SOL, so there is no real wallet drop to explain.
+        if (!isDry) {
+          const modalSol = Number(args.amount_y ?? args.amount_sol ?? wd.amount_y ?? wd.amount_sol ?? 0);
+          if (Number.isFinite(modalSol) && modalSol > 0) {
+            try { recordDeployOutflow(modalSol); } catch (_e) { /* never block deploy notify */ }
+          }
+        }
         notifyDeploy({
           pair: result.pool_name || args.pool_name || wd.pool_address?.slice(0, 8) || args.pool_address?.slice(0, 8),
           amountSol: args.amount_y ?? args.amount_sol ?? wd.amount_y ?? wd.amount_sol ?? 0,
@@ -984,10 +995,21 @@ export async function executeTool(name, args) {
           }
         }
 
-        // Vega fix #1 — TRUE realized SOL delta. Now that close + auto-swap have
-        // settled, measure the wallet-level economic outcome. Preferred path:
-        // wallet_after - wallet_before (ground truth — includes IL + slippage +
-        // gas). Fallback: formula from the close result SOL figures + gas est.
+        // Vega fix #1 + honesty-audit 2026-06-21 — TRUE realized SOL delta, SINGLE
+        // SOURCE OF TRUTH with the ledger. Now that close + auto-swap have settled,
+        // measure the wallet-level economic outcome.
+        //
+        // Preferred: wallet-delta = (wallet_after - wallet_before) - sol_deployed.
+        // The (after - before) gain is the MODAL RETURNED + fees - gas; subtracting
+        // the deployed modal yields the true economic delta. WITHOUT this subtraction
+        // a break-even trade reads ≈ +100% because the returned modal looks like
+        // profit (the glippy "+103%" / SOLANGELES "+63%" trust-eroder). This is the
+        // SAME economic quantity the ledger (lessons.json) records via the formula
+        // path, so notif == ledger.
+        //
+        // Fallback: when the wallet snapshot or sol_deployed is unavailable, use the
+        // EXACT figure dlmm.js already wrote to the ledger (result.ledger_realized_*)
+        // — never recompute a divergent number for the notif.
         // Additive only — lp_pnl_pct (result.pnl_pct) is left untouched.
         if (!isDry && config.internalAgents?.realizedSolAccounting !== false) {
           try {
@@ -1001,10 +1023,25 @@ export async function executeTool(name, args) {
               solReceivedOnClose: result.sol_received ?? null,
               feesClaimedSol: result.fees_claimed_sol ?? result.fees_sol ?? null,
             });
-            result.realized_sol_delta = rsd.realized_sol_delta;
-            result.realized_sol_delta_pct = rsd.realized_sol_delta_pct;
-            result.realized_sol_method = rsd.method;
-            result.realized_sol_estimate = rsd.estimate;
+            // Use the wallet/formula computation only if it actually produced a
+            // figure; otherwise fall back to the ledger figure so notif == ledger
+            // and we NEVER surface a modal-inflated number.
+            if (rsd.realized_sol_delta != null) {
+              result.realized_sol_delta = rsd.realized_sol_delta;
+              result.realized_sol_delta_pct = rsd.realized_sol_delta_pct;
+              result.realized_sol_method = rsd.method;
+              result.realized_sol_estimate = rsd.estimate;
+            } else if (result.ledger_realized_sol_delta != null) {
+              result.realized_sol_delta = result.ledger_realized_sol_delta;
+              result.realized_sol_delta_pct = result.ledger_realized_sol_delta_pct;
+              result.realized_sol_method = result.ledger_realized_sol_method;
+              result.realized_sol_estimate = result.ledger_realized_sol_estimate;
+            } else {
+              result.realized_sol_delta = null;
+              result.realized_sol_delta_pct = null;
+              result.realized_sol_method = "unavailable";
+              result.realized_sol_estimate = true;
+            }
             result.lp_pnl_pct = result.pnl_pct ?? null; // explicit label: price-only LP-PnL
           } catch (e) {
             log("executor_warn", `realized SOL delta computation failed: ${e.message}`);

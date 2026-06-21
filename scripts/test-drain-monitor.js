@@ -179,6 +179,65 @@ function makeDeps() {
   ok("(f4) 40% drop → baseline stored", h.getStored() && h.getStored().sol === 0.6);
 }
 
+// ─── (h) DEPLOY-AWARE drain suppression (honesty-audit FIX #2) ─────────────
+// A successful deploy moves the modal OUT of the wallet into the LP. The next
+// drain sample sees a big drop that is EXPECTED, not a drain. With a recorded
+// known outflow the monitor must credit it and NOT alert; a real drain BEYOND the
+// known deploy must still alert. The real protection is never disabled.
+const ledger = await import("../deploy-outflow-ledger.js");
+{
+  const now = 1_000_000;
+  // deploy moved 0.45 SOL out: wallet 0.78 → 0.33 (~58% drop). EXPECTED, not drain.
+  let d = idx.decideBalanceDrainAction(
+    { sol: 0.78, at: now - 1000 }, { sol: 0.33 }, now, { knownOutflowSol: 0.45 });
+  ok("(h1) deploy outflow fully explains drop → store (NO alert)", d.action === "store");
+
+  // SAME drop with NO known outflow → real drain → alerts (protection intact).
+  d = idx.decideBalanceDrainAction({ sol: 0.78, at: now - 1000 }, { sol: 0.33 }, now);
+  ok("(h2) same drop with NO outflow → alert FIRES (real drain protection intact)",
+    d.action === "alert");
+
+  // Deploy 0.45 BUT wallet also lost an extra 0.30 to a real drain: 0.78 → 0.03.
+  // Credit 0.45 → adjusted 0.48 vs 0.78 = ~38% residual drop → still alerts.
+  d = idx.decideBalanceDrainAction(
+    { sol: 0.78, at: now - 1000 }, { sol: 0.03 }, now, { knownOutflowSol: 0.45 });
+  ok("(h3) drop BEYOND known deploy → still alerts (deploy can't mask real drain)",
+    d.action === "alert" || d.action === "confirm");
+
+  // Credit clamps to baseline — an over-large outflow can't fabricate a gain.
+  d = idx.decideBalanceDrainAction(
+    { sol: 0.78, at: now - 1000 }, { sol: 0.33 }, now, { knownOutflowSol: 5.0 });
+  ok("(h4) oversized outflow credit clamps to baseline (no fabricated gain)",
+    d.action === "store" && d.dropPct <= 0 + 1e-9);
+}
+
+// ─── (i) outflow LEDGER: record → consume once → expire ────────────────────
+{
+  ledger.__resetOutflowLedgerForTest();
+  const t0 = 5_000_000;
+  ledger.recordDeployOutflow(0.45, t0);
+  ok("(i1) peek sees recorded outflow", Math.abs(ledger.peekKnownOutflowSol(t0) - 0.45) < 1e-9);
+  const c1 = ledger.consumeKnownOutflowSol(t0);
+  ok("(i2) consume returns the recorded outflow", Math.abs(c1 - 0.45) < 1e-9);
+  const c2 = ledger.consumeKnownOutflowSol(t0);
+  ok("(i3) second consume returns 0 (each outflow credited once)", c2 === 0);
+
+  // expiry: a stale deploy outflow must NOT suppress a later drain
+  ledger.__resetOutflowLedgerForTest();
+  ledger.recordDeployOutflow(0.45, t0);
+  const later = t0 + 2 * 60 * 60 * 1000; // 2h later, past 1h window
+  ok("(i4) expired outflow → 0 credit (stale deploy cannot mask later drain)",
+    ledger.consumeKnownOutflowSol(later) === 0);
+
+  // garbage inputs are never recorded
+  ledger.__resetOutflowLedgerForTest();
+  ledger.recordDeployOutflow(0, t0);
+  ledger.recordDeployOutflow(-1, t0);
+  ledger.recordDeployOutflow("x", t0);
+  ok("(i5) garbage outflow inputs ignored (0/neg/NaN)", ledger.peekKnownOutflowSol(t0) === 0);
+  ledger.__resetOutflowLedgerForTest();
+}
+
 // reset module baseline so we don't leak state
 idx.__setLastBalanceSampleForTest(null);
 

@@ -21,11 +21,27 @@
  *   - gas_spent_est          : tx gas (estimate or measured)
  *
  * LIVE method (preferred): wallet-delta. We snapshot wallet SOL right before the
- * close and again after the post-close auto-swap. wallet_sol_after - wallet_sol_before
- * is the GROUND TRUTH economic outcome — it inherently includes IL, swap slippage,
- * AND gas, with no estimation. When that snapshot pair is available we use it and
- * mark estimate=false. Otherwise we fall back to the formula using the Meteora
- * closed-PnL API SOL figures + a gas estimate, marked estimate=true.
+ * close and again after the post-close auto-swap.
+ *
+ *   ⚠️ BUG FIXED (Vega 2026-06-21 honesty audit): the pre-close wallet does NOT
+ *   contain the deployed modal — it is locked in the LP position. The close RETURNS
+ *   that modal to the wallet. So `wallet_after - wallet_before` ≈
+ *   (modal_returned + fees - gas), which COUNTS THE RETURNED MODAL AS PROFIT. A
+ *   break-even trade then reads ≈ +100% (glippy "+103%" while actually -7%). The
+ *   true economic delta is the change RELATIVE TO THE MODAL THAT WENT IN:
+ *
+ *       realized_sol_delta = (wallet_after - wallet_before) - sol_deployed
+ *                          = (modal_returned + fees - gas) - modal_deployed
+ *
+ *   This is now IDENTICAL in meaning to the formula path (received + fees -
+ *   deployed - gas) — both measure SOL-out-net vs SOL-in. The wallet path stays
+ *   preferred because the measured `wallet_after - wallet_before` already bakes in
+ *   IL + slippage + gas with no estimation; we mark estimate=false. Requires
+ *   sol_deployed to be known — if it is missing we CANNOT honestly net the modal,
+ *   so we fall through to the formula path rather than report a modal-inflated %.
+ *
+ * Otherwise we fall back to the formula using the Meteora closed-PnL API SOL
+ * figures + a gas estimate, marked estimate=true.
  *
  * PAPER method: paper trades have no wallet. We simulate the exit by applying an
  * exit-slippage haircut + a gas estimate to the price-proxy outcome, so paper
@@ -55,10 +71,13 @@ function finiteOrNull(value) {
  * Compute realized SOL delta for a LIVE close.
  *
  * Two paths, in priority order:
- *  1. wallet-delta (estimate=false): when both walletSolBefore and walletSolAfter
- *     are finite. delta = after - before. This is ground truth — IL + slippage +
- *     gas are already baked in, so we do NOT subtract gas again.
- *  2. formula (estimate=true): when wallet snapshots are missing. Uses the SOL
+ *  1. wallet-delta (estimate=false): when walletSolBefore, walletSolAfter AND
+ *     solDeployed are all finite. delta = (after - before) - deployed. The wallet
+ *     gain (after - before) is the modal returned + fees - gas; subtracting the
+ *     deployed modal yields the TRUE economic delta. IL + slippage + gas are
+ *     already baked into the measured wallet movement, so we do NOT subtract gas
+ *     again. Requires deployed (else we cannot net the modal — fall through).
+ *  2. formula (estimate=true): when the wallet path is unavailable. Uses the SOL
  *     figures from the Meteora closed-PnL API + a gas estimate.
  *
  * @param {object} args
@@ -84,11 +103,15 @@ export function computeLiveRealizedSolDelta({
   const after = finiteOrNull(walletSolAfter);
 
   // ── Path 1: measured wallet delta (ground truth) ──────────────
-  if (before != null && after != null) {
-    const delta = round8(after - before);
+  // (after - before) = modal returned + fees - gas. We MUST subtract the deployed
+  // modal to get the true economic delta — otherwise the returned modal is counted
+  // as profit (the +100%-on-breakeven bug). Requires a known deployed; without it
+  // we cannot net the modal honestly, so fall through to the formula path.
+  if (before != null && after != null && deployed != null && deployed > 0) {
+    const delta = round8((after - before) - deployed);
     return {
       realized_sol_delta: delta,
-      realized_sol_delta_pct: deployed != null && deployed > 0 ? round2((delta / deployed) * 100) : null,
+      realized_sol_delta_pct: round2((delta / deployed) * 100),
       method: "wallet_delta",
       estimate: false,
       sol_deployed: deployed,

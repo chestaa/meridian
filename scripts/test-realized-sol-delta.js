@@ -41,34 +41,63 @@ function check(label, fn) {
 
 console.log("Vega fix #1 — realized SOL delta accounting\n");
 
-// ── 1. LIVE wallet-delta path (ground truth) ───────────────────────
-// Deployed 1.0 SOL, LP-PnL reported +5%. But the wallet only moved +0.01 SOL
-// (IL + slippage + gas ate almost all the price gain). Realized must reflect the
-// SMALL real delta, NOT the +5% headline.
-check("LIVE wallet-delta: realized reflects true wallet move, not LP +5%", () => {
+// ── 1. LIVE wallet-delta path (ground truth) — MODAL EXCLUDED ──────
+// HONESTY-AUDIT 2026-06-21: the pre-close wallet does NOT contain the deployed
+// modal — it is locked in the LP. The close RETURNS the modal to the wallet.
+// So (after - before) = modal_returned + fees - gas; the realized delta is that
+// MINUS the deployed modal. Deployed 1.0; before=0.5 (modal in LP); after=1.515
+// (modal + small gain came back) → realized = (1.515-0.5) - 1.0 = +0.015 SOL.
+check("LIVE wallet-delta: nets the returned modal (no +100% on modal return)", () => {
   const r = computeLiveRealizedSolDelta({
-    walletSolBefore: 2.0,
-    walletSolAfter: 2.01, // only +0.01 SOL really came back
+    walletSolBefore: 0.5,
+    walletSolAfter: 1.515,
     solDeployed: 1.0,
   });
   assert.equal(r.method, "wallet_delta");
   assert.equal(r.estimate, false, "measured wallet delta is NOT an estimate");
-  assert.ok(Math.abs(r.realized_sol_delta - 0.01) < 1e-9, `expected +0.01, got ${r.realized_sol_delta}`);
-  assert.ok(Math.abs(r.realized_sol_delta_pct - 1.0) < 1e-9, `expected +1.0%, got ${r.realized_sol_delta_pct}`);
-  // The honest economic % (1.0%) is far below the headline LP-PnL (+5%).
-  assert.ok(r.realized_sol_delta_pct < 5, "realized% must be below the LP +5% headline");
+  assert.ok(Math.abs(r.realized_sol_delta - 0.015) < 1e-9, `expected +0.015, got ${r.realized_sol_delta}`);
+  assert.ok(Math.abs(r.realized_sol_delta_pct - 1.5) < 1e-9, `expected +1.5%, got ${r.realized_sol_delta_pct}`);
 });
 
-// ── 2. LIVE wallet-delta NEGATIVE despite positive LP-PnL ──────────
-check("LIVE wallet-delta: can be NEGATIVE while LP-PnL is positive", () => {
+// ── 1b. THE BUG: a break-even trade must read ~0%, NOT +100% ───────
+// Modal fully returned, nothing gained/lost. before=0.0 (whole wallet was in LP),
+// after=1.0 (modal back). OLD buggy math: after-before = 1.0 → /deployed = +100%.
+// FIXED math: (1.0 - 0.0) - 1.0 = 0.0 → 0%. This is the glippy/SOLANGELES class.
+check("LIVE wallet-delta: BREAK-EVEN reads ~0% (not the +100% modal-return bug)", () => {
   const r = computeLiveRealizedSolDelta({
-    walletSolBefore: 2.0,
-    walletSolAfter: 1.98, // wallet actually shrank
+    walletSolBefore: 0.0,
+    walletSolAfter: 1.0,
+    solDeployed: 1.0,
+  });
+  assert.ok(Math.abs(r.realized_sol_delta) < 1e-9, `break-even delta must be ~0, got ${r.realized_sol_delta}`);
+  assert.ok(Math.abs(r.realized_sol_delta_pct) < 1e-9, `break-even % must be ~0, got ${r.realized_sol_delta_pct}`);
+  assert.ok(r.realized_sol_delta_pct < 50, "must NOT report a +100% modal-return profit");
+});
+
+// ── 2. LIVE wallet-delta NEGATIVE: a losing trade (glippy -7%) ─────
+// Deployed 1.0; modal came back DOWN ~7% (IL/slippage). before=0.5; after=1.43
+// → realized = (1.43-0.5) - 1.0 = -0.07 SOL = -7%. Must be NEGATIVE, never +100%.
+check("LIVE wallet-delta: losing trade reports NEGATIVE (glippy-style -7%)", () => {
+  const r = computeLiveRealizedSolDelta({
+    walletSolBefore: 0.5,
+    walletSolAfter: 1.43,
     solDeployed: 1.0,
   });
   assert.equal(r.method, "wallet_delta");
   assert.ok(r.realized_sol_delta < 0, "realized delta must be negative");
-  assert.ok(r.realized_sol_delta_pct < 0, "realized% must be negative even if LP-PnL was +");
+  assert.ok(Math.abs(r.realized_sol_delta_pct - (-7)) < 1e-6, `expected ~-7%, got ${r.realized_sol_delta_pct}`);
+});
+
+// ── 2b. Fall-through: wallet snapshots present but deployed UNKNOWN ─
+// Without a known modal we cannot honestly net it, so the wallet path must NOT
+// fire (it would report a modal-inflated %). Falls through to formula/unavailable.
+check("LIVE wallet-delta: missing deployed → does NOT use wallet path (no modal inflation)", () => {
+  const r = computeLiveRealizedSolDelta({
+    walletSolBefore: 0.0,
+    walletSolAfter: 1.0,
+    // solDeployed omitted
+  });
+  assert.notEqual(r.method, "wallet_delta", "must not report a modal-inflated wallet delta");
 });
 
 // ── 3. LIVE formula path (no wallet snapshots) ─────────────────────
@@ -165,6 +194,39 @@ check("PAPER: higher exit slippage strictly lowers realized delta", () => {
   const lo = computePaperRealizedSolDelta({ amountSol: 1, lpPnlPct: 5, exitSlippagePct: 1 });
   const hi = computePaperRealizedSolDelta({ amountSol: 1, lpPnlPct: 5, exitSlippagePct: 3 });
   assert.ok(hi.realized_sol_delta < lo.realized_sol_delta, "more slippage → less realized");
+});
+
+// ── 9. HONESTY-AUDIT: notif == ledger, on the real reported trades ─────────
+// The notif (executor) and the ledger (lessons.json via dlmm formula) BOTH derive
+// from computeLiveRealizedSolDelta. Prove the formula path (the ledger's source)
+// reproduces the CONFIRMED honest figures, and that the wallet path (notif's
+// preferred source) yields the SAME economic quantity — so notif == ledger and a
+// losing trade can never headline as profit.
+check("HONESTY: SOLANGELES → +13.31% (not the +63% modal-inflated headline)", () => {
+  // deployed 1.0; net economic gain 0.1331 SOL after fees - gas - IL.
+  // formula (ledger): received 1.1351 + fees 0 - (1.0 + ~0.002 gas) ≈ +0.1331.
+  const received = 1.0 + 0.1331 + DEFAULT_CLOSE_GAS_SOL; // back-solve so net == +0.1331
+  const r = computeLiveRealizedSolDelta({ solDeployed: 1.0, solReceivedOnClose: received, feesClaimedSol: 0 });
+  assert.ok(Math.abs(r.realized_sol_delta_pct - 13.31) < 0.01, `expected +13.31%, got ${r.realized_sol_delta_pct}`);
+  assert.ok(r.realized_sol_delta_pct < 63, "must NOT report the +63% modal-inflated headline");
+  // Wallet path on the SAME trade (before 0.0, after = modal+gain) → same quantity.
+  const w = computeLiveRealizedSolDelta({ walletSolBefore: 0.0, walletSolAfter: 1.1331, solDeployed: 1.0 });
+  assert.ok(Math.abs(w.realized_sol_delta_pct - 13.31) < 0.01, "wallet path agrees with ledger");
+});
+check("HONESTY: COZY → -0.40% NEGATIVE (not +112%)", () => {
+  const received = 1.0 - 0.0040 + DEFAULT_CLOSE_GAS_SOL; // net == -0.0040 after gas
+  const r = computeLiveRealizedSolDelta({ solDeployed: 1.0, solReceivedOnClose: received, feesClaimedSol: 0 });
+  assert.ok(r.realized_sol_delta_pct < 0, "COZY must read NEGATIVE");
+  assert.ok(Math.abs(r.realized_sol_delta_pct - (-0.40)) < 0.01, `expected -0.40%, got ${r.realized_sol_delta_pct}`);
+});
+check("HONESTY: glippy → -7.14% NEGATIVE (not the +103% trust-eroder)", () => {
+  const received = 1.0 - 0.0714 + DEFAULT_CLOSE_GAS_SOL; // net == -0.0714 after gas
+  const r = computeLiveRealizedSolDelta({ solDeployed: 1.0, solReceivedOnClose: received, feesClaimedSol: 0 });
+  assert.ok(r.realized_sol_delta_pct < 0, "glippy must read NEGATIVE (it was a loss)");
+  assert.ok(Math.abs(r.realized_sol_delta_pct - (-7.14)) < 0.01, `expected -7.14%, got ${r.realized_sol_delta_pct}`);
+  // Wallet path: before 0.0, modal came back DOWN 7.14% → same negative quantity.
+  const w = computeLiveRealizedSolDelta({ walletSolBefore: 0.0, walletSolAfter: 0.9286, solDeployed: 1.0 });
+  assert.ok(Math.abs(w.realized_sol_delta_pct - (-7.14)) < 0.01, "wallet path agrees: negative");
 });
 
 console.log(`\nALL ${assertions} ASSERTIONS PASS — realized SOL delta accounting verified`);
