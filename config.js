@@ -993,7 +993,6 @@ export function reloadScreeningThresholds() {
     if (fresh.requireBluechipWsolLeg !== undefined) s.requireBluechipWsolLeg = fresh.requireBluechipWsolLeg;
     if (fresh.bluechipOnlyMode       !== undefined) s.bluechipOnlyMode       = fresh.bluechipOnlyMode;
     if (fresh.bluechipMaxBinStep     != null) s.bluechipMaxBinStep     = fresh.bluechipMaxBinStep;
-    if (fresh.bluechipMaxBinStep     != null) s.bluechipMaxBinStep     = fresh.bluechipMaxBinStep;
     if (fresh.minMeaningfulProfitSol != null) config.management.minMeaningfulProfitSol = fresh.minMeaningfulProfitSol;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;

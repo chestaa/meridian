@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair, poolLegMints } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -91,6 +91,58 @@ function poolDetailTvl(pool) {
 
 function poolDetailBinStep(pool) {
   return numberOrNull(pool?.dlmm_params?.bin_step ?? pool?.pool_config?.bin_step);
+}
+
+// ── Bluechip deploy-side binStep exemption (Vega — Opsi B, money-path) ──────────
+// ROOT BLOCKER (Lyra): bluechip never deployed — SOL-USDC bin_step=1 is far below the
+// memecoin minBinStep (80), so the executor binStep gate refused EVERY bluechip deploy.
+// A deep stable pool legitimately uses a tiny bin step (fine price grid). This helper
+// decides whether the memecoin [minBinStep,maxBinStep] floor/ceiling should be EXEMPTED.
+//
+// Exemption fires ONLY when ALL hold:
+//   1. config.screening.bluechipModeEnabled === true   (master flag, default OFF)
+//   2. isBluechipMintPair(base, quote) === true        (WHITELIST — NON-NEGOTIABLE)
+// Mints resolved from args metadata (base_mint + quote_mint/quote_address) and, when a
+// leg is missing there, from the LIVE on-chain pool `detail` via poolLegMints — the deploy
+// tool schema only carries base_mint, so quote is normally resolved from detail. This is
+// the SAME curated whitelist the executor bluechip cap uses; dlmm.deployPosition then
+// re-classifies from the on-chain mints as the AUTHORITATIVE belt. FAIL-CLOSED: missing/
+// empty leg or flag OFF → NOT exempt → memecoin [80,…] floor applies (anti-pattern #2).
+//
+// IMPORTANT: exemption is NOT "no binStep check." When exempt, the caller still enforces
+// a sane absolute bound: bin_step must be a positive finite integer in (0, bluechipMaxBinStep].
+// A garbage bin_step (0 / negative / non-finite / absurd) is REFUSED regardless.
+function isBluechipBinStepExempt(args, detail = null) {
+  if (config.screening?.bluechipModeEnabled !== true) return false;
+  const legs = detail ? poolLegMints(detail) : { base: null, quote: null };
+  const baseMint = args?.base_mint ?? args?.base_address ?? legs.base ?? null;
+  const quoteMint = args?.quote_mint ?? args?.quote_address ?? legs.quote ?? null;
+  if (!baseMint || !quoteMint) return false; // fail-closed: cannot classify → not exempt
+  return isBluechipMintPair(baseMint, quoteMint);
+}
+
+// Sane absolute bound that still applies to an EXEMPT bluechip bin_step. Returns a reject
+// reason string when the bin_step is unusable, else null (acceptable). Keeps the gate
+// fail-closed even inside the exemption lane: a tiny bin_step (1,2,4,10…) passes, but
+// 0/negative/non-integer/non-finite/over-ceiling is refused.
+function bluechipBinStepSanityReject(binStep) {
+  const ceil = numberOrNull(config.screening?.bluechipMaxBinStep) ?? 200;
+  if (binStep == null) return null; // unknown bin_step is handled by the caller's null-guard
+  if (!Number.isFinite(binStep) || !Number.isInteger(binStep) || binStep <= 0) {
+    return `bluechip bin_step ${binStep} is not a positive integer. Refusing deploy.`;
+  }
+  if (binStep > ceil) {
+    return `bluechip bin_step ${binStep} exceeds bluechip ceiling ${ceil}. Refusing deploy.`;
+  }
+  return null;
+}
+
+// Test seams — exercise the pure binStep-exemption decision + sanity bound in isolation.
+export function __isBluechipBinStepExemptForTests(args, detail = null) {
+  return isBluechipBinStepExempt(args, detail);
+}
+export function __bluechipBinStepSanityRejectForTests(binStep) {
+  return bluechipBinStepSanityReject(binStep);
 }
 
 function poolDetailFeeActiveTvlRatio(pool) {
@@ -462,17 +514,28 @@ async function validateDeployPoolThresholds(args) {
   const actualBinStep = poolDetailBinStep(detail);
   const minStep = numberOrNull(config.screening.minBinStep);
   const maxStep = numberOrNull(config.screening.maxBinStep);
-  if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
-    return {
-      pass: false,
-      reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${minStep}.`,
-    };
-  }
-  if (actualBinStep != null && maxStep != null && actualBinStep > maxStep) {
-    return {
-      pass: false,
-      reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
-    };
+  // Bluechip deploy-side binStep exemption: a WHITELIST bluechip pair (flag ON) is
+  // exempt from the memecoin [minBinStep,maxBinStep] floor (SOL-USDC bin_step=1 is
+  // legitimate). A sane absolute bound still applies (fail-closed). Non-whitelist or
+  // flag OFF → memecoin floor below, byte-for-byte unchanged.
+  if (isBluechipBinStepExempt(args, detail)) {
+    const sanity = bluechipBinStepSanityReject(actualBinStep);
+    if (sanity) {
+      return { pass: false, reason: sanity };
+    }
+  } else {
+    if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
+      return {
+        pass: false,
+        reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${minStep}.`,
+      };
+    }
+    if (actualBinStep != null && maxStep != null && actualBinStep > maxStep) {
+      return {
+        pass: false,
+        reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
+      };
+    }
   }
 
   return { pass: true };
@@ -1162,10 +1225,22 @@ async function runSafetyChecks(name, args) {
         }
       }
 
-      // Reject pools with bin_step out of configured range
+      // Reject pools with bin_step out of configured range.
+      // Bluechip deploy-side exemption (Vega — Opsi B, money-path): a WHITELIST
+      // bluechip pair (flag ON) is exempt from the memecoin [minBinStep,maxBinStep]
+      // range (SOL-USDC bin_step=1). A sane absolute bound still applies (fail-closed:
+      // 0/negative/non-integer/over-ceiling refused). Non-whitelist or flag OFF →
+      // memecoin range below, byte-for-byte unchanged. Whitelist is NON-NEGOTIABLE.
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
-      if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
+      if (isBluechipBinStepExempt(args)) {
+        const sanity = bluechipBinStepSanityReject(
+          args.bin_step != null ? Number(args.bin_step) : null,
+        );
+        if (sanity) {
+          return { pass: false, reason: sanity };
+        }
+      } else if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
         return {
           pass: false,
           reason: `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].`,
