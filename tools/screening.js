@@ -751,7 +751,7 @@ export function marketRegimeGateRejectReason(pool, regimeResult, s) {
  * Read both leg mints from a pool regardless of shape (raw token_x/token_y OR
  * condensed base/quote). Returns { base, quote } mints (may be null).
  */
-function poolLegMints(pool) {
+export function poolLegMints(pool) {
   const base = pool?.token_x?.address ?? pool?.base?.mint ?? pool?.base_mint ?? null;
   const quote = pool?.token_y?.address ?? pool?.quote?.mint ?? null;
   return { base, quote };
@@ -1953,7 +1953,21 @@ export async function discoverPools({
     // below, byte-for-byte unchanged. When ON, a both-leg-bluechip pool is routed to
     // its OWN inverted gate (vol-CEILING not floor, no rug/mcap-band/vol-floor) and
     // SKIPS the memecoin gate entirely; a memecoin pool is untouched.
-    const reason = isBluechipPool(pool, s)
+    const isBc = isBluechipPool(pool, s);
+    // Bluechip-ONLY mode (Cassiopeia — Item C, paper-soak validation). When
+    // bluechipModeEnabled AND bluechipOnlyMode are BOTH on, the funnel deploys ONLY
+    // bluechips: a non-bluechip (memecoin) pool is dropped HERE so the paper-soak data
+    // is PURE bluechip, never diluted by memecoin deploys (Lyra's "bluechip loses the
+    // pre-rank to memecoins → never reaches top-N → never deploys" fix — restrict, not
+    // re-weight). bluechipOnlyMode default FALSE → memecoin path byte-for-byte
+    // unchanged; and the master bluechipModeEnabled gate must also be on, so this is
+    // doubly inert in the live memecoin funnel. Live can later run mixed (set
+    // bluechipOnlyMode=false) — this restriction is the clean paper-soak lever only.
+    if (s.bluechipModeEnabled === true && s.bluechipOnlyMode === true && !isBc) {
+      filteredExamples.push({ name: pool.name || pool.pool_address || "unknown pool", reason: "non_bluechip_filtered_bluechip_only_mode" });
+      return false;
+    }
+    const reason = isBc
       ? bluechipPoolGateRejectReason(pool, s)
       : getRawPoolScreeningRejectReason(pool, s);
     if (!reason) return true;

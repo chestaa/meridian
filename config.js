@@ -402,6 +402,29 @@ export const config = {
     // are discoverable intel but filtered from the DEPLOYABLE set. Flip OFF once Vega
     // ships two-sided (Opsi A) deploy. Reject: bluechip_no_wsol_leg_opsi_b_undeployable.
     requireBluechipWsolLeg: u.requireBluechipWsolLeg ?? true,
+    // ── Bluechip deploy-side binStep exemption ceiling (Vega — Opsi B, money-path) ──
+    // ROOT BLOCKER (Lyra): bluechip never deployed — SOL-USDC has bin_step=1, well
+    // below the memecoin minBinStep (80) → executor binStep gate refused every
+    // bluechip deploy ("bin_step 1 is below configured minBinStep 80"). Deep stable
+    // pools NEED a small bin step (fine-grained price grid = tight active-range fee
+    // capture); the memecoin [80,125/200] floor is structurally wrong for them.
+    // FIX: when bluechipModeEnabled AND the pair is a WHITELIST bluechip pair
+    // (isBluechipMintPair), the memecoin [minBinStep,maxBinStep] floor/ceiling is
+    // EXEMPTED — but a sane absolute bound STILL applies (bin_step must be a positive
+    // finite integer in (0, bluechipMaxBinStep]). This is NOT "no check": a garbage
+    // bin_step (0/negative/non-finite/absurd) is still REFUSED (fail-closed). The
+    // whitelist is NON-NEGOTIABLE — a non-whitelist pair NEVER gets the exemption and
+    // stays on the memecoin [80,…] floor. Default 200 covers every real DLMM bin step
+    // (1,2,4,5,10,20,25,50,80,100,125,200). Inert while flag OFF.
+    bluechipMaxBinStep:     u.bluechipMaxBinStep     ?? 200,
+    // Bluechip-ONLY funnel restriction (Cassiopeia — Item C). When ON (with the master
+    // bluechipModeEnabled), discoverPools drops every NON-bluechip (memecoin) pool so a
+    // paper-soak collects PURE bluechip data — never diluted by memecoin deploys (Lyra:
+    // bluechip loses the pre-rank to memecoins → never reaches top-N → never deploys; we
+    // RESTRICT the universe rather than re-weight the score). Default FALSE → mixed
+    // funnel (memecoin path byte-for-byte unchanged). Set TRUE in the paper-soak instance
+    // only; live can later run mixed. Reject reason: non_bluechip_filtered_bluechip_only_mode.
+    bluechipOnlyMode:       u.bluechipOnlyMode       ?? false,
   },
 
   // ─── Position Management ────────────────
@@ -968,6 +991,9 @@ export function reloadScreeningThresholds() {
     if (fresh.bluechipMaxVolatility  != null) s.bluechipMaxVolatility  = fresh.bluechipMaxVolatility;
     if (fresh.bluechipBroadMcapCeil  != null) s.bluechipBroadMcapCeil  = fresh.bluechipBroadMcapCeil;
     if (fresh.requireBluechipWsolLeg !== undefined) s.requireBluechipWsolLeg = fresh.requireBluechipWsolLeg;
+    if (fresh.bluechipOnlyMode       !== undefined) s.bluechipOnlyMode       = fresh.bluechipOnlyMode;
+    if (fresh.bluechipMaxBinStep     != null) s.bluechipMaxBinStep     = fresh.bluechipMaxBinStep;
+    if (fresh.bluechipMaxBinStep     != null) s.bluechipMaxBinStep     = fresh.bluechipMaxBinStep;
     if (fresh.minMeaningfulProfitSol != null) config.management.minMeaningfulProfitSol = fresh.minMeaningfulProfitSol;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
