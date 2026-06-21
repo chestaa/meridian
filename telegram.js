@@ -491,18 +491,22 @@ async function poll(onMessage) {
 // Registers the slash-command autocomplete menu visible in Telegram clients.
 // Idempotent — safe to call on every startup. Never throws; Telegram API
 // outages must not block bot polling.
+// Executive menu only (Sirius declutter 2026-06-21). Bro-facing commands that
+// have real reporting/control value. Technical/ops commands (/config, /setcfg,
+// /screen, /candidates, /deploy, /circuit, /hive, /pause, /resume, /details,
+// /briefing) still WORK if typed — they're just removed from the autocomplete
+// menu so Bro's command bar stays clean. See /help for the full advanced list.
 const BOT_COMMANDS = [
   { command: "menu",        description: "📋 Buka menu utama" },
   { command: "positions",   description: "📊 Posisi terbuka" },
+  { command: "journal",     description: "📒 Riwayat trade (untung/rugi)" },
   { command: "digest",      description: "📋 Ringkasan hari ini" },
-  { command: "details",     description: "📊 Digest lengkap (teknis)" },
   { command: "wallet",      description: "💰 Saldo wallet" },
-  { command: "log",         description: "📜 50 baris log terakhir" },
-  { command: "about",       description: "ℹ️ Tentang bot" },
   { command: "close",       description: "❌ Tutup posisi by index" },
   { command: "closeall",    description: "❌ Tutup semua posisi" },
-  { command: "set",         description: "📝 Set note posisi" },
-  { command: "configmenu",  description: "⚙️ Menu konfigurasi" },
+  { command: "set",         description: "📝 Set catatan posisi" },
+  { command: "log",         description: "📜 50 baris log terakhir" },
+  { command: "about",       description: "ℹ️ Tentang bot" },
 ];
 
 export async function registerBotCommands() {

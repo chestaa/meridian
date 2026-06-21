@@ -758,3 +758,81 @@ export function getPerformanceSummary() {
     total_lessons: data.lessons.length,
   };
 }
+
+/**
+ * Trade journal for the operator (Sirius — /journal). Returns the most recent
+ * `limit` CLOSED trades plus an honest summary, NOT time-windowed (unlike
+ * getPerformanceHistory which is a 24h ops view).
+ *
+ * HONESTY (money-honesty fix): each row carries the TRUE realized SOL delta
+ * (`realized_sol_delta`, net of IL+slippage+gas) when present — that is the
+ * number Bro sees. We NEVER use the buggy wallet_delta. The pnl_pct shown is
+ * the LP-PnL pct (price move on the position), realized_sol is the cash truth.
+ * Win/loss/breakeven classification uses the meaningful-profit bar:
+ *   - realized >=  bar      → win  (meaningful profit)
+ *   - realized <= -bar      → loss (meaningful loss)
+ *   - within ±bar           → breakeven (noise)
+ * Legacy records with no realized figure fall back to pnl_usd sign.
+ *
+ * @param {object} opts
+ * @param {number} opts.limit  - how many recent closes to return (default 10)
+ * @returns {{ rows: Array, summary: object|null }}
+ */
+export function getTradeJournal({ limit = 10 } = {}) {
+  const data = load();
+  const p = data.performance;
+  if (p.length === 0) return { rows: [], summary: null };
+
+  const bar = meaningfulProfitBarSol();
+
+  const classify = (r) => {
+    const realized = Number(r?.realized_sol_delta);
+    if (Number.isFinite(realized)) {
+      if (realized >= bar) return "win";
+      if (realized <= -bar) return "loss";
+      return "breakeven";
+    }
+    // Legacy fallback — no realized SOL on record; use LP-PnL sign.
+    const fallback = Number(r?.pnl_usd ?? 0);
+    if (fallback > 0) return "win";
+    if (fallback < 0) return "loss";
+    return "breakeven";
+  };
+
+  // Whole-ledger honest summary (all closes, not just the displayed page).
+  let netSol = 0;
+  let netSolKnown = false;
+  let netUsd = 0;
+  let wins = 0;
+  for (const r of p) {
+    const realized = Number(r?.realized_sol_delta);
+    if (Number.isFinite(realized)) { netSol += realized; netSolKnown = true; }
+    netUsd += Number(r?.pnl_usd ?? 0);
+    if (classify(r) === "win") wins += 1;
+  }
+
+  const summary = {
+    total_trades: p.length,
+    net_sol: netSolKnown ? Math.round(netSol * 10000) / 10000 : null,
+    net_usd: Math.round(netUsd * 100) / 100,
+    win_rate_pct: Math.round((wins / p.length) * 100),
+    win_bar_sol: bar,
+  };
+
+  const rows = p.slice(-limit).reverse().map((r) => {
+    const realized = Number(r?.realized_sol_delta);
+    return {
+      pool_name: r.pool_name || r.pool || "?",
+      closed_at: r.recorded_at || null,
+      pnl_pct: Number.isFinite(Number(r.pnl_pct)) ? Number(r.pnl_pct) : null,
+      pnl_usd: Number.isFinite(Number(r.pnl_usd)) ? Number(r.pnl_usd) : null,
+      realized_sol: Number.isFinite(realized) ? Math.round(realized * 10000) / 10000 : null,
+      fees_earned_usd: Number.isFinite(Number(r.fees_earned_usd)) ? Number(r.fees_earned_usd) : null,
+      fees_earned_sol: Number.isFinite(Number(r.fees_earned_sol)) ? Number(r.fees_earned_sol) : null,
+      source: r.source === "paper" ? "paper" : "live",
+      result: classify(r),
+    };
+  });
+
+  return { rows, summary };
+}

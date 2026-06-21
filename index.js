@@ -9,7 +9,7 @@ import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
+import { evolveThresholds, getPerformanceSummary, getTradeJournal } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
   startPolling,
@@ -28,7 +28,7 @@ import {
   isExecutiveMode,
   isMeaningfulReport,
 } from "./telegram.js";
-import { formatAgeIndo, formatPositionsMessage } from "./telegram-display.js";
+import { formatAgeIndo, formatPositionsMessage, formatTradeJournal } from "./telegram-display.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, markPartialTpDone } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
@@ -1893,33 +1893,31 @@ async function applySettingsMenuCallback(msg) {
 
 function formatHelpText() {
   return [
-    "Telegram commands",
+    "📋 Perintah utama",
     "",
-    "/help — show commands",
-    "/menu — main inline-button menu",
-    "/about — what this bot does (Indonesia)",
-    "/log — last 50 lines journalctl meridian.service",
-    "/details — verbose digest (technical)",
-    "/status — wallet + positions snapshot",
-    "/wallet — wallet, deploy amount, HiveMind status",
-    "/positions — lihat posisi terbuka (bernomor)",
+    "/menu — menu tombol utama",
+    "/positions — posisi terbuka (bernomor)",
+    "/journal — riwayat trade (untung/rugi, win-rate)",
     "/pool 1 — detail satu posisi (ganti 1 dengan nomornya)",
     "/close 1 — tutup posisi nomor 1",
     "/closeall — tutup semua posisi",
-    "/set 1 catatanmu — kasih catatan/instruksi ke posisi nomor 1",
-    "/circuit — status circuit breaker | /circuit reset — re-arm",
-    "/digest — ringkasan cepat (PnL paper, Orion, threshold, biaya, circuit)",
-    "/config — lihat config penting yang aktif",
-    "/settings — menu tombol untuk config umum",
-    "/setcfg minTvl 10000 — ubah satu config (key lalu value)",
-    "/screen — refresh daftar kandidat",
-    "/candidates — lihat kandidat terbaru",
-    "/deploy 1 — deploy kandidat nomor 1 dari daftar",
+    "/set 1 catatanmu — kasih catatan ke posisi nomor 1",
+    "/wallet — saldo wallet + deploy amount",
+    "/digest — ringkasan hari ini (PnL, win-rate, biaya)",
+    "/log — 50 baris log terakhir",
+    "/about — tentang bot",
+    "",
+    "⚙️ Lanjutan (teknis/ops — tetap jalan kalau diketik)",
+    "/details — digest verbose teknis",
+    "/config — lihat config aktif",
+    "/settings — menu tombol config",
+    "/setcfg <key> <value> — ubah satu config",
+    "/screen — refresh kandidat | /candidates — lihat kandidat",
+    "/deploy 1 — deploy kandidat nomor 1",
+    "/circuit [reset] — status / re-arm circuit breaker",
     "/briefing — morning briefing",
-    "/hive — HiveMind sync status",
-    "/hive pull — manual HiveMind pull now",
-    "/pause — stop cron cycles",
-    "/resume — start cron cycles again",
+    "/hive [pull] — HiveMind sync status / manual pull",
+    "/pause — stop cron | /resume — start cron",
     "/stop — shut down agent",
   ].join("\n");
 }
@@ -2034,10 +2032,13 @@ async function drainTelegramQueue() {
 const MAIN_MENU_BUTTONS = [
   [
     { text: "📊 Positions", callback_data: "main:positions" },
-    { text: "📋 Digest",    callback_data: "main:digest" },
+    { text: "📒 Journal",   callback_data: "main:journal" },
   ],
   [
+    { text: "📋 Digest",    callback_data: "main:digest" },
     { text: "💰 Wallet",    callback_data: "main:wallet" },
+  ],
+  [
     { text: "📜 Log",       callback_data: "main:log" },
   ],
   [
@@ -2177,6 +2178,7 @@ async function telegramHandler(msg) {
     // Re-dispatch as a synthetic command message into the same handler
     const dispatch = {
       positions: "/positions",
+      journal:   "/journal",
       digest:    "/digest",
       log:       "/log",
       about:     "/about",
@@ -2221,6 +2223,20 @@ async function telegramHandler(msg) {
     }
     return;
   }
+  // /journal — riwayat closed trades (honest ledger, money-honesty fix).
+  // Pure file read (lessons.json) — cheap, placed before the busy gate so it
+  // always answers even mid-cycle.
+  if (text === "/journal" || text === "/history" || text === "/riwayat") {
+    try {
+      const journal = getTradeJournal({ limit: 10 });
+      const cur = config.management.solMode ? "◎" : "$";
+      await sendMessage(formatTradeJournal(journal, cur)).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
   if (_managementBusy || _screeningBusy || busy) {
     if (_telegramQueue.length < 5) {
       _telegramQueue.push(msg);

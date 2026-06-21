@@ -131,3 +131,62 @@ export function formatPositionsMessage(positions, totalPositions, cur = "$", opt
     : "`/close N` buat tutup · `/pool N` buat detail (ganti N dengan nomor posisi)";
   return `📊 Posisi (${totalPositions}):\n\n${blocks.join("\n\n")}\n\n${helpLine}`;
 }
+
+// Render the /journal message — riwayat closed trades (Sirius). Plain executive,
+// scannable, one line per trade in the same trade-card spirit as /positions.
+// HONEST numbers only: the rows carry realized SOL (post money-honesty fix) and
+// the LP-PnL pct — losses are shown as losses, breakeven as breakeven. NEVER
+// the buggy wallet_delta. `journal` is the object from getTradeJournal().
+//   - win  ✅   loss 🔴   breakeven ⚪
+//   - shows fee income (+$X) when meaningful (≥ $0.01)
+//   - date as "DD Mon" in local-ish short form (UTC-safe, no tz drama)
+export function formatTradeJournal(journal, cur = "$") {
+  if (!journal || !Array.isArray(journal.rows) || journal.rows.length === 0) {
+    return "📒 Belum ada riwayat trade (belum ada posisi yang ditutup).";
+  }
+  const { rows, summary } = journal;
+
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+  const fmtDate = (iso) => {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "—";
+    return `${String(d.getUTCDate()).padStart(2, " ")} ${MONTHS[d.getUTCMonth()]}`;
+  };
+
+  const emoji = (r) => (r === "win" ? "✅" : r === "loss" ? "🔴" : "⚪");
+  const signedPct = (num) => {
+    const v = Number(num);
+    if (!Number.isFinite(v)) return "";
+    const r = Math.round(v * 100) / 100;
+    return r >= 0 ? `+${r}%` : `${r}%`;
+  };
+
+  const lines = rows.map((r) => {
+    const date = fmtDate(r.closed_at);
+    const name = String(r.pool_name).slice(0, 14).padEnd(14, " ");
+    const pct = signedPct(r.pnl_pct);
+    const tag = r.result === "breakeven" ? " (breakeven)" : "";
+    // Fee income shown only when meaningful ($0.01+) so micro-noise stays quiet.
+    const feeStr = Number.isFinite(r.fees_earned_usd) && r.fees_earned_usd >= 0.01
+      ? ` (fee +${cur}${r.fees_earned_usd.toFixed(1)})`
+      : "";
+    const src = r.source === "paper" ? " ·paper" : "";
+    return `${date}  ${name} ${emoji(r.result)} ${pct}${tag}${feeStr}${src}`;
+  });
+
+  // Summary header — honest net (SOL when known, plus $) + win-rate + count.
+  const netSolStr = summary.net_sol != null
+    ? `${summary.net_sol >= 0 ? "+" : ""}${summary.net_sol} SOL`
+    : null;
+  const netUsdStr = `${summary.net_usd >= 0 ? "+" : "-"}${cur}${Math.abs(summary.net_usd).toFixed(2)}`;
+  const netStr = netSolStr ? `${netSolStr} (${netUsdStr})` : netUsdStr;
+  const header = `Net: ${netStr} · Win-rate ${summary.win_rate_pct}% · ${summary.total_trades} trade`;
+
+  return [
+    `📒 Riwayat Trade (${rows.length} terakhir)`,
+    header,
+    "─────────",
+    ...lines,
+  ].join("\n");
+}
