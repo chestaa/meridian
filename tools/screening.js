@@ -907,6 +907,41 @@ export function bluechipHasWsolLeg(pool) {
   return base === WSOL_MINT || quote === WSOL_MINT;
 }
 
+/**
+ * STRICT bluechip single-side-SOL deployability guard (Cassiopeia ↔ Vega, Opsi 1 LST-SOL
+ * pivot). PURE + unit-tested. Returns `null` if deployable, else the reject reason string.
+ *
+ * Vega diagnosis: Opsi B seeds a position with SOL ONLY (executor refuses amount_x>0).
+ * On-chain, SOL can only be the deposited side if wSOL is the pool's tokenY (QUOTE) leg.
+ * This holds for memecoin pools (quote=SOL) and for genuine LST-SOL pools (mint sort →
+ * LST=tokenX, wSOL=tokenY: verified JitoSOL-SOL / mSOL-SOL / JupSOL-SOL on-chain). It is
+ * FALSE for SOL-USDC (SOL=tokenX/base, USDC=quote) → deposit fails with on-chain 0x1.
+ *
+ * The previous guard `bluechipHasWsolLeg` ("either leg is wSOL") was TOO LOOSE: SOL-USDC
+ * and SOL-mSOL (wSOL on the base side) both have a wSOL leg, so they slipped through to
+ * enrich → judge → deploy and only died at the chain. We now require wSOL === tokenY
+ * (the quote leg) — the SAME deployability invariant solQuoteRejectReason enforces for
+ * memecoins, applied to the bluechip lane for consistency.
+ *
+ * FAIL-CLOSED (anti-pattern #2): a missing/null/empty tokenY mint cannot confirm
+ * deployability → REJECT. We never default an unverifiable pool into the deploy set.
+ *
+ * Reads both pool shapes via poolLegMints (raw token_x/token_y OR condensed base/quote);
+ * the quote leg = token_y = tokenYMint.
+ *
+ * @param {object} pool
+ * @returns {string|null} null = deployable (wSOL=tokenY); else "bluechip_wsol_not_quote_side"
+ */
+export function bluechipWsolQuoteRejectReason(pool) {
+  const { quote } = poolLegMints(pool); // quote === tokenY === tokenYMint
+  // Fail-closed: missing/empty quote (tokenY) mint → cannot confirm wSOL is the deposit
+  // side → reject. Never default-pass an unverifiable pool into single-side-SOL deploy.
+  if (quote == null || quote === "") return "bluechip_wsol_not_quote_side";
+  // Deployable ONLY when wSOL is the QUOTE (tokenY) leg. wSOL-as-base (SOL-USDC) → reject.
+  if (quote !== WSOL_MINT) return "bluechip_wsol_not_quote_side";
+  return null;
+}
+
 export function quoteOrganicGateRejectReason(pool, s) {
   const minQuoteOrganic = numeric(s?.minQuoteOrganic);
   // Floor disabled / unset / non-positive → quote-organic not gated at all.
@@ -2229,11 +2264,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   //      deep-TVL / consistent-volume / fee-yield / mcap / vol-CEILING — the inverted
   //      profile). Discovery already gated on the raw shape, but enrichment may have
   //      back-filled fields, so we re-gate on the final numbers (defense in depth).
-  //   2) Deployability: under Vega's Opsi B (single-side SOL) a bluechip pool is
-  //      deployable ONLY if it has a wSOL leg. requireBluechipWsolLeg (default true)
-  //      drops non-wSOL-leg bluechips (JLP-USDC, USDC-USDT) from the DEPLOYABLE set —
-  //      they remain discoverable intel but Opsi B cannot seed them. Flip the flag off
-  //      once Vega ships two-sided (Opsi A) deploy.
+  //   2) Deployability (Opsi 1 LST-SOL pivot): under Vega's Opsi B (single-side SOL) a
+  //      bluechip pool is deployable ONLY if wSOL is its tokenY (QUOTE) leg — the side
+  //      SOL can be deposited on-chain. requireBluechipWsolLeg (default true) drops
+  //      pools where wSOL is the BASE leg (SOL-USDC, SOL-mSOL → on-chain 0x1) AND pools
+  //      with no wSOL leg (JLP-USDC), via bluechipWsolQuoteRejectReason. The deployable
+  //      bluechip set is now LST-SOL pools (JitoSOL-SOL / mSOL-SOL / JupSOL-SOL: mint
+  //      sort → LST=tokenX, wSOL=tokenY). Flip the flag off once Vega ships two-sided
+  //      (Opsi A) deploy that can seed a wSOL-base pool.
   if (eff.bluechipModeEnabled === true && eligible.length > 0) {
     const beforeBc = eligible.length;
     const requireWsolLeg = eff.requireBluechipWsolLeg !== false; // default true (Opsi B)
@@ -2245,10 +2283,13 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pushFilteredReason(filteredOut, p, reason);
         return false;
       }
-      if (requireWsolLeg && !bluechipHasWsolLeg(p)) {
-        log("screening", `Bluechip deployability: dropped ${p.name} — no_wsol_leg_opsi_b_undeployable (quote=${p.quote?.symbol || "?"})`);
-        pushFilteredReason(filteredOut, p, "bluechip_no_wsol_leg_opsi_b_undeployable");
-        return false;
+      if (requireWsolLeg) {
+        const wsolReason = bluechipWsolQuoteRejectReason(p);
+        if (wsolReason) {
+          log("screening", `Bluechip deployability: dropped ${p.name} — ${wsolReason} (wSOL must be tokenY/quote for single-side-SOL Opsi B; quote=${p.quote?.symbol || p.token_y?.symbol || "?"})`);
+          pushFilteredReason(filteredOut, p, wsolReason);
+          return false;
+        }
       }
       return true;
     });

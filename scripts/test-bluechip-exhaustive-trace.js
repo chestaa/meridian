@@ -7,6 +7,7 @@ import {
   isBluechipPool,
   bluechipPoolGateRejectReason,
   bluechipHasWsolLeg,
+  bluechipWsolQuoteRejectReason,
   getRawPoolScreeningRejectReason,
   buildDiscoveryFilters,
   tvlMcapGateRejectReason,
@@ -69,7 +70,17 @@ const ok = (cond, msg) => { assert.ok(cond, msg); pass++; };
 // ── 1. Classification ──────────────────────────────────────────────────────
 ok(classifyPoolMode(rawSolUsdc) === "bluechip", "SOL-USDC both-leg → bluechip");
 ok(isBluechipPool(rawSolUsdc, s) === true, "isBluechipPool true when flag on");
-ok(bluechipHasWsolLeg(rawSolUsdc) === true, "has wSOL leg → Opsi-B deployable");
+ok(bluechipHasWsolLeg(rawSolUsdc) === true, "SOL-USDC has a wSOL leg (old loose guard would pass)");
+// Opsi 1 pivot: SOL-USDC has wSOL on the BASE side (tokenX) → single-side-SOL deposit
+// fails on-chain (0x1). The tightened deployability guard now REJECTS it.
+ok(bluechipWsolQuoteRejectReason(rawSolUsdc) === "bluechip_wsol_not_quote_side",
+   "SOL-USDC (wSOL=tokenX) → NOT Opsi-B deployable (rejected)");
+// The deployable bluechip target is now LST-SOL: LST=tokenX, wSOL=tokenY (quote).
+const rawJitoSol = { ...rawSolUsdc, name: "JitoSOL-SOL",
+  token_x: { address: "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn", market_cap: 727_000_000, organic_score: 95, created_at: Date.now() - 1000 * 24 * 3600 * 1000 },
+  token_y: { address: WSOL, organic_score: 0 } };
+ok(classifyPoolMode(rawJitoSol) === "bluechip", "JitoSOL-SOL both-leg → bluechip");
+ok(bluechipWsolQuoteRejectReason(rawJitoSol) === null, "JitoSOL-SOL (wSOL=tokenY) → Opsi-B deployable");
 
 // ── 2. Discovery server pre-filter must NOT push a maxTvl<=150k that drops $245k ─
 const filters = buildDiscoveryFilters(s); // &&-joined string in broad mode
@@ -109,4 +120,4 @@ const offReason = getRawPoolScreeningRejectReason(rawSolUsdc, { ...s, bluechipMo
 ok(typeof offReason === "string", `flag off → memecoin gate applies (reject): ${offReason}`);
 
 console.log(`\nBluechip exhaustive trace: ${pass}/${pass} assertions PASS`);
-console.log("SOL-USDC ($245k) clears classification → discovery routing → income gate → TVL/MC/regime/quote exemptions → deployable.");
+console.log("SOL-USDC ($245k) clears the income/TVL/MC/regime/quote gates but is NOT Opsi-B deployable (wSOL=tokenX). JitoSOL-SOL (wSOL=tokenY) IS deployable — Opsi 1 pivot.");

@@ -8,8 +8,9 @@
 //   (a) flag ON  + SOL-USDC bluechip  → routed to bluechip gate (passes)
 //   (b) flag ON  + memecoin pool      → memecoin gate (unchanged)
 //   (c) flag OFF + everything         → memecoin path (regression: isBluechipPool false)
-//   (d) bluechip + requireSolQuote    → SOL-USDC (wSOL base / USDC quote) deployable
-//   (e) non-deployable bluechip       → no wSOL leg (JLP-USDC) flagged undeployable
+//   (d) bluechip + requireSolQuote    → SOL-USDC bypasses the SOL-quote pre-filter
+//   (e) deployability (Opsi 1 pivot)  → wSOL MUST be tokenY/quote (JitoSOL-SOL deployable;
+//                                        SOL-USDC + JLP-USDC rejected — wSOL not the quote leg)
 //   + discovery-band: broad mcap ceiling RAISED only when flag on (SOL ~$40B survives)
 //   + regime gate: bluechip EXEMPT from downtrend pause (incl. non-stable base LST)
 //
@@ -32,6 +33,7 @@ const {
   isBluechipPool,
   bluechipPoolGateRejectReason,
   bluechipHasWsolLeg,
+  bluechipWsolQuoteRejectReason,
   marketRegimeGateRejectReason,
   solQuoteRejectReason,
   buildDiscoveryFilters,
@@ -140,19 +142,23 @@ console.log("\n── (d) requireSolQuote relax for bluechip ──");
 // solQuoteRejectReason itself still rejects a USDC quote (the wiring SKIPS it for bluechip).
 check("raw solQuoteRejectReason WOULD reject USDC-quoted SOL-USDC (memecoin assumption)",
   solQuoteRejectReason(solUsdc(), sOn) === "non_sol_quote_undeployable");
-// The wiring relaxes via isBluechipPool — confirm SOL-USDC IS classified bluechip so it bypasses.
+// The wiring relaxes the SOL-quote pre-filter via isBluechipPool — confirm SOL-USDC IS
+// classified bluechip so it bypasses THAT filter (deployability is then re-checked in (e)).
 check("SOL-USDC is bluechip → wiring bypasses the SOL-quote filter", isBluechipPool(solUsdc(), sOn) === true);
-// True deployability is governed by wSOL-leg, NOT quote==wSOL: SOL-USDC has a wSOL leg.
-check("SOL-USDC has wSOL leg → deployable under Opsi B", bluechipHasWsolLeg(solUsdc()) === true);
 
-// ── (e) non-deployable bluechip (no wSOL leg) handled ──
-console.log("\n── (e) non-wSOL-leg bluechip flagged undeployable ──");
-check("JLP-USDC is bluechip", isBluechipPool(jlpUsdc(), sOn) === true);
-check("JLP-USDC has NO wSOL leg → undeployable under Opsi B", bluechipHasWsolLeg(jlpUsdc()) === false);
-check("USDC-USDT (no wSOL leg) → undeployable",
-  bluechipHasWsolLeg({ base: { mint: USDC }, quote: { mint: USDT } }) === false);
-check("JitoSOL-SOL HAS wSOL leg (quote side) → deployable", bluechipHasWsolLeg(jitoSol()) === true);
-check("SOL-USDC wSOL leg detected via condensed shape too", bluechipHasWsolLeg({ base: { mint: WSOL }, quote: { mint: USDC } }) === true);
+// ── (e) deployability (Opsi 1 LST-SOL pivot): wSOL MUST be tokenY/quote ──
+// Tightened from the old "either leg is wSOL" guard. SOL-USDC has a wSOL leg but it is
+// the BASE side (tokenX) → single-side-SOL deposit fails on-chain (0x1) → REJECT.
+console.log("\n── (e) deployability: wSOL must be the tokenY/quote leg ──");
+check("JitoSOL-SOL (wSOL=tokenY) → deployable (null)", bluechipWsolQuoteRejectReason(jitoSol()) === null);
+check("SOL-USDC (wSOL=tokenX/base) → REJECTED (the 0x1 bug, now closed)",
+  bluechipWsolQuoteRejectReason(solUsdc()) === "bluechip_wsol_not_quote_side");
+check("SOL-USDC still HAS a wSOL leg (proves old guard would have passed it)",
+  bluechipHasWsolLeg(solUsdc()) === true);
+check("JLP-USDC (no wSOL leg) → REJECTED", isBluechipPool(jlpUsdc(), sOn) === true
+  && bluechipWsolQuoteRejectReason(jlpUsdc()) === "bluechip_wsol_not_quote_side");
+check("USDC-USDT (no wSOL leg) → REJECTED",
+  bluechipWsolQuoteRejectReason({ base: { mint: USDC }, quote: { mint: USDT } }) === "bluechip_wsol_not_quote_side");
 
 // ── discovery band: broad mcap ceiling RAISED only when flag on ──
 console.log("\n── discovery band: broad mcap ceiling raise (flag-gated) ──");

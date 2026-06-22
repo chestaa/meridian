@@ -397,10 +397,13 @@ export const config = {
     // (still client-gated by both memecoin maxMcap AND the bluechip band). Default
     // 1e12 = $1T, comfortably above any real bluechip cap. Inert while flag OFF.
     bluechipBroadMcapCeil:  u.bluechipBroadMcapCeil  ?? 1_000_000_000_000,
-    // Opsi-B (single-side SOL) deployability guard: a bluechip pool is deployable only
-    // if it has a wSOL leg. Default true → non-wSOL-leg bluechips (JLP-USDC, USDC-USDT)
-    // are discoverable intel but filtered from the DEPLOYABLE set. Flip OFF once Vega
-    // ships two-sided (Opsi A) deploy. Reject: bluechip_no_wsol_leg_opsi_b_undeployable.
+    // Opsi-1/B (single-side SOL) deployability guard: a bluechip pool is deployable only
+    // if wSOL is its tokenY (QUOTE) leg — the side SOL can be deposited on-chain. Default
+    // true → pools with wSOL on the BASE side (SOL-USDC, SOL-mSOL → on-chain 0x1) AND
+    // pools with no wSOL leg (JLP-USDC, USDC-USDT) are filtered from the DEPLOYABLE set.
+    // Deployable target = LST-SOL (JitoSOL-SOL / mSOL-SOL / JupSOL-SOL: LST=tokenX,
+    // wSOL=tokenY). Flip OFF once Vega ships two-sided (Opsi A) deploy that can seed a
+    // wSOL-base pool. Reject: bluechip_wsol_not_quote_side.
     requireBluechipWsolLeg: u.requireBluechipWsolLeg ?? true,
     // ── Bluechip deploy-side binStep exemption ceiling (Vega — Opsi B, money-path) ──
     // ROOT BLOCKER (Lyra): bluechip never deployed — SOL-USDC has bin_step=1, well
