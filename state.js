@@ -68,6 +68,7 @@ export function trackPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  is_bluechip = false,
   signal_snapshot = null,
 }) {
   const state = load();
@@ -86,6 +87,11 @@ export function trackPosition({
     initial_fee_tvl_24h: fee_tvl_ratio,
     organic_score,
     initial_value_usd,
+    // Vega — bluechip flag (LST-SOL income-engine). Persisted at deploy so the
+    // OOR handler can apply patient-OOR-UP handling (single-side SOL slot-Y
+    // goes OOR-UP on the first up-tick = thesis, not a stop). Default false →
+    // memecoin path unchanged. bluechipPatientOorEnabled gates the live effect.
+    is_bluechip: is_bluechip === true,
     signal_snapshot: signal_snapshot || null,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
@@ -820,6 +826,45 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
         if (changedUp) save(state);
         // No exit: the trailing-drop block (runs above next cycle) and SL govern
         // the exit. The pump is captured instead of clipped at +sliver.
+        return null;
+      }
+      // ── Patient OOR-UP for bluechip near-peg single-side SOL (Vega Opsi 1) ──
+      // ROOT-CAUSE FIX for masalah #2 (instant-close ~40s). A single-side SOL
+      // deploy into a wSOL=tokenY (LST-SOL) pool MUST end at the SDK active bin
+      // (maxBinId=activeBin) — a bin ABOVE active holds tokenX (the LST) only, so
+      // funding headroom would require depositing the LST = two-sided (Opsi A,
+      // out of scope). A bin-buffer above active is therefore NOT SDK-valid here;
+      // the correct lever is OOR-HANDLING. On a near-peg pool with a small
+      // bin_step the FIRST up-tick pushes active above upper → OOR-UP in seconds,
+      // while net pnl is still ~flat (conversion-edge IL) so the in-profit ride
+      // path above does not catch it and the position was being cut at the worst
+      // spot. But OOR-UP on a single-side SOL slot-Y position is the THESIS
+      // playing out (SOL converting into the appreciating LST), NOT a stop. So we
+      // HOLD it patiently instead of instant-closing or rebalancing-up.
+      //
+      // SAFETY (money-path, non-negotiable): this branch is reached ONLY after
+      // the STOP_LOSS and break-even blocks ABOVE have already passed — i.e. the
+      // net fee-inclusive PnL is strictly ABOVE the SL floor. A genuine de-peg
+      // dump shows as OOR-DOWN (handled by the fast-cut below) or as net <= SL
+      // (stopped out above). Patient hold can therefore NEVER shield a real loss
+      // and can NEVER hold forever (SL/max-hold still own the exit). It also
+      // applies to UP only, so it cannot block the OOR-DOWN cut. Gated on
+      // bluechipPatientOorEnabled (default OFF) AND pos.is_bluechip — a memecoin
+      // position is byte-for-byte unchanged (the flag is a no-op for it).
+      if (
+        mgmtConfig.bluechipPatientOorEnabled === true &&
+        pos.is_bluechip === true
+      ) {
+        if (!pos.bluechip_patient_oor_logged) {
+          pos.bluechip_patient_oor_logged = true;
+          save(state);
+          log(
+            "state",
+            `Position ${position_address} bluechip OOR-UP (net ${currentPnlPct != null ? Number(currentPnlPct).toFixed(2) : "?"}%) — patient hold, NOT instant-closing (single-side SOL slot-Y converting to LST; SL still owns downside)`,
+          );
+        }
+        // No exit: SOL is converting into the appreciating LST exactly as
+        // intended. SL (above) caps a real loss; max-hold (above) caps duration.
         return null;
       }
       // OOR-UP but NOT in-profit → normal OOR timer (fall through below).

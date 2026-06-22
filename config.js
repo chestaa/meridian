@@ -500,6 +500,23 @@ export const config = {
     // OOR-DOWN cut timer (minutes). MUST be <= outOfRangeWaitMinutes; a dump is
     // pure depreciation so we exit sooner. Default 8 (vs 20-30 normal).
     outOfRangeWaitMinutesDown: u.outOfRangeWaitMinutesDown ?? 8,
+    // Vega Opsi 1 (2026-06-22) — Patient OOR-UP for bluechip near-peg LST-SOL.
+    // ROOT-CAUSE FIX for masalah #2 (instant-close ~40s). A single-side SOL
+    // deploy into a wSOL=tokenY pool MUST end at maxBinId=activeBin (a bin above
+    // active holds tokenX/LST only → would require depositing the LST = two-sided
+    // Opsi A). So a bin-buffer above active is NOT SDK-valid for single-side SOL
+    // slot-Y; the correct lever is OOR-HANDLING. On a near-peg pool with a small
+    // bin_step the first up-tick → OOR-UP in seconds while net pnl is still ~flat
+    // (conversion-edge), so the in-profit ride path misses it and the legacy
+    // timer cut it at the worst spot. With this ON, a pos.is_bluechip position
+    // that is OOR-UP (and above the SL floor — SL fires above this block) is HELD
+    // patiently: SOL is converting into the appreciating LST exactly as intended,
+    // NOT a stop signal. SL + max-hold still own the exit (no infinite hold), and
+    // it is UP-only so the OOR-DOWN fast-cut is untouched. Memecoin (is_bluechip
+    // falsey) is byte-for-byte unchanged. Default OFF — Bro+Vega enable after
+    // paper-soak; bluechip mode itself stays PAUSED. Requires
+    // oorDirectionalExitEnabled (the directional substrate) to be ON to take effect.
+    bluechipPatientOorEnabled: u.bluechipPatientOorEnabled ?? false,
     // Andromeda PR-A — max-drawdown-recovery exit (paper-trades.js).
     // ARM when max_drawdown (peak−trough) >= armPct; FIRE when current pnl
     // recovers deltaPct above trough. Distinct from trailing TP, which gates
