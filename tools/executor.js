@@ -442,6 +442,15 @@ async function validateDeployPoolThresholds(args) {
     }
   }
 
+  // Bluechip deploy-side exemption (Vega money-path, mirrors screening carve-out):
+  // a WHITELIST bluechip pair (flag ON) is a DEEP STABLE pool — the memecoin gates
+  // maxTvl ($150k), minFeeActiveTvlRatio floor (0.10) and the vol>0 floor are all
+  // mis-targeted for it (deep TVL = GOOD, bluechip fee/TVL is lower, vol is a CEILING
+  // not a floor). When exempt, those three gates are replaced by bluechip semantics
+  // (no maxTvl ceiling; bluechip fee/TVL floor; vol ceiling). Non-whitelist or flag
+  // OFF → memecoin path below, byte-for-byte unchanged. FAIL-CLOSED throughout.
+  const isBluechipExempt = isBluechipBinStepExempt(args, detail);
+
   const tvl = poolDetailTvl(detail);
   const minTvl = numberOrNull(config.screening.minTvl);
   const maxTvl = numberOrNull(config.screening.maxTvl);
@@ -457,7 +466,9 @@ async function validateDeployPoolThresholds(args) {
       reason: `Pool TVL $${tvl} is below configured minTvl $${minTvl}.`,
     };
   }
-  if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
+  // GATE 1 — maxTvl ceiling: EXEMPT for bluechip (a deep $245k SOL-USDC pool is the
+  // ideal income target, not a risk). Memecoin path keeps the ceiling unchanged.
+  if (!isBluechipExempt && maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
     return {
       pass: false,
       reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.`,
@@ -470,15 +481,23 @@ async function validateDeployPoolThresholds(args) {
   const effectiveFeeTvlRatio = [feeActiveTvlRatio, feeTvlRatio, requestedFeeTvlRatio]
     .filter((value) => value != null)
     .reduce((best, value) => Math.max(best, value), -Infinity);
-  const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
+  // GATE 2 — fee/TVL floor: bluechip uses the LOWER bluechipMinFeeTvlRatio floor
+  // (0.03, ~11% APR — bluechip IL is far smaller so a lower fee bar is fine) in
+  // place of the memecoin minFeeActiveTvlRatio (0.10). Still FAIL-CLOSED: a missing
+  // fee/TVL reading is rejected in both lanes (never default to passing).
+  const effectiveFeeFloor = isBluechipExempt
+    ? numberOrNull(config.screening.bluechipMinFeeTvlRatio)
+    : numberOrNull(config.screening.minFeeActiveTvlRatio);
   if (
-    minFeeActiveTvlRatio != null &&
-    minFeeActiveTvlRatio > 0 &&
-    (!Number.isFinite(effectiveFeeTvlRatio) || effectiveFeeTvlRatio < minFeeActiveTvlRatio)
+    effectiveFeeFloor != null &&
+    effectiveFeeFloor > 0 &&
+    (!Number.isFinite(effectiveFeeTvlRatio) || effectiveFeeTvlRatio < effectiveFeeFloor)
   ) {
     return {
       pass: false,
-      reason: `Pool fee/TVL ratio ${effectiveFeeTvlRatio ?? "unknown"} is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}.`,
+      reason: isBluechipExempt
+        ? `Bluechip pool fee/TVL ratio ${Number.isFinite(effectiveFeeTvlRatio) ? effectiveFeeTvlRatio : "unknown"} is below bluechipMinFeeTvlRatio ${effectiveFeeFloor}.`
+        : `Pool fee/TVL ratio ${Number.isFinite(effectiveFeeTvlRatio) ? effectiveFeeTvlRatio : "unknown"} is below configured minFeeActiveTvlRatio ${effectiveFeeFloor}.`,
     };
   }
 
@@ -504,7 +523,20 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const volatility = poolDetailVolatility(volatilityDetail);
-  if (volatility == null || volatility <= 0) {
+  // GATE 3 — volatility: for MEMECOIN this is a FLOOR (vol>0 required; a stable/dead
+  // reading = refuse). For BLUECHIP it INVERTS to a CEILING — a stable pool legitimately
+  // reads ~0 vol and that is GOOD (SOL-USDC vola ~0.1); a WILD reading means it isn't
+  // behaving as a stable bluechip (de-peg / thin book) and IS rejected. Low/zero vol is
+  // tolerated for bluechip (mirrors screening bluechipPoolGateRejectReason).
+  if (isBluechipExempt) {
+    const maxVola = numberOrNull(config.screening.bluechipMaxVolatility);
+    if (maxVola != null && maxVola > 0 && volatility != null && volatility > maxVola) {
+      return {
+        pass: false,
+        reason: `Bluechip pool ${volatilityTimeframe} volatility ${volatility} is above bluechipMaxVolatility ${maxVola}. Not behaving as a stable bluechip — refusing deploy.`,
+      };
+    }
+  } else if (volatility == null || volatility <= 0) {
     return {
       pass: false,
       reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
