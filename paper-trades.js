@@ -734,6 +734,9 @@ export async function closePaperTrade(trade, exit, snapshot) {
         close_reason: exit.reason,
         deployed_at: trade.opened_at,
         source: "paper",
+        // Vega 2026-06-23 — propagate the live-tracked peak so Lyra can analyze
+        // trailing/exit timing offline (logging only, no new fetch).
+        peak_pnl_pct: trade.peak_pnl_pct ?? null,
         // Vega fix #1 — carry the simulated realized SOL delta into the lessons
         // record so digest/snapshot read TRUE economics, not just price-only PnL.
         realized_sol_delta: trade.realized_sol_delta ?? null,

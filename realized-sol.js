@@ -87,6 +87,11 @@ function finiteOrNull(value) {
  * @param {number} [args.solReceivedOnClose] SOL back from close+swap (formula path)
  * @param {number} [args.feesClaimedSol]     fees claimed, in SOL
  * @param {number} [args.gasSpentSol]        measured/estimated gas (formula path)
+ * @param {number} [args.finalValueUsd]      USD value withdrawn at close (economics
+ *                                           cross-check — used ONLY to refuse a
+ *                                           fabricated ~-100% catastrophe)
+ * @param {number} [args.pnlPct]             closed-PnL % from the API (economics
+ *                                           cross-check — same purpose)
  * @returns {{ realized_sol_delta: number|null, realized_sol_delta_pct: number|null,
  *             method: string, estimate: boolean, sol_deployed: number|null }}
  */
@@ -97,6 +102,8 @@ export function computeLiveRealizedSolDelta({
   solReceivedOnClose,
   feesClaimedSol,
   gasSpentSol,
+  finalValueUsd,
+  pnlPct,
 } = {}) {
   const deployed = finiteOrNull(solDeployed);
   const before = finiteOrNull(walletSolBefore);
@@ -123,6 +130,28 @@ export function computeLiveRealizedSolDelta({
   const fees = finiteOrNull(feesClaimedSol) ?? 0;
   const gas = finiteOrNull(gasSpentSol) ?? DEFAULT_CLOSE_GAS_SOL;
   if (received != null && deployed != null) {
+    // HONESTY GUARD (Vega 2026-06-23): a PRESENT-but-ZERO SOL withdrawal
+    // (received === 0, fees 0) makes the formula read delta ≈ -(deployed + gas)
+    // ≈ -1× deploy ≈ -100% — a fabricated total wipe. But the Meteora SOL field
+    // is frequently zero/absent on a settling record even when the trade did NOT
+    // wipe. If the USD economics CONTRADICT a wipe (finalValueUsd > 0, i.e. SOL
+    // came back; or pnlPct > -90, i.e. not a near-total loss), refuse the
+    // catastrophic figure and fail toward UNKNOWN (null) — an honest gap, never a
+    // fabricated -100%. We only let a true wipe through when USD agrees it wiped.
+    const usdValueOut = finiteOrNull(finalValueUsd);
+    const closedPnlPct = finiteOrNull(pnlPct);
+    const noSolBack = received === 0 && fees === 0;
+    const usdSaysNotWiped = (usdValueOut != null && usdValueOut > 0) ||
+                            (closedPnlPct != null && closedPnlPct > -90);
+    if (noSolBack && usdSaysNotWiped) {
+      return {
+        realized_sol_delta: null,
+        realized_sol_delta_pct: null,
+        method: "unavailable_zero_sol_usd_disagree",
+        estimate: true,
+        sol_deployed: deployed,
+      };
+    }
     const delta = round8(received + fees - (deployed + gas));
     return {
       realized_sol_delta: delta,

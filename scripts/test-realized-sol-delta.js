@@ -229,4 +229,81 @@ check("HONESTY: glippy → -7.14% NEGATIVE (not the +103% trust-eroder)", () => 
   assert.ok(Math.abs(w.realized_sol_delta_pct - (-7.14)) < 0.01, "wallet path agrees: negative");
 });
 
+// ── 10. HONESTY GUARD (2026-06-23): present-but-zero SOL must NOT fabricate -100% ─
+// The Meteora closed-PnL API frequently reports allTimeWithdrawals.total.sol === 0
+// on a still-settling record. The OLD formula read delta ≈ -(deployed+gas) ≈ -100%.
+// When USD economics CONTRADICT a wipe, the formula must FAIL TO UNKNOWN (null).
+check("HONESTY GUARD: received=0 + pnlPct says NOT-wiped → UNKNOWN (not fabricated -100%)", () => {
+  const r = computeLiveRealizedSolDelta({
+    solDeployed: 1.0,
+    solReceivedOnClose: 0,   // present-but-zero (settling record)
+    feesClaimedSol: 0,
+    pnlPct: -3,              // USD says it lost ~3%, NOT a wipe
+  });
+  assert.equal(r.realized_sol_delta, null, "must NOT emit a fabricated -100%");
+  assert.equal(r.realized_sol_delta_pct, null);
+  assert.equal(r.method, "unavailable_zero_sol_usd_disagree");
+  assert.equal(r.estimate, true);
+});
+check("HONESTY GUARD: received=0 + finalValueUsd>0 → UNKNOWN (USD value came back)", () => {
+  const r = computeLiveRealizedSolDelta({
+    solDeployed: 1.0,
+    solReceivedOnClose: 0,
+    feesClaimedSol: 0,
+    finalValueUsd: 180, // USD value DID come back → not a wipe
+  });
+  assert.equal(r.realized_sol_delta, null);
+  assert.equal(r.method, "unavailable_zero_sol_usd_disagree");
+});
+check("HONESTY GUARD: received=0 + USD AGREES wipe (pnlPct=-99, no usd) → real catastrophe through", () => {
+  // When USD ALSO says wiped, we do NOT mask it — a real total loss is honest.
+  const r = computeLiveRealizedSolDelta({
+    solDeployed: 1.0,
+    solReceivedOnClose: 0,
+    feesClaimedSol: 0,
+    pnlPct: -99,            // USD agrees: near-total wipe
+  });
+  assert.equal(r.method, "formula", "USD-agreed wipe must pass through, not be masked");
+  assert.ok(r.realized_sol_delta < -0.9, "a genuine wipe stays deeply negative");
+});
+check("HONESTY GUARD: positive received unaffected (guard only fires on zero-SOL)", () => {
+  const r = computeLiveRealizedSolDelta({
+    solDeployed: 1.0, solReceivedOnClose: 1.02, feesClaimedSol: 0, pnlPct: 2,
+  });
+  assert.equal(r.method, "formula");
+  assert.ok(r.realized_sol_delta != null, "normal formula path still computes");
+});
+
+// ── 11. Backfill detection (pure fn) ───────────────────────────────────────
+const { isMisbookedRealizedRow } = await import("./backfill-realized-sol-delta.js");
+check("BACKFILL: mis-booked -100% row with USD non-wipe → detected", () => {
+  assert.equal(isMisbookedRealizedRow({
+    realized_sol_delta: -0.20, amount_sol: 0.20, // ratio = -1.0 (~-100%)
+    pnl_pct: -4, final_value_usd: 190, close_reason: "OOR rebalance",
+  }), true);
+});
+check("BACKFILL: genuine stop-loss disaster → NOT touched", () => {
+  assert.equal(isMisbookedRealizedRow({
+    realized_sol_delta: -0.18, amount_sol: 0.20,
+    pnl_pct: -92, final_value_usd: 0, close_reason: "Stop loss -8%",
+  }), false);
+});
+check("BACKFILL: a normal small loss (not -100%) → NOT touched", () => {
+  assert.equal(isMisbookedRealizedRow({
+    realized_sol_delta: -0.01, amount_sol: 0.20, // ratio = -0.05
+    pnl_pct: -5, final_value_usd: 190, close_reason: "agent decision",
+  }), false);
+});
+check("BACKFILL: USD ALSO confirms wipe → NOT touched (honest catastrophe)", () => {
+  assert.equal(isMisbookedRealizedRow({
+    realized_sol_delta: -0.20, amount_sol: 0.20,
+    pnl_pct: -97, final_value_usd: 0, close_reason: "OOR",
+  }), false);
+});
+check("BACKFILL: missing amount_sol → NOT touched (cannot judge ratio)", () => {
+  assert.equal(isMisbookedRealizedRow({
+    realized_sol_delta: -0.20, amount_sol: 0, pnl_pct: -4, final_value_usd: 190,
+  }), false);
+});
+
 console.log(`\nALL ${assertions} ASSERTIONS PASS — realized SOL delta accounting verified`);

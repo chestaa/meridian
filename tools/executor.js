@@ -1117,6 +1117,9 @@ export async function executeTool(name, args) {
               solDeployed: result.sol_deployed ?? null,
               solReceivedOnClose: result.sol_received ?? null,
               feesClaimedSol: result.fees_claimed_sol ?? result.fees_sol ?? null,
+              // Vega honesty fix #1 (2026-06-23) — economics cross-check so the
+              // formula path refuses a fabricated ~-100% from present-but-zero SOL.
+              pnlPct: result.pnl_pct ?? null,
             });
             // Use the wallet/formula computation only if it actually produced a
             // figure; otherwise fall back to the ledger figure so notif == ledger

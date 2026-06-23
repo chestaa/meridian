@@ -1850,8 +1850,16 @@ export async function closePosition({ position_address, reason }) {
                 finalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
                 initialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
                 feesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
-                const nextWithdrawnSol = posEntry.allTimeWithdrawals?.total?.sol != null
+                // Vega honesty fix #1 (2026-06-23): present-but-zero SOL on a
+                // settling record → UNKNOWN (null) when USD contradicts a wipe,
+                // so the formula returns null (honest gap), not a fabricated -1×.
+                const rawWithdrawnSol = posEntry.allTimeWithdrawals?.total?.sol != null
                   ? parseFloat(posEntry.allTimeWithdrawals.total.sol) : null;
+                const usdNotWiped = (Number.isFinite(finalValueUsd) && finalValueUsd > 0)
+                  || (Number.isFinite(pnlPct) && pnlPct > -90);
+                const nextWithdrawnSol = (rawWithdrawnSol === 0 && usdNotWiped)
+                  ? null
+                  : rawWithdrawnSol;
                 const nextFeesSol = posEntry.allTimeFees?.total?.sol != null
                   ? parseFloat(posEntry.allTimeFees.total.sol) : null;
                 withdrawnSol = Number.isFinite(nextWithdrawnSol) ? nextWithdrawnSol : withdrawnSol;
@@ -1871,6 +1879,8 @@ export async function closePosition({ position_address, reason }) {
               solDeployed: tracked.amount_sol ?? null,
               solReceivedOnClose: Number.isFinite(withdrawnSol) ? withdrawnSol : null,
               feesClaimedSol: Number.isFinite(feesSol) ? feesSol : null,
+              finalValueUsd,
+              pnlPct,
             })
           : null;
 
@@ -1879,6 +1889,7 @@ export async function closePosition({ position_address, reason }) {
           pool: poolAddress,
           pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
           base_mint: livePosition?.base_mint || null,
+          peak_pnl_pct: tracked.peak_pnl_pct,
           strategy: tracked.strategy,
           bin_range: tracked.bin_range,
           bin_step: tracked.bin_step || null,
@@ -2129,8 +2140,19 @@ export async function closePosition({ position_address, reason }) {
               const nextFinalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
               const nextInitialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
               const nextFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
-              const nextWithdrawnSol = posEntry.allTimeWithdrawals?.total?.sol != null
+              // Vega honesty fix #1 (2026-06-23): a PRESENT-but-ZERO SOL
+              // withdrawal on a settling record makes the formula read ~-100%
+              // even when USD economics show the position did NOT wipe. Treat
+              // present-but-zero SOL as UNKNOWN (null) when USD contradicts a
+              // wipe (finalValueUsd > 0 or pnlPct > -90), so the formula returns
+              // null (honest gap) rather than a fabricated -1× deploy.
+              const rawWithdrawnSol = posEntry.allTimeWithdrawals?.total?.sol != null
                 ? parseFloat(posEntry.allTimeWithdrawals.total.sol) : null;
+              const usdNotWiped = (Number.isFinite(nextFinalValueUsd) && nextFinalValueUsd > 0)
+                || (Number.isFinite(nextPnlPct) && nextPnlPct > -90);
+              const nextWithdrawnSol = (rawWithdrawnSol === 0 && usdNotWiped)
+                ? null
+                : rawWithdrawnSol;
               const nextFeesSol = posEntry.allTimeFees?.total?.sol != null
                 ? parseFloat(posEntry.allTimeFees.total.sol) : null;
 
@@ -2184,6 +2206,8 @@ export async function closePosition({ position_address, reason }) {
             solDeployed: tracked.amount_sol ?? null,
             solReceivedOnClose: Number.isFinite(withdrawnSol) ? withdrawnSol : null,
             feesClaimedSol: Number.isFinite(feesSol) ? feesSol : null,
+            finalValueUsd,
+            pnlPct,
           })
         : null;
 
@@ -2192,6 +2216,7 @@ export async function closePosition({ position_address, reason }) {
         pool: poolAddress,
         pool_name: tracked.pool_name || poolMeta.name || poolAddress.slice(0, 8),
         base_mint: pool.lbPair.tokenXMint.toString(),
+        peak_pnl_pct: tracked.peak_pnl_pct,
         strategy: tracked.strategy,
         bin_range: tracked.bin_range,
         bin_step: tracked.bin_step || null,
