@@ -78,8 +78,13 @@ check("maxBundlePct unchanged",                            cfg?.maxBundlePct,   
 check("maxSniperPct unchanged",                            cfg?.maxSniperPct,         0.5);
 check("maxTop10Pct unchanged (base)",                      cfg?.maxTop10Pct,           60);
 check("liveOverrides.maxTop10Pct unchanged",               cfg?.liveOverrides?.maxTop10Pct, 55);
-check("liveOverrides.minOrganic (live overlay, tightened 75->72)", cfg?.liveOverrides?.minOrganic, 72);
-check("liveOverrides.minFeeActiveTvlRatio (live overlay, tightened 0.07->0.10)", cfg?.liveOverrides?.minFeeActiveTvlRatio, 0.1);
+// minOrganic HELD at 72: live probe 2026-06-24 showed org>=80 cuts the full live
+// gate to ZERO survivors (dormancy). FLAGGED to Bro; 80 NOT shipped silently.
+check("liveOverrides.minOrganic (HELD 72 — org>=80 = 0-pool dormancy on live probe)", cfg?.liveOverrides?.minOrganic, 72);
+check("liveOverrides.minVolatility (live overlay FLOOR, 3.0->3.25, 2026-06-24 entry-quality, funnel-survivable=3)", cfg?.liveOverrides?.minVolatility, 3.25);
+check("liveOverrides.minFeeActiveTvlRatio (live overlay, IL-coverage floor)", cfg?.liveOverrides?.minFeeActiveTvlRatio, 0.15);
+checkRange("liveOverrides.minVolatility in [3.0, 4.5] (FLOOR, NOT 3.5 dormancy)", cfg?.liveOverrides?.minVolatility, 3.0, 4.5);
+checkRange("liveOverrides.minOrganic in [60, 85] (stricter band, not funnel-killing 80+)", cfg?.liveOverrides?.minOrganic, 60, 85);
 check("maxPositions = 2 (Vega-validated 2-slot envelope)", cfg?.maxPositions,           2);
 
 // ─── 5. config.js propagation check ───────────────────────────
