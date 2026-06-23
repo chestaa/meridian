@@ -32,6 +32,7 @@ const { config } = await import("../config.js");
 
 const WSOL = "So11111111111111111111111111111111111111112";
 const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const JITOSOL = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
 const MEMECOIN = "9xyzMEMEcoinMintAddressNotWhitelistedDEADBEEF11";
 
 // Mock a Pool-Discovery /pools response wrapping a single detail row.
@@ -52,6 +53,24 @@ function bluechipDetail(overrides = {}) {
     fee_tvl_ratio: 0.04,
     volatility: 0.14,
     dlmm_params: { bin_step: 1 },
+    ...overrides,
+  };
+}
+
+// LST-SOL bluechip detail (the FLAGSHIP shape Draco flagged in paper-soak).
+// On-chain mint sort puts the LST on token_x (BASE) and wSOL on token_y (QUOTE) —
+// the OPPOSITE leg arrangement from SOL-USDC (where wSOL is token_x). $2.44M TVL.
+// This is the exact shape that must clear the maxTvl exemption, else the flagship
+// JitoSOL-SOL pool never deploys and the soak only ever tests the small USDC-SOL.
+function lstSolDetail(overrides = {}) {
+  return {
+    token_x: { address: JITOSOL }, // LST = base
+    token_y: { address: WSOL },    // wSOL = quote (the single-side-SOL deposit leg)
+    tvl: 2_440_000,                // flagship deep TVL >> $150k memecoin ceiling
+    fee_active_tvl_ratio: 0.04,
+    fee_tvl_ratio: 0.04,
+    volatility: 0.2,
+    dlmm_params: { bin_step: 4 },
     ...overrides,
   };
 }
@@ -106,6 +125,31 @@ installDetail(bluechipDetail({ tvl: 5_000_000 }));
   check("bluechip maxTvl EXEMPT — $5M deep pool → PASS", r.pass === true);
 }
 
+// ── (1b) FLAGSHIP LST-SOL shape (Draco paper-soak block repro) ──
+// JitoSOL-SOL $2.44M: LST=token_x(base), wSOL=token_y(quote). The maxTvl exemption
+// MUST resolve the pair as bluechip from this leg arrangement (base from args or the
+// detail's token_x, quote from the detail's token_y) and pass. Tested across the
+// arg shapes the deploy path can present so the exemption can never silently
+// fail-close on the flagship pool (→ block → soak only gets the small USDC-SOL).
+installDetail(lstSolDetail());
+{
+  // base_mint = JITOSOL (screening candidate base == token_x)
+  const r = await verify({ pool_address: "JITOSOL_SOL", base_mint: JITOSOL });
+  check("LST-SOL JitoSOL $2.44M (base_mint=JITOSOL) → PASS (maxTvl EXEMPT)", r.pass === true);
+}
+installDetail(lstSolDetail());
+{
+  // base_mint = WSOL (bot frames SOL as the deposited base) — both legs still whitelisted
+  const r = await verify({ pool_address: "JITOSOL_SOL", base_mint: WSOL });
+  check("LST-SOL JitoSOL $2.44M (base_mint=WSOL) → PASS (maxTvl EXEMPT)", r.pass === true);
+}
+installDetail(lstSolDetail());
+{
+  // NO base_mint in args → BOTH legs must resolve from the on-chain detail
+  const r = await verify({ pool_address: "JITOSOL_SOL" });
+  check("LST-SOL JitoSOL $2.44M (no base_mint, legs from detail) → PASS (maxTvl EXEMPT)", r.pass === true);
+}
+
 // gate-2 fee/TVL: bluechip floor 0.03 — 0.04 passes, 0.02 rejected
 installDetail(bluechipDetail({ fee_active_tvl_ratio: 0.02, fee_tvl_ratio: 0.02 }));
 {
@@ -140,6 +184,14 @@ installDetail(memecoinDetail({ tvl: 245_000 }));
 {
   const r = await verify({ pool_address: "POOL_MEME_DEEP", base_mint: MEMECOIN });
   check("non-whitelist + TVL $245k → REJECT (memecoin maxTvl, NOT exempt)", r.pass === false && /maxTvl/.test(r.reason));
+}
+// LEAK GUARD: a deep-TVL pool in the SAME leg arrangement as LST-SOL (non-whitelist
+// base on token_x, wSOL on token_y) must STILL be blocked. Proves the exemption keys
+// off the WHITELIST pair, not the leg shape — a $2.44M memecoin-SOL pool is NOT exempt.
+installDetail(lstSolDetail({ token_x: { address: MEMECOIN } }));
+{
+  const r = await verify({ pool_address: "MEME_SOL_DEEP", base_mint: MEMECOIN });
+  check("non-whitelist LST-shaped pool $2.44M → REJECT (memecoin maxTvl, exemption ≠ leg-shape)", r.pass === false && /maxTvl/.test(r.reason));
 }
 // non-whitelist low fee/TVL → memecoin floor 0.10 bites (not bluechip 0.03)
 installDetail(memecoinDetail({ tvl: 80_000, fee_active_tvl_ratio: 0.04, fee_tvl_ratio: 0.04 }));
