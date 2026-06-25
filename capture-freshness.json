@@ -1,13 +1,13 @@
 {
-  "ts": "2026-06-25T21:20:07Z",
-  "status": "stale",
+  "ts": "2026-06-25T22:20:08Z",
+  "status": "ok",
   "newest_tier1_file": "2026-06-25.jsonl",
-  "newest_tier1_age_sec": 3602,
+  "newest_tier1_age_sec": 3600,
   "newest_tier2_file": "2026-06-25.jsonl",
-  "newest_tier2_age_sec": 4443,
-  "today_tier1_rows": 14000,
+  "newest_tier2_age_sec": 827,
+  "today_tier1_rows": 15000,
   "api_reachable": false,
   "tier1_stale_threshold_sec": 7200,
   "tier2_stale_threshold_sec": 1800,
-  "reasons": ["tier2_stale_4443s_gt_1800s"]
+  "reasons": []
 }
