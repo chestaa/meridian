@@ -1,8 +1,8 @@
 {
-  "ts": "2026-06-25T08:19:35Z",
+  "ts": "2026-06-25T08:19:39Z",
   "status": "ok",
   "newest_tier1_file": "2026-06-25.jsonl",
-  "newest_tier1_age_sec": 33,
+  "newest_tier1_age_sec": 37,
   "newest_tier2_file": "none",
   "newest_tier2_age_sec": -1,
   "today_tier1_rows": 1000,
