@@ -1,7 +1,7 @@
 # Meridian TSMOM Paper-Soak timer — DAILY, once/day (TSMOM is slow).
 #
-# STAGED / DISABLED — enable only AFTER the one-shot test writes a real journal
-# entry (see meridian-tsmom-soak.service header).
+# Enable: `systemctl enable --now meridian-tsmom-soak.timer`.
+# Disable (reversible): `systemctl disable --now meridian-tsmom-soak.timer`.
 #
 # 00:30 UTC: after the UTC daily close settles, so the "latest daily close" the
 # runner pulls is the just-closed day, not a partial bar. Persistent=true so a

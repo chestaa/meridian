@@ -1,11 +1,14 @@
 # Meridian TSMOM Paper-Soak Freshness Guard (Draco/Ops — 18-day-stale lesson)
 #
-# STAGED / DISABLED — enable alongside the soak timer once the soak runner is
-# live (see meridian-tsmom-soak.service). Until the soak produces journal rows
-# this probe exits 0 (pre-launch is honestly "no alert", not a false stall).
+# Enable alongside the soak timer. NOTE: the soak logs its FIRST journal row only
+# at the first rebalance (~21 days after cold-open), so this guard tracks
+# TSMOM/v3-btc-long rows — until one exists it exits 0 (honest "no alert", not a
+# false stall). It will start meaningfully guarding once forward periods accrue.
+# To watch the soak STATE freshness sooner, point a future check at
+# tsmom/data/soak-v3-btc-long.json last_run_at instead (the daily heartbeat).
 #
 # Reads the shared journal, FAILS (exit 1 → OnFailure Telegram alert) if the
-# most-recent TSMOM entry is older than TSMOM_FRESH_MAX_DAYS (default 2).
+# most-recent TSMOM/v3-btc-long entry is older than TSMOM_FRESH_MAX_DAYS (default 2).
 # READ-ONLY: no money, no on-chain, no LLM, no writes.
 
 [Unit]

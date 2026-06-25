@@ -1,32 +1,26 @@
-# Meridian TSMOM Paper-Soak (Lyra B1 — BTC-only forward paper-soak)
+# Meridian TSMOM Paper-Soak (Lyra B1 — BTC-only forward paper-soak, v3-btc-long)
 #
-# ┌─ STAGED / DISABLED — DO NOT `systemctl enable` YET ───────────────────────┐
-# │ The forward paper-soak RUNNER does not exist on `main` yet. As of          │
-# │ 2026-06-25 the tsmom/ branch ships only the walk-forward BACKTEST harness   │
-# │ (tsmom-run.js) + the declared v3-btc-long config (tsmom/tsmom-variants.js,  │
-# │ still local/uncommitted). tsmom-run.js re-runs the SAME backtest over the   │
-# │ SAME cached history and would spam ~hundreds of journal entries per run —   │
-# │ it is NOT a daily "pull latest close → mark to market → append one row"     │
-# │ soak. DO NOT point ExecStart at tsmom-run.js.                               │
-# │                                                                             │
-# │ WIRE-UP when Lyra pushes the real soak runner:                              │
-# │   1. Replace the ExecStart placeholder below with her documented CLI        │
-# │      (exact script path + args — read it from the branch, do not assume).   │
-# │   2. Confirm ReadWritePaths still matches what she writes (journal +        │
-# │      tsmom/data). Add/remove paths to match her runner exactly.             │
-# │   3. Manual one-shot test FIRST (see below); only enable if a journal       │
-# │      entry is actually written/updated.                                     │
-# └─────────────────────────────────────────────────────────────────────────┘
+# Runs Lyra's tsmom/tsmom-paper-soak.js — exact CLI mirrored from her in-file
+# contract (lines 30-39). Each run: fetch latest BTC daily close (Yahoo) →
+# compute v3-btc-long signal with data <= latest CLOSED bar (no peek) → mark the
+# open paper position to market → on rebalance (>=21d) append ONE proxy period to
+# the journal. IDEMPOTENT: re-running same UTC day only refreshes the MTM snapshot
+# (date-guarded on the latest closed bar) — safe for a daily timer, no double-log.
 #
-# Pattern mirrors meridian-intel-digest.service (oneshot + OnFailure notify) with
-# the requested low-priority + read-only hardening on top.
+# Verified one-shot on VPS 2026-06-25: action=cold_open, BTC closed bar 2026-06-24
+# @ $60995, signal FLAT weight=0 (trailing-252d −44.94% → cash), state written to
+# tsmom/data/soak-v3-btc-long.json. First JOURNAL row defers to the first rebalance
+# (~21 days) — cold-open correctly logs no period. Journal-append path itself
+# proven separately (backtest je_..._y1oh27).
 #
 # READ-ONLY re: money — NO money path, NO on-chain, NO real orders, NO LLM cost.
-# Pure data fetch (Yahoo daily close) + journal.jsonl append.
+# Pure data fetch + state/journal append.
 #
-# Manual one-shot test (run BEFORE enabling the timer):
+# Manual one-shot test:
 #   systemctl start meridian-tsmom-soak.service
-#   tail -n 3 /opt/meridian/journal.jsonl    # confirm a fresh TSMOM row appended
+#   node /opt/meridian/tsmom/tsmom-paper-soak.js status   # inspect state, no write
+#
+# Reversible: `systemctl disable --now meridian-tsmom-soak.timer`.
 
 [Unit]
 Description=Meridian TSMOM Paper-Soak (Lyra B1 — BTC-only, PAPER/PROXY, no money path)
@@ -43,16 +37,8 @@ WorkingDirectory=/opt/meridian
 Nice=10
 IOSchedulingClass=idle
 
-# === PLACEHOLDER — replace with Lyra's documented forward-soak CLI ===========
-# Expected shape (per tsmom/tsmom-variants.js v3-btc-long declaration):
-#   pull latest BTC daily close → compute TSMOM signal → mark paper position to
-#   market → append ONE journal entry (experiment_id=TSMOM, config_version=
-#   v3-btc-long, unit=proxy, is_realized=false).
-# Until that script exists this unit MUST stay disabled.
-ExecStart=/bin/echo "TSMOM soak runner not yet shipped — see header. Replace ExecStart with Lyra CLI."
-# Example once shipped (VERIFY against her actual file/args before using):
-#   ExecStart=/usr/local/bin/node /opt/meridian/tsmom/tsmom-soak.js BTC
-# ============================================================================
+# Lyra's documented CLI: `run` = fetch latest, mark/rebalance, log to journal.
+ExecStart=/usr/local/bin/node /opt/meridian/tsmom/tsmom-paper-soak.js run
 
 Environment=NODE_ENV=production
 # v3-btc-long is the pre-registered BTC-only hypothesis (NOT a curve-fit).

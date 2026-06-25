@@ -15,8 +15,34 @@
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 
 const EXPERIMENT_ID = "TSMOM";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// The soak writes last_run_at to its state file on EVERY run (cold_open / mark /
+// rebalance / noop) — the TRUE daily heartbeat. The journal only gets a row at a
+// rebalance (~every 21d), so the state file is the right primary stall signal
+// (works from day 1). Journal recency is a secondary corroboration.
+function soakStateFile() {
+  if (process.env.TSMOM_SOAK_STATE) return path.resolve(process.env.TSMOM_SOAK_STATE);
+  const dir = process.env.TSMOM_DATA_DIR
+    ? path.resolve(process.env.TSMOM_DATA_DIR)
+    : path.resolve(__dirname, "..", "tsmom", "data");
+  return path.join(dir, "soak-v3-btc-long.json");
+}
+
+function stateLastRunMs() {
+  const f = soakStateFile();
+  if (!fs.existsSync(f)) return { exists: false, file: f };
+  try {
+    const s = JSON.parse(fs.readFileSync(f, "utf8"));
+    const ms = s.last_run_at ? Date.parse(s.last_run_at) : NaN;
+    return { exists: true, file: f, ms: Number.isFinite(ms) ? ms : null };
+  } catch {
+    return { exists: true, file: f, ms: null, corrupt: true };
+  }
+}
 const MAX_DAYS = Number(process.env.TSMOM_FRESH_MAX_DAYS || 2);
 // The forward soak logs config_version=v3-btc-long. Filter to it so a stalled
 // soak is NOT masked by an old v2-deephistory BACKTEST row (which is re-runnable
@@ -52,28 +78,41 @@ function latestTsmomTs(file) {
 }
 
 function main() {
-  const file = journalFile();
-  const r = latestTsmomTs(file);
+  // PRIMARY signal: state-file last_run_at (daily heartbeat, works from day 1).
+  const st = stateLastRunMs();
 
-  // PRE-LAUNCH HONESTY: before the soak ever runs there are no TSMOM rows. That
-  // is NOT a stall — do not page. Exit 0 with a clear note. Once the soak runs
-  // once, the absence of a recent row IS a stall.
-  if (!r.found) {
-    console.log(`[tsmom-fresh] OK (no alert): ${r.reason} — soak not yet producing rows. file=${file}`);
+  // PRE-LAUNCH HONESTY: no state file yet => soak has never run. Not a stall —
+  // don't page (the timer may simply not be enabled yet).
+  if (!st.exists) {
+    console.log(`[tsmom-fresh] OK (no alert): no soak state file yet — soak not yet run. file=${st.file}`);
     process.exit(0);
   }
-
-  const ageDays = (Date.now() - r.ms) / 86400000;
-  const lastIso = new Date(r.ms).toISOString();
-  if (ageDays > MAX_DAYS) {
+  if (st.ms == null) {
     console.error(
-      `[tsmom-fresh] STALE: last TSMOM journal entry ${lastIso} is ${ageDays.toFixed(1)}d old ` +
-      `(> ${MAX_DAYS}d). The daily paper-soak may have stalled. Check ` +
+      `[tsmom-fresh] STALE: soak state ${st.file} ${st.corrupt ? "is corrupt" : "has no last_run_at"} — ` +
+      `the daily paper-soak may have stalled or never completed a run. Check ` +
       `journalctl -u meridian-tsmom-soak.service.`
     );
     process.exit(1);
   }
-  console.log(`[tsmom-fresh] OK: last TSMOM entry ${lastIso} (${ageDays.toFixed(1)}d old, <= ${MAX_DAYS}d).`);
+  const runAgeDays = (Date.now() - st.ms) / 86400000;
+  const runIso = new Date(st.ms).toISOString();
+  if (runAgeDays > MAX_DAYS) {
+    console.error(
+      `[tsmom-fresh] STALE: soak last_run_at ${runIso} is ${runAgeDays.toFixed(1)}d old (> ${MAX_DAYS}d). ` +
+      `The daily paper-soak has stopped running. Check journalctl -u meridian-tsmom-soak.service ` +
+      `and systemctl status meridian-tsmom-soak.timer.`
+    );
+    process.exit(1);
+  }
+
+  // SECONDARY (informational): journal recency for the soak config.
+  const r = latestTsmomTs(journalFile());
+  const jrnNote = r.found
+    ? `last v3-btc-long journal row ${new Date(r.ms).toISOString()} (rebalances are ~21d apart)`
+    : `no v3-btc-long journal rows yet (first logs at first rebalance, ~21d after cold-open)`;
+
+  console.log(`[tsmom-fresh] OK: soak ran ${runIso} (${runAgeDays.toFixed(1)}d ago, <= ${MAX_DAYS}d). ${jrnNote}.`);
   process.exit(0);
 }
 
