@@ -1,0 +1,13 @@
+{
+  "ts": "2026-06-25T08:12:23Z",
+  "status": "stale",
+  "newest_full_file": "none",
+  "newest_full_age_sec": -1,
+  "newest_watchlist_file": "none",
+  "newest_watchlist_age_sec": -1,
+  "today_full_rows": 0,
+  "api_reachable": false,
+  "full_stale_threshold_sec": 7200,
+  "watchlist_stale_threshold_sec": 1800,
+  "reasons": ["today_full_missing_or_empty:/var/lib/meridian-capture/capture-full-2026-06-25.jsonl","no_full_capture_file_at_all"]
+}
