@@ -36,6 +36,8 @@ import { reconcile } from "./btc-reconcile.js";
 import { placeBtcOrder } from "./btc-order.js";
 import { loadPosition, savePosition, applyFill, coldPosition } from "./btc-position.js";
 import { V3_BTC_LONG_PARAMS } from "./tsmom-variants.js";
+import { recordEquitySnapshot, resolveBaselineEquity } from "./btc-equity-baseline.js";
+import { resolveCbbtcPrice } from "./btc-price-oracle.js";
 
 // Actions from decideSoak that represent an actual position change. Everything
 // else (mark / noop / insufficient / error) is a NO-ORDER outcome.
@@ -132,9 +134,14 @@ export function planFromDecision(decision, { currentEquityUsd, currentCbbtcUnits
  * @param {object} ctx
  * @param {Array}  ctx.rows                BTC daily bars (from the soak's history)
  * @param {number} ctx.currentEquityUsd    equity for sizing (USDC + cbBTC mark)
- * @param {number} [ctx.windowStartEquity] 24h-ago equity for the circuit (defaults to currentEquity → 0% dd)
+ * @param {number} [ctx.windowStartEquity] 24h-ago equity for the circuit. If OMITTED,
+ *                                         resolved from the PERSISTED equity-baseline
+ *                                         store (fail-closed to HALT if missing/stale).
+ *                                         Pass an explicit number only for tests.
  * @param {number} [ctx.cbbtcPriceUsd]     current cbBTC price (for slippage expectation)
- * @param {object} [ctx.deps]              injected {reconcileFn, placeOrderFn, getBalances} for tests
+ * @param {object} [ctx.deps]              injected {reconcileFn, placeOrderFn, getBalances,
+ *                                         resolveBaselineFn, recordSnapshotFn} for tests
+ * @param {boolean} [ctx.recordSnapshot=true] record currentEquity into the baseline store
  * @param {string} [ctx.dryRunRaw]         injected DRY_RUN
  */
 export async function executeStep({
@@ -144,10 +151,32 @@ export async function executeStep({
   cbbtcPriceUsd,
   soakState = undefined,
   deps = {},
+  recordSnapshot = true,
   dryRunRaw = process.env.DRY_RUN,
 } = {}) {
   // 0) DRY_RUN must be unambiguous (throws on bad value before anything else).
   const isDryRun = assertDryRunGate(dryRunRaw);
+
+  // 0a) Record an equity snapshot for the rolling 24h baseline (idempotent-ish: one
+  //     append per run). Done BEFORE the circuit check so the store always advances,
+  //     even on a HALT run. Refused silently on non-finite equity (no bogus snapshot).
+  if (recordSnapshot) {
+    const recordFn = deps.recordSnapshotFn || recordEquitySnapshot;
+    try { recordFn(currentEquityUsd); } catch { /* never crash the money path on a snapshot write */ }
+  }
+
+  // 0b) Resolve an INDEPENDENT cbBTC price for the slippage check (gap #3). If the
+  //     caller passed an explicit cbbtcPriceUsd (tests / operator), honor it; else
+  //     resolve from the oracle (Jupiter price v3 → cached BTC close → null). A null
+  //     here is fail-closed on the LIVE path below (refuse rather than self-reference
+  //     the swap quote). DRY-RUN proceeds but flags price_unavailable in the plan.
+  let priceUsd = cbbtcPriceUsd;
+  let priceInfo = null;
+  if (priceUsd == null) {
+    const priceFn = deps.resolvePriceFn || resolveCbbtcPrice;
+    priceInfo = await priceFn();
+    priceUsd = priceInfo.ok ? priceInfo.price : null;
+  }
 
   // 1) WRAP decideSoak — the SAME pure decision the paper soak uses. We never
   //    recompute signal logic here.
@@ -163,20 +192,34 @@ export async function executeStep({
   const plan = planFromDecision(decision, {
     currentEquityUsd,
     currentCbbtcUnits,
-    cbbtcPriceUsd,
+    cbbtcPriceUsd: priceUsd,
   });
 
-  // Re-evaluate the circuit with the REAL 24h baseline (planFromDecision's gate used
-  // current=window which is 0% dd; the true breaker needs the 24h-ago equity).
+  // Re-evaluate the circuit with the REAL 24h baseline. planFromDecision's gate used
+  // current=window (0% dd) only for SIZING; the true breaker needs the 24h-ago equity.
+  // When windowStartEquity is not explicitly supplied (production), resolve it from
+  // the PERSISTED baseline store. FAIL-CLOSED: a missing/stale baseline returns null,
+  // which checkDailyLossCircuit treats as "equity_unknown_fail_closed_halt" → HALT.
+  // We do NOT fall back to currentEquity (that was the bug — a 0% dd that can't trip).
+  let baselineEquity;
+  let baselineInfo = null;
+  if (windowStartEquity != null) {
+    baselineEquity = windowStartEquity; // explicit (tests / operator override)
+  } else {
+    const resolveFn = deps.resolveBaselineFn || resolveBaselineEquity;
+    baselineInfo = resolveFn();
+    baselineEquity = baselineInfo.equityUsd; // null => circuit fail-closed HALT
+  }
   const circuitGate = preTradeGate({
     dryRunRaw,
-    windowStartEquity: windowStartEquity != null ? windowStartEquity : currentEquityUsd,
+    windowStartEquity: baselineEquity,
     currentEquity: currentEquityUsd,
     rawWeight: decision?.sig?.weight,
   });
   if (!circuitGate.allow) {
-    log("btc_exec", `NO ORDER — gate halt at ${circuitGate.stage}: ${circuitGate.reason}`);
-    return { ordered: false, isDryRun, action: decision.action, reason: circuitGate.reason, stage: circuitGate.stage, decision: brief(decision), plan };
+    log("btc_exec", `NO ORDER — gate halt at ${circuitGate.stage}: ${circuitGate.reason}` +
+      (baselineInfo ? ` (baseline age ${baselineInfo.age_hours}h, ${baselineInfo.reason || "ok"})` : ""));
+    return { ordered: false, isDryRun, action: decision.action, reason: circuitGate.reason, stage: circuitGate.stage, baseline: baselineInfo, decision: brief(decision), plan };
   }
 
   if (!plan.order) {
@@ -191,11 +234,22 @@ export async function executeStep({
       input_mint: plan.in_mint, output_mint: plan.out_mint, amount: plan.amount,
       expectedOut: plan.expectedOut, dryRunRaw: "true",
     });
-    log("btc_exec", `DRY-RUN plan: ${plan.side} ${plan.amount} (${plan.action}, weight ${plan.targetWeight}, notional $${plan.targetNotional})`);
-    return { ordered: false, isDryRun: true, action: decision.action, plan, intended, decision: brief(decision) };
+    const priceAvail = priceUsd != null;
+    log("btc_exec", `DRY-RUN plan: ${plan.side} ${plan.amount} (${plan.action}, weight ${plan.targetWeight}, notional $${plan.targetNotional})` +
+      (priceAvail ? ` @ indep price $${priceUsd} (${priceInfo?.source || "explicit"})` : ` ⚠ price_unavailable (LIVE would REFUSE)`));
+    return { ordered: false, isDryRun: true, action: decision.action, plan, intended, price: priceInfo, priceAvailable: priceAvail, decision: brief(decision) };
   }
 
   // ── LIVE PATH (DRY_RUN=false only) ───────────────────────────────────────────
+  // 4b) INDEPENDENT-PRICE GUARD (gap #3, fail-closed): never trade the LIVE money
+  //     path without an independent slippage anchor. A null oracle would force
+  //     btc-order to self-reference its own quote (slippage 0 by construction) — that
+  //     is a slippage check that can't catch a bad route. Refuse instead.
+  if (priceUsd == null) {
+    log("btc_exec", `NO ORDER — independent price unavailable (${priceInfo?.reason || "no_price"}); refusing LIVE trade (fail-closed)`);
+    return { ordered: false, isDryRun: false, action: decision.action, reason: "independent_price_unavailable_fail_closed", halted: true, price: priceInfo, plan };
+  }
+
   // 5) Reconcile book vs chain FIRST. Drift => halt, no order.
   const reconcileFn = deps.reconcileFn || reconcile;
   const rec = await reconcileFn({ book, getBalances: deps.getBalances, alert: true });
@@ -224,7 +278,7 @@ export async function executeStep({
       out_mint: plan.out_mint,
       in_amt: plan.amount,
       out_amt: order.realizedOut,
-      price_usd: cbbtcPriceUsd != null ? Number(cbbtcPriceUsd) : null,
+      price_usd: priceUsd != null ? Number(priceUsd) : null,
       signature: order.signature,
     });
     savePosition(newBook);

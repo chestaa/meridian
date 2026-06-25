@@ -15,6 +15,7 @@ async function rejects(fn, msg) {
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "btc-exec-"));
 process.env.BTC_TSMOM_STATE = path.join(tmp, "pos.json");
+process.env.BTC_TSMOM_EQUITY_BASELINE = path.join(tmp, "baseline.json");
 
 const X = await import("../tsmom/btc-executor.js");
 const { decideSoak } = await import("../tsmom/tsmom-paper-soak.js");
@@ -66,8 +67,8 @@ await rejects(
 let placeCalls = 0;
 const dryPlace = async (p) => { placeCalls++; ok(p.dryRunRaw === "true", "dry-run forwards dryRunRaw=true to order"); return { success: true, placed: false, dry_run: true, intended: p }; };
 const dryRes = await X.executeStep({
-  rows: upRows, currentEquityUsd: 250, cbbtcPriceUsd: 60000,
-  deps: { placeOrderFn: dryPlace }, dryRunRaw: "true",
+  rows: upRows, currentEquityUsd: 250, windowStartEquity: 250, cbbtcPriceUsd: 60000,
+  recordSnapshot: false, deps: { placeOrderFn: dryPlace }, dryRunRaw: "true",
 });
 ok(!dryRes.ordered && dryRes.isDryRun, "dry-run: ordered=false");
 ok(dryRes.intended && dryRes.intended.dry_run, "dry-run: intended order returned");
@@ -78,8 +79,8 @@ let orderCalls = 0;
 const spyPlace = async () => { orderCalls++; return { success: true, placed: true, signature: "S", realizedOut: 0.004 }; };
 const driftRec = async () => ({ ok: false, halt: true, reason: "drift_cbBTC" });
 const liveDrift = await X.executeStep({
-  rows: upRows, currentEquityUsd: 250, cbbtcPriceUsd: 60000,
-  deps: { reconcileFn: driftRec, placeOrderFn: spyPlace }, dryRunRaw: "false",
+  rows: upRows, currentEquityUsd: 250, windowStartEquity: 250, cbbtcPriceUsd: 60000,
+  recordSnapshot: false, deps: { reconcileFn: driftRec, placeOrderFn: spyPlace }, dryRunRaw: "false",
 });
 ok(!liveDrift.ordered && liveDrift.halted && liveDrift.reason.startsWith("reconcile_"), "live: reconcile drift => HALT");
 ok(orderCalls === 0, "live: NO order placed when reconcile halts (money path blocked)");
