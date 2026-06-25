@@ -35,6 +35,30 @@ function forwardReturn(closes, a, b) {
   return pb / pa - 1;
 }
 
+// Regime classification window (trading days) and band, exported for reuse/tests.
+export const REGIME_WINDOW_DAYS = 90; // ~3 months trailing trend
+export const REGIME_BAND = 0.10; // +/-10% over 90d => trending; inside => chop/whipsaw
+
+// Ex-ante regime label for a rebalance at index `idx`, using ONLY a trailing
+// window ending at idx (close[idx-W..idx]). NEVER peeks at the forward window —
+// this is a legitimate "what kind of market were we in WHEN we placed the trade"
+// tag, the question Bro asked. We deliberately do NOT use the TSMOM signal's own
+// lookback as the regime label (that would just re-encode the signal); a SHORTER
+// 90d trend is the macro context the 252d signal is being judged inside.
+//   UPTREND  : trailing 90d return >= +BAND
+//   DOWNTREND: trailing 90d return <= -BAND
+//   CHOP     : within +/-BAND (whipsaw / range — momentum's classic weak spot)
+//   UNKNOWN  : insufficient trailing data (skip in regime split, never fabricate)
+export function regimeAt(closes, idx, windowDays = REGIME_WINDOW_DAYS, band = REGIME_BAND) {
+  const trail = lookbackReturn(closes, idx, windowDays);
+  if (trail === null) return { regime: "UNKNOWN", trail: null };
+  let regime;
+  if (trail >= band) regime = "UPTREND";
+  else if (trail <= -band) regime = "DOWNTREND";
+  else regime = "CHOP";
+  return { regime, trail: +trail.toFixed(6) };
+}
+
 // Run the walk-forward backtest for one asset.
 // Returns { asset, params, periods:[...], equityCurve:[...], metrics:{...} }
 export function backtestAsset(history, params = DEFAULT_PARAMS) {
@@ -55,6 +79,9 @@ export function backtestAsset(history, params = DEFAULT_PARAMS) {
     // Strategy return over the window = position weight * asset move.
     const stratRet = s.weight * assetRet;
 
+    // Ex-ante regime tag (trailing-only, no peek at the forward window).
+    const reg = regimeAt(closes, s.idx);
+
     periods.push({
       entry_date: s.date,
       exit_date: dates[endIdx],
@@ -64,11 +91,14 @@ export function backtestAsset(history, params = DEFAULT_PARAMS) {
       asset_return: +assetRet.toFixed(6), // forward move (out-of-sample)
       period_return: +stratRet.toFixed(6), // what the strategy earned
       hold_days: endIdx - s.idx,
+      regime: reg.regime, // UPTREND | DOWNTREND | CHOP | UNKNOWN (ex-ante)
+      regime_trail_ret: reg.trail,
     });
   }
 
   const metrics = computeBacktestMetrics(periods, p);
   const equityCurve = buildEquityCurve(periods);
+  const regimeSplit = computeRegimeSplit(periods);
 
   return {
     asset: history.asset,
@@ -81,7 +111,38 @@ export function backtestAsset(history, params = DEFAULT_PARAMS) {
     periods,
     equityCurve,
     metrics,
+    regimeSplit,
   };
+}
+
+// Split per-period returns by ex-ante regime and summarize each bucket.
+// Pure arithmetic — verdict-grade stats are applied downstream by journal-stats
+// so the n>=10 + |t|>=2 gate is identical to everything else.
+export function computeRegimeSplit(periods) {
+  const buckets = { UPTREND: [], DOWNTREND: [], CHOP: [], UNKNOWN: [] };
+  for (const x of periods) (buckets[x.regime] || buckets.UNKNOWN).push(x);
+  const out = {};
+  for (const [regime, ps] of Object.entries(buckets)) {
+    const rets = ps.map((x) => x.period_return).filter((x) => Number.isFinite(x));
+    const n = rets.length;
+    if (!n) {
+      out[regime] = { n: 0 };
+      continue;
+    }
+    const mean = rets.reduce((a, b) => a + b, 0) / n;
+    const sd = n > 1 ? Math.sqrt(rets.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1)) : 0;
+    const wins = rets.filter((x) => x > 0).length;
+    out[regime] = {
+      n,
+      mean_period_return: +mean.toFixed(6),
+      sd_period_return: +sd.toFixed(6),
+      win_rate_pct: +((wins / n) * 100).toFixed(2),
+      long: ps.filter((x) => x.signal > 0).length,
+      short: ps.filter((x) => x.signal < 0).length,
+      flat: ps.filter((x) => x.signal === 0).length,
+    };
+  }
+  return out;
 }
 
 // Per-period return based metrics. Sharpe + maxDD honest.

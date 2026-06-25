@@ -21,12 +21,12 @@ mechanics faithfully:
 
 | File | Role |
 |------|------|
-| `ohlcv-ingest.js` | Daily CLOSE history for BTC/ETH/SOL from CoinGecko free API → local JSON cache |
+| `ohlcv-ingest.js` | Daily history for BTC/ETH/SOL. **Default source = Yahoo Finance deep daily (multi-year, true OHLC)**; `TSMOM_SOURCE=coingecko` falls back to the 1yr close-only source |
 | `tsmom-signal.js` | Mechanical signal: lookback sign + vol-scaled weight (params configurable) |
-| `tsmom-backtest.js` | Walk-forward / out-of-sample runner; Sharpe, drawdown, win-rate, expectancy |
-| `tsmom-run.js` | Orchestrate: backtest → honest stats verdict → log to journal (experiment_id=TSMOM) |
+| `tsmom-backtest.js` | Walk-forward / out-of-sample runner; Sharpe, drawdown, win-rate, expectancy + **ex-ante regime split** (UPTREND/DOWNTREND/CHOP) |
+| `tsmom-run.js` | Orchestrate: backtest → honest stats verdict (overall + per-regime) → log to journal (experiment_id=TSMOM) |
 | `data/` | Cached daily history (snapshot, reproducible via ingest) |
-| `../scripts/test-tsmom.js` | 24 deterministic unit tests (no network) |
+| `../scripts/test-tsmom.js` | 38 deterministic unit tests (no network) |
 
 ## Usage
 
@@ -42,21 +42,45 @@ TSMOM_LOOKBACK=180 TSMOM_REBALANCE=10 node tsmom/tsmom-run.js
 TSMOM_NO_LOG=1 node tsmom/tsmom-run.js              # dry compute, no journal write
 ```
 
-## HONEST DATA LIMITS (read this before trusting any number)
+## DATA SOURCES (read this before trusting any number)
 
-CoinGecko **free** tier:
+### v2 default: Yahoo Finance deep daily (multi-year, true OHLC)
 
-1. **CLOSE only, not true OHLC.** The free `market_chart` endpoint returns
-   `[ts, price]` spot points. open/high/low are stored as `null`. TSMOM is
-   close-to-close so this is sufficient — but we do NOT pretend we have OHLC.
-2. **~365 days of daily depth.** The free key truncates history to ~1 year.
-   With a 252-day lookback this leaves only ~113 post-warmup days = **~6
-   monthly rebalances per asset.** This is THIN for a 12-month strategy.
-3. **Final row may be a partial (live snapshot) day** — flagged in warnings.
-4. **Rate-limited** (~5-15 calls/min). We space fetches politely.
+Pulled via `period1`/`period2` Unix-second windows (`range=max` silently
+downsamples to weekly — only period bounds give true 1-day bars). Verified
+depth (2026-06-25 ingest):
 
-These limits are stamped into every saved data file (`warnings[]`) and surfaced
-in the backtest report. A missing day is a missing day — we never fabricate.
+| Asset | Rows | Span | Years |
+| --- | --- | --- | --- |
+| BTC | 4300 | 2014-09-17 → 2026-06-25 | 11.8 |
+| ETH | 3151 | 2017-11-09 → 2026-06-25 | 8.6 |
+| SOL | 2268 | 2020-04-10 → 2026-06-25 | 6.2 |
+
+Zero null closes. Covers 2017 bull, 2018 bear, 2019 chop, 2020 COVID crash,
+2021 bull, 2022 bear, 2023-25 cycle — **multi-regime**, which is the whole point.
+
+**Why Yahoo and not an exchange klines API:** every centralized-exchange klines
+endpoint (Binance, Binance.US, Coinbase, Kraken, Bybit, OKX) is **cert-injection
+blocked** from this environment — `ERR_TLS_CERT_ALTNAME_INVALID`, a TLS-MITM on
+exchange domains (the geo/ISP block a teammate hit). CoinGecko `days=max` now
+needs a paid key (error 10012); CryptoCompare needs a key; Coinpaprika free caps
+at 1yr. Yahoo is the one free deep source reachable + uncensored here. If Yahoo
+is ever blocked too, the ingester reports the gap — it never fabricates prices.
+
+### v1 fallback: CoinGecko free (`TSMOM_SOURCE=coingecko`)
+
+CLOSE-only, ~365d depth cap → ~6 monthly rebalances/asset (THIN). Kept as a
+reachable fallback; not the validation source. A missing day is a missing day.
+
+## Regime split (the B1 question)
+
+Each held-out period is tagged with an **ex-ante** regime — the sign+magnitude of
+the trailing **90-day** return *at entry* (UPTREND ≥ +10%, DOWNTREND ≤ −10%, else
+CHOP). This is trailing-only (proven by a no-peek test: the label is invariant to
+future closes) and deliberately SHORTER than the 252d signal lookback, so it labels
+the macro context the signal trades *inside*. The per-regime verdict uses the same
+`computeStats` n≥10 / |t|≥2 gate. This is how we tell a real cross-regime edge from
+a one-off "short the bear" artifact.
 
 ## Anti-overfitting discipline
 
@@ -68,22 +92,35 @@ in the backtest report. A missing day is a missing day — we never fabricate.
 - Verdict via `journal-stats.computeStats`: expectancy + t-stat + the n≥10 / |t|≥2
   noise gate. A green equity curve is NOT an edge claim.
 
-## Honest read (v1, window 2025-06-26 → 2026-06-25)
+## Honest read — v2-deephistory (multi-year, multi-regime)
 
-The window is a **single monotonic bear regime** (BTC −43%, ETH −32%, SOL −52%
-over the year). TSMOM correctly read negative trailing momentum and went short
-every period; shorting a falling market produced positive sim returns. But:
+Re-run over the full Yahoo daily history (per-asset n now 96–193 held-out,
+non-overlapping monthly periods spanning ~6–12 yr). The v1 single-bear-leg
+artifact is gone; the picture is now mixed and honest:
 
-- **n=6 periods/asset → THIN.** The journal verdict is THIN/UNPROVEN, not edge.
-- **Zero regime diversity.** No uptrend, no whipsaw, no regime transition in the
-  data we can get for free. The "edge" is essentially one bet (short crypto in a
-  bear year) sampled a handful of overlapping-leg times; one period (May→Jun)
-  drives most of the return.
-- The POOLED n=18 EDGE_POSITIVE read is a **false-confidence trap** — 3 assets ×
-  6 periods are highly correlated (same macro leg), NOT 18 independent samples.
-  Per-asset n=3 in the journal correctly returns THIN despite t=38.
+| Asset | n | overall verdict | t | UPTREND | DOWNTREND | CHOP |
+| --- | --- | --- | --- | --- | --- | --- |
+| BTC | 193 | **EDGE_POSITIVE** | 4.14 | EDGE+ (t 3.36) | NOISE (t 1.17) | EDGE+ (t 2.17) |
+| ETH | 138 | NOISE | 0.14 | NOISE | NOISE | NOISE (neg) |
+| SOL | 96 | NOISE | 1.40 | NOISE (t 1.88) | NOISE | NOISE |
 
-**Verdict: B1's mechanics are sound and now measurable, but it is NOT validated.**
-Free-API history is too short and too regime-homogeneous to distinguish edge from
-"short the 2025-26 bear." Next step to honestly test it: a longer daily history
-(multi-year, multiple regimes) — which requires a paid/alternate data source.
+Pooled by regime (all assets — correlated, indicative only): UPTREND n=197 t=4.11
+EDGE_POSITIVE; DOWNTREND n=146 t=0.31 NOISE; CHOP n=84 t=1.22 NOISE.
+
+**Key inversions vs the v1 hypothesis:**
+
+1. The edge is **NOT a bear-short artifact.** DOWNTREND is the *weakest* regime
+   (NOISE everywhere). The signal that carries BTC is the LONG side in UPTREND +
+   CHOP. With real regime diversity, "short the bear" does not survive.
+2. **Edge is asset-specific, not universal.** Only BTC clears the bar. ETH is flat
+   over 8.6yr (and negative in chop — slow whipsaw bleed). SOL leans positive but
+   stays NOISE at n=96.
+3. The pooled EDGE_POSITIVE (t=3.58) is still flagged as a correlation caveat —
+   BTC dominates it. Per-asset is primary.
+
+**Verdict: B1 is PARTIALLY VALIDATED — BTC only, and contingent on uptrend/chop,
+not the bear short.** Mechanics are sound and now tested against real regimes.
+This is NOT a green light to deploy a 3-asset TSMOM book: 2 of 3 majors show no
+edge. A BTC-only, long-biased variant is the honest hypothesis to carry forward —
+logged as its own `config_version`, paper-soaked before any capital. Still proxy /
+`is_realized=false`; nothing here is realized money.

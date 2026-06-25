@@ -52,12 +52,128 @@ export const MAJORS = {
   SOL: "solana",
 };
 
+// Yahoo Finance symbols (deep daily history, true OHLC, free, no key).
+// Verified reachable + uncensored from this environment (2026-06-25) while
+// EVERY centralized-exchange klines API (Binance, Binance.US, Coinbase, Kraken,
+// Bybit, OKX) is cert-injection blocked here: ERR_TLS_CERT_ALTNAME_INVALID — a
+// TLS-MITM on exchange domains (the geo/ISP block a teammate hit). CoinGecko's
+// free `days=max` now requires a paid key (error 10012); CryptoCompare needs a
+// key; Coinpaprika free is capped to 1yr. Yahoo is the one free deep source
+// reachable here, so it is the v2 default. NEVER fabricate — if Yahoo is also
+// blocked one day, we report the gap, we do not invent prices.
+export const YAHOO_SYMBOLS = {
+  BTC: "BTC-USD",
+  ETH: "ETH-USD",
+  SOL: "SOL-USD",
+};
+const YAHOO_BASE =
+  process.env.YAHOO_BASE || "https://query1.finance.yahoo.com/v8/finance/chart";
+
 const CG_BASE = process.env.COINGECKO_BASE || "https://api.coingecko.com/api/v3";
 // Optional demo/pro key (still free tier behavior for demo keys).
 const CG_KEY = process.env.COINGECKO_API_KEY || null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ── DEEP daily history from Yahoo Finance (TRUE OHLC, multi-year) ────────
+// Returns the same shape as fetchDailyHistory so the backtest is source-agnostic.
+// Pulls the FULL daily series from `since` (default well before all inceptions)
+// to now via period1/period2 Unix seconds. `range=max` silently downsamples to
+// weekly on Yahoo — period1/period2 is the only way to get true 1-day bars.
+export async function fetchDailyHistoryYahoo(asset, { since = 1262304000 } = {}) {
+  const sym = YAHOO_SYMBOLS[asset];
+  if (!sym) throw new Error(`unknown asset ${asset}; known: ${Object.keys(YAHOO_SYMBOLS).join(",")}`);
+
+  const p2 = Math.floor(Date.now() / 1000);
+  const url = new URL(`${YAHOO_BASE}/${sym}`);
+  url.searchParams.set("interval", "1d");
+  url.searchParams.set("period1", String(since));
+  url.searchParams.set("period2", String(p2));
+
+  const warnings = [];
+  let json;
+  try {
+    const res = await fetch(url, {
+      headers: { accept: "application/json", "user-agent": "Mozilla/5.0 (meridian-tsmom)" },
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status} ${res.statusText} — ${body.slice(0, 200)}`);
+    }
+    json = await res.json();
+  } catch (e) {
+    return {
+      asset,
+      source: "yahoo-finance",
+      requested_days: null,
+      rows: [],
+      gaps: [],
+      warnings: [`FETCH FAILED: ${e.cause?.code || e.name}: ${e.message}`],
+      ok: false,
+    };
+  }
+
+  const result = json.chart?.result?.[0];
+  const ts = result?.timestamp || [];
+  const q = result?.indicators?.quote?.[0] || {};
+  if (!ts.length) {
+    return {
+      asset,
+      source: "yahoo-finance",
+      requested_days: null,
+      rows: [],
+      gaps: [],
+      warnings: ["EMPTY: Yahoo returned no timestamps"],
+      ok: false,
+    };
+  }
+
+  // One row per UTC calendar day. Yahoo daily bars are already 1/day; if a day
+  // has a null close we SKIP it (honest gap), never carry-forward or fabricate.
+  const byDay = new Map();
+  let nullSkipped = 0;
+  for (let i = 0; i < ts.length; i++) {
+    const close = q.close?.[i];
+    if (close == null || !Number.isFinite(close) || !(close > 0)) {
+      nullSkipped++;
+      continue;
+    }
+    const ms = ts[i] * 1000;
+    const k = dayKeyFromMs(ms);
+    byDay.set(k, {
+      date: k,
+      ts: ms,
+      open: numOrNull(q.open?.[i]),
+      high: numOrNull(q.high?.[i]),
+      low: numOrNull(q.low?.[i]),
+      close,
+      volume: numOrNull(q.volume?.[i]),
+    });
+  }
+  const dayKeys = [...byDay.keys()].sort();
+  const rows = dayKeys.map((k) => byDay.get(k));
+
+  const gaps = detectGaps(dayKeys);
+  if (gaps.length) warnings.push(`${gaps.length} calendar-day gap(s) in series`);
+  if (nullSkipped) warnings.push(`${nullSkipped} bar(s) skipped for null/non-finite close (honest gap)`);
+  warnings.push(`final row ${rows[rows.length - 1].date} may be a PARTIAL day (live snapshot)`);
+
+  return {
+    asset,
+    source: "yahoo-finance",
+    requested_days: null,
+    rows,
+    gaps,
+    warnings,
+    ok: rows.length > 0,
+  };
+}
+
+function numOrNull(x) {
+  return x == null || !Number.isFinite(x) ? null : x;
 }
 
 // ── fetch one asset's daily close history ──────────────────────────────
@@ -197,25 +313,33 @@ export function loadHistory(asset) {
 }
 
 // ── CLI: node tsmom/ohlcv-ingest.js [BTC ETH SOL] ────────────────────────
+// Default source = Yahoo deep daily history (multi-year, true OHLC). Set
+// TSMOM_SOURCE=coingecko to fall back to the 1yr close-only free source.
 async function main() {
   const args = process.argv.slice(2).filter((a) => !a.startsWith("-"));
   const assets = args.length ? args.map((a) => a.toUpperCase()) : Object.keys(MAJORS);
-  const days = Number(process.env.TSMOM_DAYS || 365);
+  const source = (process.env.TSMOM_SOURCE || "yahoo").toLowerCase();
 
-  console.log(`[ingest] assets=${assets.join(",")} days=${days} source=coingecko-free`);
+  console.log(`[ingest] assets=${assets.join(",")} source=${source}`);
   for (const asset of assets) {
     process.stdout.write(`[ingest] ${asset} ... `);
-    const result = await fetchDailyHistory(asset, { days });
+    const result =
+      source === "coingecko"
+        ? await fetchDailyHistory(asset, { days: Number(process.env.TSMOM_DAYS || 365) })
+        : await fetchDailyHistoryYahoo(asset);
     if (!result.ok) {
       console.log(`FAILED — ${result.warnings.join("; ")}`);
       continue;
     }
     const file = saveHistory(result);
+    const span =
+      (new Date(result.rows[result.rows.length - 1].ts) - new Date(result.rows[0].ts)) /
+      (365.25 * 86400000);
     console.log(
-      `${result.rows.length} rows (${result.rows[0].date} → ${result.rows[result.rows.length - 1].date}) → ${path.basename(file)}`
+      `${result.rows.length} rows (${result.rows[0].date} → ${result.rows[result.rows.length - 1].date}, ${span.toFixed(1)}yr) → ${path.basename(file)}`
     );
     for (const w of result.warnings) console.log(`   ⚠ ${w}`);
-    await sleep(2500); // polite spacing for free-tier rate limit
+    await sleep(1500); // polite spacing
   }
   console.log("[ingest] done.");
 }

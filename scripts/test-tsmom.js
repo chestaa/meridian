@@ -13,6 +13,10 @@ import {
   backtestAsset,
   computeBacktestMetrics,
   buildEquityCurve,
+  regimeAt,
+  computeRegimeSplit,
+  REGIME_BAND,
+  REGIME_WINDOW_DAYS,
 } from "../tsmom/tsmom-backtest.js";
 
 let pass = 0;
@@ -126,6 +130,65 @@ function approx(a, b, eps = 1e-6) {
 {
   const r = backtestAsset({ asset: "TEST", rows: [{ close: 100, date: "x" }] }, DEFAULT_PARAMS);
   ok(r.metrics.n_periods === 0, "backtest: too-short data => 0 periods (honest, no crash)");
+}
+
+// ── regimeAt: ex-ante trailing-trend label, no peeking ────────────────
+{
+  const W = REGIME_WINDOW_DAYS;
+  // Build a series long enough to have a trailing W-window at idx.
+  const n = W + 50;
+  // Uptrend: +0.3% / day over the trailing window => well above +BAND.
+  const up = Array.from({ length: n }, (_, i) => 100 * 1.003 ** i);
+  const ru = regimeAt(up, n - 1);
+  ok(ru.regime === "UPTREND", "regimeAt: rising trailing window => UPTREND");
+  ok(ru.trail >= REGIME_BAND, "regimeAt: uptrend trail >= +band");
+
+  // Downtrend.
+  const down = Array.from({ length: n }, (_, i) => 100 * 0.997 ** i);
+  ok(regimeAt(down, n - 1).regime === "DOWNTREND", "regimeAt: falling trailing window => DOWNTREND");
+
+  // Chop: flat within band.
+  const flat = Array.from({ length: n }, () => 100);
+  ok(regimeAt(flat, n - 1).regime === "CHOP", "regimeAt: flat trailing window => CHOP");
+
+  // Insufficient trailing history => UNKNOWN, never fabricated.
+  ok(regimeAt(up, 5).regime === "UNKNOWN", "regimeAt: too-early idx => UNKNOWN (no fabrication)");
+
+  // Trailing-only: regimeAt at idx must NOT depend on closes AFTER idx.
+  const base = Array.from({ length: n }, (_, i) => 100 * 1.003 ** i);
+  const tampered = base.slice();
+  for (let i = n - 5; i < n; i++) tampered[i] = 1; // crash the FUTURE only
+  ok(
+    regimeAt(base, n - 10).regime === regimeAt(tampered, n - 10).regime,
+    "regimeAt: label at idx is invariant to future closes (no peeking)"
+  );
+}
+
+// ── computeRegimeSplit: buckets + per-bucket stats ────────────────────
+{
+  const periods = [
+    { regime: "UPTREND", period_return: 0.1, signal: 1 },
+    { regime: "UPTREND", period_return: 0.2, signal: 1 },
+    { regime: "DOWNTREND", period_return: -0.1, signal: -1 },
+    { regime: "CHOP", period_return: 0.0, signal: 0 },
+  ];
+  const split = computeRegimeSplit(periods);
+  ok(split.UPTREND.n === 2, "regimeSplit: UPTREND bucket counts 2");
+  ok(approx(split.UPTREND.mean_period_return, 0.15), "regimeSplit: UPTREND mean = 0.15");
+  ok(split.UPTREND.win_rate_pct === 100, "regimeSplit: UPTREND WR 100%");
+  ok(split.DOWNTREND.n === 1 && split.DOWNTREND.short === 1, "regimeSplit: DOWNTREND short tally");
+  ok(split.CHOP.n === 1 && split.CHOP.flat === 1, "regimeSplit: CHOP flat tally");
+  ok(split.UNKNOWN.n === 0, "regimeSplit: no UNKNOWN here");
+}
+
+// ── backtest attaches a regime to every period ────────────────────────
+{
+  const n = 600;
+  const closes = Array.from({ length: n }, (_, i) => 100 * 1.001 ** i);
+  const dates = Array.from({ length: n }, (_, i) => `d${i}`);
+  const r = backtestAsset({ asset: "T", rows: closes.map((c, i) => ({ close: c, date: dates[i] })) }, DEFAULT_PARAMS);
+  ok(r.periods.every((p) => ["UPTREND", "DOWNTREND", "CHOP", "UNKNOWN"].includes(p.regime)), "backtest: every period carries a regime label");
+  ok(r.regimeSplit && typeof r.regimeSplit === "object", "backtest: regimeSplit present in result");
 }
 
 console.log(`\nTSMOM tests: ${pass} passed, ${fail} failed`);

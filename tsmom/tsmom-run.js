@@ -25,6 +25,7 @@ import { MAJORS, loadHistory } from "./ohlcv-ingest.js";
 import { DEFAULT_PARAMS } from "./tsmom-signal.js";
 import { backtestAsset } from "./tsmom-backtest.js";
 import { computeStats } from "../journal-stats.js";
+import { computeRegimeSplit } from "./tsmom-backtest.js";
 import { appendEntry } from "../journal.js";
 
 const EXPERIMENT_ID = "TSMOM";
@@ -47,9 +48,10 @@ function paramsFromEnv() {
 
 function configVersion(p) {
   if (process.env.TSMOM_CONFIG_VERSION) return process.env.TSMOM_CONFIG_VERSION;
-  // derive a deterministic version string from the spec so a param change
-  // never silently reuses another config's slice key.
-  return `v1-lb${p.lookbackDays}-rb${p.rebalanceDays}-vt${p.targetAnnualVol}-${p.allowShort ? "ls" : "lf"}`;
+  // Default to v2-deephistory: same mechanical spec as v1, but run over the
+  // multi-year multi-regime Yahoo daily history instead of the 1yr CoinGecko
+  // window. New version string => compares cleanly against v1 in the journal.
+  return "v2-deephistory";
 }
 
 function pct(x) {
@@ -65,6 +67,14 @@ export function runAsset(asset, params, configVer, { log = true } = {}) {
   // Honest stats verdict on the SET of held-out period returns (unit=proxy).
   const periodReturns = bt.periods.map((x) => x.period_return);
   const stats = computeStats(periodReturns, "proxy");
+
+  // Per-regime honest verdict: same computeStats gate (n>=10 + |t|>=2) on each
+  // ex-ante regime bucket. The whole B1 question lives here.
+  const regimeStats = {};
+  for (const regime of ["UPTREND", "DOWNTREND", "CHOP"]) {
+    const rets = bt.periods.filter((x) => x.regime === regime).map((x) => x.period_return);
+    regimeStats[regime] = computeStats(rets, "proxy");
+  }
 
   let journalEntry = null;
   if (log && process.env.TSMOM_NO_LOG !== "1") {
@@ -87,6 +97,10 @@ export function runAsset(asset, params, configVer, { log = true } = {}) {
         sharpe_annual: bt.metrics.sharpe_annual,
         max_drawdown_pct: bt.metrics.max_drawdown_pct,
         total_return_pct: bt.metrics.total_return_pct,
+        regime_split: bt.regimeSplit,
+        regime_verdicts: Object.fromEntries(
+          Object.entries(regimeStats).map(([r, s]) => [r, { n: s.n, t: s.tStat, verdict: s.verdict }])
+        ),
       },
       status: "closed",
       // outcome = per-trade EXPECTANCY of the held-out periods, as a PROXY
@@ -104,7 +118,7 @@ export function runAsset(asset, params, configVer, { log = true } = {}) {
     });
   }
 
-  return { asset, bt, stats, journalEntry };
+  return { asset, bt, stats, regimeStats, journalEntry };
 }
 
 function printAssetReport(r) {
@@ -129,6 +143,19 @@ function printAssetReport(r) {
   console.log(`  VERDICT: ${s.verdict}`);
   console.log(`  ${s.honesty}`);
   if (s.payoffTrap) console.log(`  PAYOFF TRAP: ${s.payoffTrap}`);
+  // Regime split — the core B1 question.
+  const rs = r.bt.regimeSplit;
+  console.log(`-- REGIME SPLIT (ex-ante trailing-90d trend at entry) --`);
+  for (const regime of ["UPTREND", "DOWNTREND", "CHOP"]) {
+    const b = rs[regime] || { n: 0 };
+    const v = r.regimeStats[regime];
+    if (!b.n) { console.log(`  ${regime.padEnd(9)} n=0`); continue; }
+    console.log(
+      `  ${regime.padEnd(9)} n=${String(b.n).padEnd(3)} mean=${pct(b.mean_period_return).padStart(8)} ` +
+      `WR=${String(b.win_rate_pct).padStart(5)}%  L/S/F=${b.long}/${b.short}/${b.flat}  ` +
+      `t=${v.tStat ?? "n/a"} ${v.verdict}`
+    );
+  }
   if (r.journalEntry) console.log(`  journal: logged ${r.journalEntry.id} (${EXPERIMENT_ID}/${r.journalEntry.config_version})`);
 }
 
@@ -161,6 +188,20 @@ async function main() {
     console.log(`  VERDICT: ${pooled.verdict}`);
     console.log(`  ${pooled.honesty}`);
     if (pooled.payoffTrap) console.log(`  PAYOFF TRAP: ${pooled.payoffTrap}`);
+    console.log(`  ⚠ CORRELATION CAVEAT: BTC/ETH/SOL majors move together; pooled n`);
+    console.log(`    overstates independence. Treat pooled as indicative, per-asset as primary.`);
+
+    // Pooled BY REGIME — the cleanest read on "edge across regimes vs bear-short artifact".
+    console.log(`\n## POOLED BY REGIME (all assets, ex-ante regime at entry)`);
+    const allTagged = results.filter((r) => r.bt).flatMap((r) => r.bt.periods);
+    for (const regime of ["UPTREND", "DOWNTREND", "CHOP"]) {
+      const rets = allTagged.filter((x) => x.regime === regime).map((x) => x.period_return);
+      const st = computeStats(rets, "proxy");
+      console.log(
+        `  ${regime.padEnd(9)} n=${String(st.n).padEnd(3)} expectancy=${st.expectancy} ` +
+        `t=${st.tStat ?? "n/a"} ${st.verdict}`
+      );
+    }
   }
   console.log(`\n(Run \`node journal-cli.js report\` to see TSMOM alongside other experiments.)`);
 }
