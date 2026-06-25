@@ -88,3 +88,6 @@ status-snapshot.json
 # Agent bundles / archives
 .agent-bundle/
 *.zip
+
+# Lyra journal runtime ledger (local state, not source)
+journal.jsonl
