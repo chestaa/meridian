@@ -1,0 +1,78 @@
+# Meridian TSMOM Paper-Soak (Lyra B1 — BTC-only forward paper-soak)
+#
+# ┌─ STAGED / DISABLED — DO NOT `systemctl enable` YET ───────────────────────┐
+# │ The forward paper-soak RUNNER does not exist on `main` yet. As of          │
+# │ 2026-06-25 the tsmom/ branch ships only the walk-forward BACKTEST harness   │
+# │ (tsmom-run.js) + the declared v3-btc-long config (tsmom/tsmom-variants.js,  │
+# │ still local/uncommitted). tsmom-run.js re-runs the SAME backtest over the   │
+# │ SAME cached history and would spam ~hundreds of journal entries per run —   │
+# │ it is NOT a daily "pull latest close → mark to market → append one row"     │
+# │ soak. DO NOT point ExecStart at tsmom-run.js.                               │
+# │                                                                             │
+# │ WIRE-UP when Lyra pushes the real soak runner:                              │
+# │   1. Replace the ExecStart placeholder below with her documented CLI        │
+# │      (exact script path + args — read it from the branch, do not assume).   │
+# │   2. Confirm ReadWritePaths still matches what she writes (journal +        │
+# │      tsmom/data). Add/remove paths to match her runner exactly.             │
+# │   3. Manual one-shot test FIRST (see below); only enable if a journal       │
+# │      entry is actually written/updated.                                     │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# Pattern mirrors meridian-intel-digest.service (oneshot + OnFailure notify) with
+# the requested low-priority + read-only hardening on top.
+#
+# READ-ONLY re: money — NO money path, NO on-chain, NO real orders, NO LLM cost.
+# Pure data fetch (Yahoo daily close) + journal.jsonl append.
+#
+# Manual one-shot test (run BEFORE enabling the timer):
+#   systemctl start meridian-tsmom-soak.service
+#   tail -n 3 /opt/meridian/journal.jsonl    # confirm a fresh TSMOM row appended
+
+[Unit]
+Description=Meridian TSMOM Paper-Soak (Lyra B1 — BTC-only, PAPER/PROXY, no money path)
+After=network-online.target
+Wants=network-online.target
+OnFailure=meridian-notify@%n.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/meridian
+
+# Low-priority: TSMOM is slow + non-urgent. Never compete with signal-runner.
+Nice=10
+IOSchedulingClass=idle
+
+# === PLACEHOLDER — replace with Lyra's documented forward-soak CLI ===========
+# Expected shape (per tsmom/tsmom-variants.js v3-btc-long declaration):
+#   pull latest BTC daily close → compute TSMOM signal → mark paper position to
+#   market → append ONE journal entry (experiment_id=TSMOM, config_version=
+#   v3-btc-long, unit=proxy, is_realized=false).
+# Until that script exists this unit MUST stay disabled.
+ExecStart=/bin/echo "TSMOM soak runner not yet shipped — see header. Replace ExecStart with Lyra CLI."
+# Example once shipped (VERIFY against her actual file/args before using):
+#   ExecStart=/usr/local/bin/node /opt/meridian/tsmom/tsmom-soak.js BTC
+# ============================================================================
+
+Environment=NODE_ENV=production
+# v3-btc-long is the pre-registered BTC-only hypothesis (NOT a curve-fit).
+Environment=TSMOM_CONFIG_VERSION=v3-btc-long
+EnvironmentFile=-/opt/meridian/.env
+TimeoutStartSec=120s
+
+# ── Read-only hardening: filesystem read-only except the dirs the runner writes.
+#    journal.js resolves JOURNAL_FILE (else cwd/journal.jsonl). The default
+#    journal.jsonl is at /opt/meridian (the SHARED ledger — keep it there so
+#    `journal-cli report` sees TSMOM alongside everything). tsmom/data caches the
+#    daily history the ingester refreshes. NOTE: with ProtectSystem=strict a
+#    ReadWritePaths FILE must already exist at start; we therefore grant the
+#    PARENT dirs (journal.jsonl pre-exists in practice, but dir-scope is robust
+#    to first-run). Tighten to the exact files once Lyra's runner is wired.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/opt/meridian /opt/meridian/tsmom/data
+
+[Install]
+WantedBy=multi-user.target

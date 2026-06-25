@@ -1,0 +1,35 @@
+# Meridian TSMOM Paper-Soak Freshness Guard (Draco/Ops — 18-day-stale lesson)
+#
+# STAGED / DISABLED — enable alongside the soak timer once the soak runner is
+# live (see meridian-tsmom-soak.service). Until the soak produces journal rows
+# this probe exits 0 (pre-launch is honestly "no alert", not a false stall).
+#
+# Reads the shared journal, FAILS (exit 1 → OnFailure Telegram alert) if the
+# most-recent TSMOM entry is older than TSMOM_FRESH_MAX_DAYS (default 2).
+# READ-ONLY: no money, no on-chain, no LLM, no writes.
+
+[Unit]
+Description=Meridian TSMOM paper-soak freshness guard (alert if no log in >2 days)
+After=network-online.target
+OnFailure=meridian-notify@%n.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/meridian
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/node /opt/meridian/scripts/tsmom-soak-freshness.js
+Environment=NODE_ENV=production
+Environment=TSMOM_FRESH_MAX_DAYS=2
+EnvironmentFile=-/opt/meridian/.env
+TimeoutStartSec=30s
+
+# Pure read of the journal — no writes needed.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

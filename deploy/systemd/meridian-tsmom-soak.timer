@@ -1,0 +1,21 @@
+# Meridian TSMOM Paper-Soak timer — DAILY, once/day (TSMOM is slow).
+#
+# STAGED / DISABLED — enable only AFTER the one-shot test writes a real journal
+# entry (see meridian-tsmom-soak.service header).
+#
+# 00:30 UTC: after the UTC daily close settles, so the "latest daily close" the
+# runner pulls is the just-closed day, not a partial bar. Persistent=true so a
+# missed run (VPS down) fires on next boot — one catch-up is fine for a daily,
+# slow-rebalance strategy.
+
+[Unit]
+Description=Run Meridian TSMOM paper-soak once daily (00:30 UTC) — paper/proxy, no money
+
+[Timer]
+OnCalendar=*-*-* 00:30:00 UTC
+AccuracySec=10min
+Unit=meridian-tsmom-soak.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

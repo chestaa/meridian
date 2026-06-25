@@ -1,0 +1,17 @@
+# Meridian TSMOM freshness-guard timer — DAILY 06:00 UTC.
+#
+# STAGED / DISABLED — enable with the soak. Runs ~5.5h after the 00:30 UTC soak
+# so a same-day stall is caught the same day. >2-day threshold tolerates one
+# missed run before paging (avoids flapping on a single transient miss).
+
+[Unit]
+Description=Run TSMOM paper-soak freshness check once daily (06:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 UTC
+AccuracySec=10min
+Unit=meridian-tsmom-freshness.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
