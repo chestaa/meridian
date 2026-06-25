@@ -216,7 +216,13 @@ export async function executeStep({
     currentEquity: currentEquityUsd,
     rawWeight: decision?.sig?.weight,
   });
-  if (!circuitGate.allow) {
+  // Circuit/gate halt. LIVE: hard return, no order (the money path stops here). DRY-RUN:
+  // we do NOT return yet — the rehearsal should still show the INTENDED order, but
+  // flagged `wouldHaltLive` so the operator sees that LIVE would have stopped (e.g.
+  // a cold/young baseline on day one, or a real drawdown). An honest rehearsal shows
+  // BOTH "what the signal wants" and "whether the live gate would allow it".
+  const gateHalt = !circuitGate.allow;
+  if (gateHalt && !isDryRun) {
     log("btc_exec", `NO ORDER — gate halt at ${circuitGate.stage}: ${circuitGate.reason}` +
       (baselineInfo ? ` (baseline age ${baselineInfo.age_hours}h, ${baselineInfo.reason || "ok"})` : ""));
     return { ordered: false, isDryRun, action: decision.action, reason: circuitGate.reason, stage: circuitGate.stage, baseline: baselineInfo, decision: brief(decision), plan };
@@ -224,7 +230,7 @@ export async function executeStep({
 
   if (!plan.order) {
     log("btc_exec", `NO ORDER — ${decision.action}: ${plan.reason}`);
-    return { ordered: false, isDryRun, action: decision.action, reason: plan.reason, decision: brief(decision), plan };
+    return { ordered: false, isDryRun, action: decision.action, reason: plan.reason, baseline: baselineInfo, wouldHaltLive: gateHalt, gateStage: gateHalt ? circuitGate.stage : "ok", gateReason: gateHalt ? circuitGate.reason : null, decision: brief(decision), plan };
   }
 
   // 4) DRY-RUN: still compute the intended order (honest plan), place NOTHING.
@@ -236,8 +242,14 @@ export async function executeStep({
     });
     const priceAvail = priceUsd != null;
     log("btc_exec", `DRY-RUN plan: ${plan.side} ${plan.amount} (${plan.action}, weight ${plan.targetWeight}, notional $${plan.targetNotional})` +
-      (priceAvail ? ` @ indep price $${priceUsd} (${priceInfo?.source || "explicit"})` : ` ⚠ price_unavailable (LIVE would REFUSE)`));
-    return { ordered: false, isDryRun: true, action: decision.action, plan, intended, price: priceInfo, priceAvailable: priceAvail, decision: brief(decision) };
+      (priceAvail ? ` @ indep price $${priceUsd} (${priceInfo?.source || "explicit"})` : ` ⚠ price_unavailable (LIVE would REFUSE)`) +
+      (gateHalt ? ` ⚠ LIVE WOULD HALT: ${circuitGate.stage}/${circuitGate.reason}` : ""));
+    return {
+      ordered: false, isDryRun: true, action: decision.action, plan, intended,
+      price: priceInfo, priceAvailable: priceAvail,
+      wouldHaltLive: gateHalt, gateStage: gateHalt ? circuitGate.stage : "ok", gateReason: gateHalt ? circuitGate.reason : null,
+      baseline: baselineInfo, decision: brief(decision),
+    };
   }
 
   // ── LIVE PATH (DRY_RUN=false only) ───────────────────────────────────────────
