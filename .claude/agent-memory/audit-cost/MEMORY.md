@@ -2,3 +2,4 @@
 - [VPS SSH canonical path](vps-ssh-canonical-path.md) — Use C:\Users\Pradikta Andrianto\.ssh\meridian_vps_ed25519 + root@124.156.202.109; never ./vps-key
 - [Counterfactual data sources](counterfactual-data-sources.md) — Blocked-pool addresses NOT in logs/pool-memory; resolve via DexScreener search by short pool ID
 - [Realized PnL source of truth](realized-pnl-source-of-truth.md) — Per-trade PnL in lessons.json performance[] on VPS (NOT state.json peak-only); filter source!=="paper" for real money
+- [TSMOM B1 paper-test](project-tsmom-b1-paper-test.md) — branch feat/tsmom-paper-test-v1; mechanics sound but NOT validated (free-API 365d = single bear regime); pooled n=18 is false-confidence trap
