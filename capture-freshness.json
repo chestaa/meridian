@@ -1,13 +1,13 @@
 {
-  "ts": "2026-06-26T00:20:12Z",
-  "status": "stale",
-  "newest_tier1_file": "none",
-  "newest_tier1_age_sec": -1,
+  "ts": "2026-06-26T01:20:16Z",
+  "status": "ok",
+  "newest_tier1_file": "2026-06-26.jsonl",
+  "newest_tier1_age_sec": 3603,
   "newest_tier2_file": "2026-06-26.jsonl",
-  "newest_tier2_age_sec": 816,
-  "today_tier1_rows": 0,
+  "newest_tier2_age_sec": 810,
+  "today_tier1_rows": 1000,
   "api_reachable": false,
   "tier1_stale_threshold_sec": 7200,
   "tier2_stale_threshold_sec": 1800,
-  "reasons": ["today_tier1_missing_or_empty:/var/lib/meridian-capture/tier1/2026-06-26.jsonl","no_tier1_capture_file_at_all"]
+  "reasons": []
 }
