@@ -1,0 +1,16 @@
+{
+  "question": "Does cbBTC-SOL DLMM ever sustain >60k TVL? (7d watch 2026-06-27..2026-07-04)",
+  "ever_crossed_60k": true,
+  "first_crossed_60k_at": "2026-06-27T01:20:07.596Z",
+  "peak_tvl_usd": 102821,
+  "peak_tvl_at": "2026-06-27T01:20:07.596Z",
+  "peak_tvl_pool": "H2USRSaWuUchkbdmSJgKNfAm7ocyD4ZnCm69oRGyecKw",
+  "peak_volume_window_usd": 16820,
+  "peak_fee_active_tvl_ratio": 0.0422,
+  "last_seen_tvl_usd": 102821,
+  "last_seen_at": "2026-06-27T01:20:07.596Z",
+  "sweeps_recorded": 1,
+  "sweeps_with_cbbtc_sol_pool": 1,
+  "note": "volume_window = per-fetch timeframe window (screener fetches 1h), NOT 24h. Liquidity-only, monitoring-only, no money path.",
+  "updated_at": "2026-06-27T01:20:07.789Z"
+}
