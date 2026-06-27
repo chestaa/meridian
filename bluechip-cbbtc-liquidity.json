@@ -7,10 +7,10 @@
   "peak_tvl_pool": "H2USRSaWuUchkbdmSJgKNfAm7ocyD4ZnCm69oRGyecKw",
   "peak_volume_window_usd": 25633,
   "peak_fee_active_tvl_ratio": 0.06967,
-  "last_seen_tvl_usd": 102624,
-  "last_seen_at": "2026-06-27T10:26:19.726Z",
-  "sweeps_recorded": 21,
-  "sweeps_with_cbbtc_sol_pool": 21,
+  "last_seen_tvl_usd": 102811,
+  "last_seen_at": "2026-06-27T10:56:32.352Z",
+  "sweeps_recorded": 22,
+  "sweeps_with_cbbtc_sol_pool": 22,
   "note": "volume_window = per-fetch timeframe window (screener fetches 1h), NOT 24h. Liquidity-only, monitoring-only, no money path.",
-  "updated_at": "2026-06-27T10:26:20.137Z"
+  "updated_at": "2026-06-27T10:56:32.748Z"
 }
