@@ -15,7 +15,7 @@
 import assert from "node:assert/strict";
 
 const DUST_FLOOR = 0.02;            // executor.js minDeploy hard floor
-const PHASE1_CAP = 0.05;            // MAX_LIVE_POSITION_SOL (dlmm.js)
+const PHASE1_CAP = 0.5;             // MAX_LIVE_POSITION_SOL (dlmm.js, raised 0.05->0.5 2026-06-28)
 
 // Mirror of the executor floor expression. If executor.js:1385 changes, this
 // constant must change with it — the test below pins the contract.

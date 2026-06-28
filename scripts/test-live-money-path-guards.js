@@ -22,7 +22,7 @@ if (!process.env.BURNER_WALLET_KEY) process.env.BURNER_WALLET_KEY = "test-not-us
 const dlmm = await import("../tools/dlmm.js");
 const { deployPosition, MAX_LIVE_POSITION_SOL, __setForTests, __resetTests } = dlmm;
 
-assert.strictEqual(MAX_LIVE_POSITION_SOL, 0.05, "Phase-1 cap must be hard-pinned at 0.05 SOL");
+assert.strictEqual(MAX_LIVE_POSITION_SOL, 0.5, "live per-position cap must be hard-pinned at 0.5 SOL (Bro decision 2026-06-28)");
 
 const WSOL = "So11111111111111111111111111111111111111112";
 const NOT_WSOL = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC (bluechip)
@@ -55,15 +55,15 @@ catch (e) { r1 = { success: false, error: e.message }; }
 assert.strictEqual(r1.success, false, "non-wSOL Y leg must be refused");
 assert.ok(/not wSOL|wSOL.*Y leg/i.test(r1.error || ""), `expected wSOL refusal, got: ${r1.error}`);
 
-// ── 2. Phase-1 cap: amount above 0.05 on a wSOL pool must REFUSE ──
+// ── 2. Live cap: amount above 0.5 on a wSOL pool must REFUSE ──
 __setForTests({ getPool: async () => fakePool(WSOL) });
 let r2;
-try { r2 = await deployPosition({ pool_address: "PoolWsol", amount_y: 0.2, bins_below: 35 }); }
+try { r2 = await deployPosition({ pool_address: "PoolWsol", amount_y: 0.6, bins_below: 35 }); }
 catch (e) { r2 = { success: false, error: e.message }; }
-assert.strictEqual(r2.success, false, "0.2 SOL must exceed the 0.05 Phase-1 cap");
-assert.ok(/Phase-1 per-position cap|hard belt/i.test(r2.error || ""), `expected cap refusal, got: ${r2.error}`);
+assert.strictEqual(r2.success, false, "0.6 SOL must exceed the 0.5 live cap");
+assert.ok(/per-position cap|hard belt/i.test(r2.error || ""), `expected cap refusal, got: ${r2.error}`);
 
 __resetTests();
 
 process.env.DRY_RUN = prevDryRun;
-console.log("PASS: live money-path guards (wSOL-leg refusal + Phase-1 0.05 cap)");
+console.log("PASS: live money-path guards (wSOL-leg refusal + live 0.5 cap)");

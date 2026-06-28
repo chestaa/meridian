@@ -1057,7 +1057,10 @@ export async function executeTool(name, args) {
         }
         notifyDeploy({
           pair: result.pool_name || args.pool_name || wd.pool_address?.slice(0, 8) || args.pool_address?.slice(0, 8),
-          amountSol: args.amount_y ?? args.amount_sol ?? wd.amount_y ?? wd.amount_sol ?? 0,
+          // Report the AUTHORITATIVE deployed amount (post-cap finalAmountY = chain
+          // truth) first; result.* is undefined on the DRY path so the paper fallback
+          // is preserved. Never print the pre-cap request again. (Vega reporting-bug fix)
+          amountSol: result.amount_y ?? result.amount_sol ?? args.amount_y ?? args.amount_sol ?? wd.amount_y ?? wd.amount_sol ?? 0,
           position: result.position,
           tx: result.txs?.[0] ?? result.tx,
           priceRange: result.price_range,

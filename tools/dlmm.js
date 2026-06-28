@@ -45,9 +45,12 @@ const MAX_BLUECHIP_POSITION_SOL = 0.45;
 // can be mis-set). config may TIGHTEN below this but can NEVER exceed it — the
 // deploy path takes Math.min(belt, config). Anti-pattern #7: a tunable/LLM-driven
 // size can never breach a code-pinned cap. Raising it is an explicit Bro decision.
-// Burner funded with 0.5 SOL; 0.05/position keeps any single bad trade to ~1/10th
-// of capital. Mirrors MAX_BLUECHIP_POSITION_SOL pattern. Lives in code, not JSON.
-export const MAX_LIVE_POSITION_SOL = 0.05;
+// Raised 0.05 -> 0.5 on Bro's EXPLICIT decision (2026-06-28). NOTE: this is the
+// per-position CEILING, not the achievable size — gasReserve + live balance bound
+// the actual deploy below it (burner ~0.612 SOL, gasReserve 0.2 → max ~0.412/pos,
+// so a single position is ~the whole burner; maxPositions MUST be 1 at this size).
+// Mirrors MAX_BLUECHIP_POSITION_SOL pattern. Lives in code, not JSON.
+export const MAX_LIVE_POSITION_SOL = 0.5;
 
 // Wrapped-SOL mint — the ONLY mint a single-side SOL deploy may deposit into.
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
