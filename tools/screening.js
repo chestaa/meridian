@@ -499,6 +499,47 @@ export function tvlMcapGateRejectReason(pool, s) {
 }
 
 /**
+ * H3 edge filter (Cassiopeia, 2026-06-28) — the safety paid for by re-opening the
+ * memecoin DEPLOY lane. NOT a loosening: this ADDS a reject on top of every existing
+ * gate. From the 59-real-trade brain analysis, the only losing mechanism in the
+ * −$1.74 book was the stop-out tail. The clean 2x2 intersection that flipped it
+ * +$9.36 (stop-losses 14→3) was: fee_active_tvl_ratio ∈ [min,max) AND volatility ≥ floor.
+ *
+ *   - ftvl ≥ edgeFilterFtvlMax (1.0): a transient fee spike on a thin/just-launched
+ *     pool — NEGATIVE signal (EV −0.50). Rejected.
+ *   - ftvl < edgeFilterFtvlMin (0.2): too little fee generation to cover IL. Rejected.
+ *   - volatility < edgeFilterMinVolatility (2.5): slow-bleed band (EV −0.41) — the
+ *     position never realizes a win, it drifts into the stop. Rejected.
+ *
+ * FAIL-CLOSED (anti-pattern #2): a missing/non-finite ftvl OR volatility means we
+ * CANNOT confirm the candidate is in the positive-EV cell → reject (never default to
+ * "assume in-band"). Uses strictNumeric so Number(null)===0 cannot fabricate a reading.
+ *
+ * Default OFF (edgeFilterEnabled=false) → byte-for-byte no-op; Bro enables it together
+ * with the lane. Returns a reject reason string, or null if it passes / disabled.
+ *
+ * @param {object} pool - reads pool.fee_active_tvl_ratio + pool.volatility
+ * @param {object} s - effective screening thresholds
+ */
+export function edgeFilterRejectReason(pool, s) {
+  if (s?.edgeFilterEnabled !== true) return null; // opt-in → inert by default
+  const ftvl = strictNumeric(pool?.fee_active_tvl_ratio);
+  const vol = strictNumeric(pool?.volatility);
+  // Fail-closed: cannot place the pool in the positive cell without both readings.
+  if (ftvl == null || !Number.isFinite(ftvl)) return "edge_filter_data_unknown";
+  if (vol == null || !Number.isFinite(vol)) return "edge_filter_data_unknown";
+  const ftvlMin = numeric(s?.edgeFilterFtvlMin);
+  const ftvlMax = numeric(s?.edgeFilterFtvlMax);
+  const volFloor = numeric(s?.edgeFilterMinVolatility);
+  // Fail-closed: a mis-configured (missing) bound → reject rather than pass everything.
+  if (ftvlMin == null || ftvlMax == null || volFloor == null) return "edge_filter_data_unknown";
+  if (ftvl < ftvlMin) return "edge_filter_ftvl_below_band";
+  if (ftvl >= ftvlMax) return "edge_filter_ftvl_above_band";
+  if (vol < volFloor) return "edge_filter_volatility_below_floor";
+  return null;
+}
+
+/**
  * Deployability pre-filter (Cassiopeia, Lyra cost-cut) — NOT a risk gate.
  *
  * This bot deploys single-side SOL ONLY (executor.js rejects amount_x>0). A pool
@@ -1037,6 +1078,12 @@ export function getRawPoolScreeningRejectReason(pool, s) {
   if (s.minVolatility > 0 && volatility < s.minVolatility) {
     return `volatility ${volatility} below minVolatility ${s.minVolatility}`;
   }
+  // H3 edge filter (Cassiopeia 2026-06-28) — the safety for the re-opened memecoin
+  // DEPLOY lane. Keeps only the positive-EV 2x2 cell ftvl∈[0.2,1.0) AND vol≥2.5
+  // (brain analysis: flips −$1.74 → +$9.36, stop-losses 14→3). STRICTER, not looser.
+  // Inert when edgeFilterEnabled=false. Fail-closed inside the fn (anti-pattern #2).
+  const edgeReason = edgeFilterRejectReason(pool, s);
+  if (edgeReason) return edgeReason;
   // Fail-closed (anti-pattern #2): null organic = DATA-MISSING (structural gap on
   // the cross-ref endpoint, NOT a genuine low score). organic_unknown is
   // distinguishable from a genuine sub-floor score so enrich-before-gate (which

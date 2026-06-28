@@ -38,6 +38,19 @@ import { isBluechipMintPair } from "./screening.js";
 // not just in a tunable file. Raising it is an explicit Bro decision (anti-pattern
 // #7: never let a tunable/LLM path size above a hardcoded cap).
 const MAX_BLUECHIP_POSITION_SOL = 0.45;
+
+// ── Phase-1 live per-position hard cap (Vega — go-live 2026-06-28) ──
+// Hardcoded ceiling on per-position SOL for the MEMECOIN live path, INDEPENDENT
+// of the tunable config.risk.maxDeployAmount (which lives in user-config.json and
+// can be mis-set). config may TIGHTEN below this but can NEVER exceed it — the
+// deploy path takes Math.min(belt, config). Anti-pattern #7: a tunable/LLM-driven
+// size can never breach a code-pinned cap. Raising it is an explicit Bro decision.
+// Burner funded with 0.5 SOL; 0.05/position keeps any single bad trade to ~1/10th
+// of capital. Mirrors MAX_BLUECHIP_POSITION_SOL pattern. Lives in code, not JSON.
+export const MAX_LIVE_POSITION_SOL = 0.05;
+
+// Wrapped-SOL mint — the ONLY mint a single-side SOL deploy may deposit into.
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
@@ -744,6 +757,39 @@ export async function deployPosition({
       );
     }
   }
+  // ── Phase-1 memecoin per-position HARD CAP (Vega — go-live, NON-bluechip path) ──
+  // The bluechip lane has its own belt above; this is the memecoin/general live belt.
+  // Effective cap = min(code-pinned MAX_LIVE_POSITION_SOL, config maxDeployAmount).
+  // DRY_RUN paper deploys are exempt (no real SOL moves) so the dry-run soak can size
+  // freely; the cap binds only when real TX will be sent. anti-pattern #7.
+  if (!isBluechipDeploy && process.env.DRY_RUN !== "true") {
+    const liveCap = Math.min(
+      MAX_LIVE_POSITION_SOL,
+      Number(config.risk?.maxDeployAmount ?? MAX_LIVE_POSITION_SOL),
+    );
+    if (finalAmountY > liveCap) {
+      throw new Error(
+        `Invalid deploy amount: live position ${finalAmountY} SOL exceeds the Phase-1 per-position cap ${liveCap} SOL (hard belt ${MAX_LIVE_POSITION_SOL}).`,
+      );
+    }
+  }
+
+  // ── wSOL-leg chain-side assertion (Vega — closes the CLAUDE.md TODO) ──
+  // This agent deploys single-side SOL into the Y leg (totalYAmount = finalAmountY).
+  // That is ONLY correct when tokenY IS wSOL. quoteMint is read from the LIVE
+  // on-chain pool (pool.lbPair.tokenYMint), so a mislabelled candidate cannot fool
+  // it. The screener guards this pre-deploy, but this is the authoritative money-path
+  // belt: a single-side SOL deposit into a non-wSOL Y leg is REFUSED before any TX.
+  // FAIL-CLOSED: a missing/unreadable quoteMint also refuses (anti-pattern #2).
+  // DRY_RUN exempt (no real deposit) so paper soak on any pool shape still runs.
+  if (process.env.DRY_RUN !== "true" && finalAmountY > 0) {
+    if (!quoteMint || quoteMint !== WSOL_MINT) {
+      throw new Error(
+        `Refusing single-side SOL deploy: pool tokenY (quote) mint is ${quoteMint || "unknown"}, not wSOL (${WSOL_MINT}). SOL can only be deposited when wSOL is the Y leg.`,
+      );
+    }
+  }
+
   const isSingleSidedSol = finalAmountX <= 0 && finalAmountY > 0;
   if (isSingleSidedSol && (Number(bins_above ?? 0) > 0 || Number(upside_pct ?? 0) > 0)) {
     throw new Error(

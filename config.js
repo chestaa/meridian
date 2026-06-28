@@ -243,6 +243,19 @@ export const config = {
     // Reject reasons: tvl_mcap_ratio_too_high, tvl_mcap_ratio_unknown.
     tvlMcapGateEnabled: u.tvlMcapGateEnabled ?? true,
     maxTvlMcapRatio:    u.maxTvlMcapRatio    ?? 0.2,
+    // ─── H3 edge filter (Cassiopeia, 2026-06-28 — the safety for the memecoin lane) ───
+    // Pairs with re-enabling the memecoin DEPLOY lane (bluechipOnlyMode=false). From the
+    // 59-real-trade brain analysis ([[project-edge-stoploss-tail-2026-06-28]]): the only
+    // losing mechanism is the stop-out TAIL. The 2x2 intersection ftvl∈[0.2,1.0) AND
+    // vol≥2.5 flipped the in-sample book −$1.74 → +$9.36, EV +0.32, stop-losses 14→3.
+    // STRICTER on quality (a NEW reject), NOT a loosening — the wider lane is paid for by
+    // this filter. ftvl≥1.0 = transient spike on thin/just-launched pool (EV −0.50);
+    // vol<2.5 = slow-bleed band (EV −0.41). Default OFF (opt-in: Bro enables with the lane).
+    // FAIL-CLOSED (anti-pattern #2): missing ftvl OR vol → reject (edge_filter_data_unknown).
+    edgeFilterEnabled:     u.edgeFilterEnabled     ?? false,
+    edgeFilterFtvlMin:     u.edgeFilterFtvlMin     ?? 0.2,
+    edgeFilterFtvlMax:     u.edgeFilterFtvlMax     ?? 1.0,
+    edgeFilterMinVolatility: u.edgeFilterMinVolatility ?? 2.5,
     // ─── Enrich-before-gate for the holder floor (Cassiopeia) ───
     // Signal pools (discord/solscan/pumpfun) often arrive with holders null/0
     // because the source didn't carry the field — DATA-MISSING, not a real low
@@ -979,6 +992,10 @@ export function reloadScreeningThresholds() {
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
     if (fresh.tvlMcapGateEnabled !== undefined) s.tvlMcapGateEnabled = fresh.tvlMcapGateEnabled;
     if (fresh.maxTvlMcapRatio    != null) s.maxTvlMcapRatio = fresh.maxTvlMcapRatio;
+    if (fresh.edgeFilterEnabled  !== undefined) s.edgeFilterEnabled = fresh.edgeFilterEnabled;
+    if (fresh.edgeFilterFtvlMin  != null) s.edgeFilterFtvlMin = fresh.edgeFilterFtvlMin;
+    if (fresh.edgeFilterFtvlMax  != null) s.edgeFilterFtvlMax = fresh.edgeFilterFtvlMax;
+    if (fresh.edgeFilterMinVolatility != null) s.edgeFilterMinVolatility = fresh.edgeFilterMinVolatility;
     if (fresh.enrichHolderCountBeforeGate !== undefined) s.enrichHolderCountBeforeGate = fresh.enrichHolderCountBeforeGate;
     if (fresh.enrichNativeDetailBeforeGate !== undefined) s.enrichNativeDetailBeforeGate = fresh.enrichNativeDetailBeforeGate;
     if (fresh.broadDiscoveryEnabled  !== undefined) s.broadDiscoveryEnabled  = fresh.broadDiscoveryEnabled;

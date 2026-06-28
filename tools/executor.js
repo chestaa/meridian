@@ -9,6 +9,7 @@ import {
   closePosition,
   partialClosePosition,
   searchPools,
+  MAX_LIVE_POSITION_SOL,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
@@ -1381,7 +1382,11 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
+      // Dust floor only. Phase-1 sizing (Bro-approved 0.03/0.05) must clear, so the
+      // hard floor is 0.02 (dust guard, not a sizing floor). config.deployAmountSol can
+      // still raise it. The Phase-1 0.05 per-position CAP below + dlmm.js cap are the
+      // money-side belts and are UNCHANGED. (Vega — go-live floor drop 0.1→0.02)
+      const minDeploy = Math.max(0.02, config.management.deployAmountSol);
       if (amountY < minDeploy) {
         return {
           pass: false,
@@ -1393,6 +1398,21 @@ async function runSafetyChecks(name, args) {
           pass: false,
           reason: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
         };
+      }
+
+      // ── Phase-1 live per-position HARD CAP suspenders (Vega — go-live) ──
+      // dlmm.deployPosition is the AUTHORITATIVE belt (code-pinned MAX_LIVE_POSITION_SOL).
+      // This refuses earlier, at the executor, so a config maxDeployAmount mis-set above
+      // 0.05 can never let an oversized LIVE memecoin deploy through. Bluechip pairs use
+      // their own bluechipCap above; DRY_RUN exempt (paper soak sizes freely).
+      if (process.env.DRY_RUN !== "true" && !(config.screening?.bluechipModeEnabled === true && args.base_mint && (args.quote_mint ?? args.quote_address) && isBluechipMintPair(args.base_mint, args.quote_mint ?? args.quote_address))) {
+        const liveCap = Math.min(MAX_LIVE_POSITION_SOL, Number(config.risk?.maxDeployAmount ?? MAX_LIVE_POSITION_SOL));
+        if (amountY > liveCap) {
+          return {
+            pass: false,
+            reason: `SOL amount ${amountY} exceeds the Phase-1 live per-position cap ${liveCap} SOL (hard belt ${MAX_LIVE_POSITION_SOL}).`,
+          };
+        }
       }
 
       // ── Bluechip per-position SOL cap (Vega — Opsi B, executor suspenders) ──
