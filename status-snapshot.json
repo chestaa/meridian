@@ -1,5 +1,5 @@
 {
-  "ts": "2026-07-01T03:55:10.531Z",
+  "ts": "2026-07-01T04:00:11.332Z",
   "wallet": {
     "pubkey": "DgA9MZ…1Hiu",
     "sol_free": 0.737397,
@@ -30,7 +30,7 @@
     "auto-screener"
   ],
   "config_active": {
-    "dryRun": true,
+    "dryRun": false,
     "oor_wait_min": 20,
     "oor_cooldown_h": 6,
     "deploy_amount_sol": 0.25,
