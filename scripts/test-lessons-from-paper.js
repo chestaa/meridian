@@ -218,6 +218,85 @@ try {
       trade.status === "closed",
     );
   }
+
+  // ── 5. Finite apiPnlUsd/apiPnlPct override the value-delta recompute ──
+  // Recompute from these values would be pnl_usd=10, pnl_pct=20. The API
+  // figures (7.5 / 15) must win when finite.
+  {
+    fs.writeFileSync(LESSONS_FILE, JSON.stringify({ lessons: [], performance: [] }, null, 2));
+    config.internalAgents.paperFeedsLessons = true;
+
+    await recordPerformance({
+      position: "api_pnl_pos",
+      pool: "APIpool111",
+      pool_name: "API-SOL",
+      strategy: "spot",
+      bin_range: 35,
+      bin_step: 100,
+      volatility: 2.0,
+      fee_tvl_ratio: 0.10,
+      organic_score: 70,
+      amount_sol: 0.5,
+      fees_earned_usd: 5,
+      final_value_usd: 55,      // recompute → (55 + 5) - 50 = 10 usd, 20%
+      initial_value_usd: 50,
+      minutes_in_range: 60,
+      minutes_held: 60,
+      close_reason: "manual",
+      source: "live",
+      apiPnlUsd: 7.5,           // preferred over recompute 10
+      apiPnlPct: 15,            // preferred over recompute 20
+    });
+    const row = readLessons().performance[0];
+    assert(
+      "finite apiPnlUsd stored verbatim (7.5), not recompute (10)",
+      row && Math.abs(row.pnl_usd - 7.5) < 1e-6,
+      `got pnl_usd=${row?.pnl_usd}`,
+    );
+    assert(
+      "finite apiPnlPct stored verbatim (15), not recompute (20)",
+      row && Math.abs(row.pnl_pct - 15) < 1e-6,
+      `got pnl_pct=${row?.pnl_pct}`,
+    );
+  }
+
+  // ── 6. Legacy path — no API figures → value-delta recompute intact ──
+  {
+    fs.writeFileSync(LESSONS_FILE, JSON.stringify({ lessons: [], performance: [] }, null, 2));
+    config.internalAgents.paperFeedsLessons = true;
+
+    await recordPerformance({
+      position: "legacy_pnl_pos",
+      pool: "LEGACYpool111",
+      pool_name: "LEGACY-SOL",
+      strategy: "spot",
+      bin_range: 35,
+      bin_step: 100,
+      volatility: 2.0,
+      fee_tvl_ratio: 0.10,
+      organic_score: 70,
+      amount_sol: 0.5,
+      fees_earned_usd: 5,
+      final_value_usd: 55,      // recompute → (55 + 5) - 50 = 10 usd, 20%
+      initial_value_usd: 50,
+      minutes_in_range: 60,
+      minutes_held: 60,
+      close_reason: "manual",
+      source: "live",
+      // NOTE: no apiPnlUsd / apiPnlPct — must recompute, no crash
+    });
+    const row = readLessons().performance[0];
+    assert(
+      "legacy no-api recompute pnl_usd intact (10)",
+      row && Math.abs(row.pnl_usd - 10) < 1e-6,
+      `got pnl_usd=${row?.pnl_usd}`,
+    );
+    assert(
+      "legacy no-api recompute pnl_pct intact (20)",
+      row && Math.abs(row.pnl_pct - 20) < 1e-6,
+      `got pnl_pct=${row?.pnl_pct}`,
+    );
+  }
 } finally {
   // ── Restore state ────────────────────────────────────────────
   if (userConfigBackup === null) {

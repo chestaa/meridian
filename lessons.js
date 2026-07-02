@@ -111,6 +111,8 @@ function save(data) {
  * @param {number} perf.fees_earned_usd - Total fees earned
  * @param {number} perf.final_value_usd - Value when closed
  * @param {number} perf.initial_value_usd - Value when opened
+ * @param {number} [perf.apiPnlUsd]      - SDK/API realized price PnL (USD); preferred over recompute when finite
+ * @param {number} [perf.apiPnlPct]      - SDK/API realized price PnL (%); preferred over recompute when finite
  * @param {number} perf.minutes_in_range  - Total minutes position was in range
  * @param {number} perf.minutes_held      - Total minutes position was held
  * @param {string} perf.close_reason   - Why it was closed
@@ -134,10 +136,19 @@ export async function recordPerformance(perf) {
     return;
   }
 
-  const pnl_usd = (perf.final_value_usd + perf.fees_earned_usd) - perf.initial_value_usd;
-  const pnl_pct = perf.initial_value_usd > 0
-    ? (pnl_usd / perf.initial_value_usd) * 100
-    : 0;
+  // ponytail: prefer the SDK/API realized figure (apiPnlUsd/apiPnlPct) when the
+  // producer supplies it — that number is price-only by design (fees stay tracked
+  // separately in fees_earned_usd / fees_earned_sol so fee income and price move
+  // stay independently auditable). Fall back to the legacy value-delta recompute
+  // (fee-inclusive) only when no API figure is present, preserving old behavior.
+  const pnl_usd = Number.isFinite(perf.apiPnlUsd)
+    ? perf.apiPnlUsd
+    : (perf.final_value_usd + perf.fees_earned_usd) - perf.initial_value_usd;
+  const pnl_pct = Number.isFinite(perf.apiPnlPct)
+    ? perf.apiPnlPct
+    : perf.initial_value_usd > 0
+      ? (pnl_usd / perf.initial_value_usd) * 100
+      : 0;
   const range_efficiency = perf.minutes_held > 0
     ? (perf.minutes_in_range / perf.minutes_held) * 100
     : 0;
