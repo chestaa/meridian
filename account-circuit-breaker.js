@@ -216,10 +216,27 @@ export async function recordRealizedLoss({ pnl_pct, amount_sol, pool, pool_name,
 
 /**
  * Read-only circuit status snapshot.
+ *
+ * IMPORTANT: this is DISPLAY/STATUS ONLY — it does NOT gate deploys.
+ * It reads state directly (loadState) rather than going through
+ * getOrInitState(null), because getOrInitState collapses two very
+ * different conditions into the same null:
+ *   (1) benign "not-yet-seeded-today" — no state for the current UTC day
+ *       yet (fresh install, or day-rollover before the first balance read).
+ *       The breaker is ARMED and will seed on the next deploy check; this is
+ *       NOT a halt and must not surface as one.
+ *   (2) real "corrupt/unreadable file" — the state file exists but cannot be
+ *       parsed. This IS a genuine problem → halt / state_unreadable.
+ * Deploy safety is unchanged: assertCircuitOK() still fail-closes on BOTH
+ * conditions (a null from getOrInitStateAsync blocks the deploy). This
+ * function only fixes the STATUS reporting so a benign day-rollover no
+ * longer shows a false "HALTED — state_unreadable".
  */
 export function getCircuitStatus() {
-  const state = getOrInitState(null);
-  if (!state) {
+  const raw = loadState();
+
+  // (2) Real problem: file present but unparseable → genuine halt.
+  if (raw === "CORRUPT") {
     return {
       halted: true,
       halt_reason: "state_unreadable",
@@ -233,6 +250,31 @@ export function getCircuitStatus() {
       date: todayUtc(),
     };
   }
+
+  const today = todayUtc();
+
+  // (1) Benign: no state for today yet (fresh install or UTC-day rollover
+  // before the first balance read). Breaker is armed, not halted. On the
+  // next deploy check the daily cap resets fresh anyway (new UTC day), so
+  // reporting not-halted here is consistent with actual deploy behavior.
+  if (!raw || raw.date !== today) {
+    return {
+      halted: false,
+      pending_seed: true,
+      halt_reason: null,
+      status: "armed_pending_seed",
+      realized_loss_sol: 0,
+      realized_loss_pct: 0,
+      cap_sol: DAILY_LOSS_CAP_SOL,
+      cap_pct: DAILY_LOSS_CAP_PCT,
+      pct_to_cap_sol: 0,
+      pct_to_cap_pct: 0,
+      positions_closed_today: 0,
+      date: today,
+    };
+  }
+
+  const state = raw;
   return {
     date: state.date,
     starting_balance_sol: state.starting_balance_sol,

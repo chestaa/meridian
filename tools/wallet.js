@@ -79,6 +79,107 @@ function walletReadFailure(walletAddress, message) {
   };
 }
 
+// ─── Helius transient-failure hardening (Vega, P1 — bot idle since Jul 1) ──
+// Helius 502'd 73× in 5 days → every screening cycle read the wallet as
+// unreadable → the deploy gate skipped → the bot never deployed. Root cause is
+// a hard single-shot fetch with no retry and no fallback. Fix hardens ONLY the
+// balance READ: (1) retry-with-backoff on 5xx/429, (2) if Helius still fails,
+// fall back to plain Solana JSON-RPC `getBalance` (the path that works when
+// Helius is down — mirrors scripts/boss-report.js getSolBalance). No deploy,
+// sizing, DRY_RUN, or tx logic is touched.
+const HELIUS_RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+const HELIUS_MAX_ATTEMPTS = 3;
+const HELIUS_BACKOFF_MS = [300, 800]; // between attempt 1→2 and 2→3
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Fetch Helius balances with retry-with-backoff on transient 5xx/429.
+ * Returns the parsed JSON on success. Throws on exhausted retries or a
+ * non-retryable failure — the caller then attempts the RPC fallback.
+ */
+async function fetchHeliusBalancesWithRetry(url) {
+  let lastErr;
+  for (let attempt = 1; attempt <= HELIUS_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        // Retry only on transient status; other !ok (e.g. 401 bad key) is
+        // non-retryable → throw immediately (RPC fallback still runs after).
+        if (HELIUS_RETRYABLE_STATUS.has(res.status) && attempt < HELIUS_MAX_ATTEMPTS) {
+          lastErr = new Error(`Helius API error: ${res.status} ${res.statusText}`);
+          log("wallet_warn", `Helius ${res.status} (attempt ${attempt}/${HELIUS_MAX_ATTEMPTS}) — retrying`);
+          await sleep(HELIUS_BACKOFF_MS[attempt - 1] ?? 800);
+          continue;
+        }
+        throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
+      }
+      return await res.json();
+    } catch (e) {
+      lastErr = e;
+      // Network-level throw (fetch reject) is transient → retry with backoff.
+      if (attempt < HELIUS_MAX_ATTEMPTS) {
+        log("wallet_warn", `Helius fetch threw (attempt ${attempt}/${HELIUS_MAX_ATTEMPTS}): ${e.message} — retrying`);
+        await sleep(HELIUS_BACKOFF_MS[attempt - 1] ?? 800);
+        continue;
+      }
+      throw lastErr;
+    }
+  }
+  throw lastErr ?? new Error("Helius fetch failed");
+}
+
+/**
+ * Plain Solana JSON-RPC getBalance fallback (SOL only). Mirrors the working
+ * pattern in scripts/boss-report.js — this RPC path stays up when Helius is
+ * down. Returns a finite SOL number on success, or null on ANY failure.
+ * NEVER returns 0-as-success: a network/RPC failure yields null so the caller
+ * fails closed (anti-pattern #2/#3), not a fabricated empty wallet.
+ */
+async function getSolBalanceViaRpc(walletAddress) {
+  const rpcUrl = process.env.RPC_URL;
+  if (!rpcUrl) return null;
+  try {
+    const res = await fetch(rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getBalance", params: [walletAddress] }),
+    });
+    if (!res.ok) return null;
+    const d = await res.json();
+    // A genuine RPC success carries result.value (lamports, possibly 0). Its
+    // ABSENCE means the response was unusable → null, not a sentinel 0.
+    const lamports = d?.result?.value;
+    if (lamports == null || !Number.isFinite(Number(lamports))) return null;
+    return Number(lamports) / LAMPORTS_PER_SOL;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Degraded (RPC-fallback) balance shape. SOL is real (from chain RPC), but the
+ * USD/price/token/usdc fields Helius would have provided are genuinely unknown
+ * → null (never fabricated, never a sentinel 0). `error` stays false so the
+ * deploy gate can proceed on a real SOL read; `degraded`/`source` are markers
+ * for observability. `tokens: []` keeps auto-swap callers (`.tokens?.find`)
+ * fail-closed (find nothing) rather than throwing.
+ */
+function walletRpcFallback(walletAddress, sol) {
+  return {
+    wallet: walletAddress,
+    sol: Math.round(sol * 1e6) / 1e6,
+    sol_price: null,
+    sol_usd: null,
+    usdc: null,
+    tokens: [],
+    total_usd: null,
+    error: false,
+    degraded: true,
+    source: "rpc_fallback",
+  };
+}
+
 export async function getWalletBalances() {
   let walletAddress;
   try {
@@ -90,18 +191,19 @@ export async function getWalletBalances() {
   const HELIUS_KEY = process.env.HELIUS_API_KEY;
   if (!HELIUS_KEY) {
     log("wallet_error", "HELIUS_API_KEY not set in .env");
+    // No Helius key: still try the RPC fallback so the deploy gate can proceed
+    // on a real SOL read rather than skipping forever.
+    const sol = await getSolBalanceViaRpc(walletAddress);
+    if (sol != null && Number.isFinite(sol)) {
+      log("wallet_warn", "Helius API key missing — served SOL via RPC fallback");
+      return walletRpcFallback(walletAddress, sol);
+    }
     return walletReadFailure(walletAddress, "Helius API key missing");
   }
 
   try {
     const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
-    const res = await fetch(url);
-
-    if (!res.ok) {
-      throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
-    }
-
-    const data = await res.json();
+    const data = await fetchHeliusBalancesWithRetry(url);
     // Distinguish "Helius returned no balances field" (read failure / malformed)
     // from "wallet genuinely holds nothing". A successful 200 always carries a
     // `balances` array; its ABSENCE means the response was unusable → fail-closed
@@ -138,7 +240,16 @@ export async function getWalletBalances() {
       total_usd: Math.round((data.totalUsdValue || 0) * 100) / 100,
     };
   } catch (error) {
-    log("wallet_error", error.message);
+    // Helius exhausted (retries + non-retryable). Try the RPC fallback so a
+    // Helius outage no longer freezes deploys. Only if RPC ALSO fails do we
+    // return the unreadable/skip result (fail-closed — anti-pattern #2/#3).
+    log("wallet_warn", `Helius unreadable after retries (${error.message}) — attempting RPC fallback`);
+    const sol = await getSolBalanceViaRpc(walletAddress);
+    if (sol != null && Number.isFinite(sol)) {
+      log("wallet_warn", `Served SOL=${sol} via RPC fallback (Helius down)`);
+      return walletRpcFallback(walletAddress, sol);
+    }
+    log("wallet_error", `Both Helius and RPC fallback failed: ${error.message}`);
     return walletReadFailure(walletAddress, error.message);
   }
 }
