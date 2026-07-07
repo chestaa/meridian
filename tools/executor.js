@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair, poolLegMints } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair, poolLegMints, peekDiscoveryDetailByAddress } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -265,6 +265,25 @@ export function __fetchFreshPoolDetailForTests(poolAddress, timeframe) {
 }
 
 /**
+ * Vega 2026-07-07 — 429-dedup peek seam. `validateDeployPoolThresholds` prefers
+ * the already-fetched live discovery detail (Cassiopeia's peekDiscoveryDetailByAddress
+ * in screening.js) over a redundant fetchFreshPoolDetail on every deploy. That
+ * redundant fetch re-hit Meteora Pool-Discovery seconds after discovery already
+ * pulled the same pool → 429 → snapshot_verify_failed on GOOD candidates. Reuse
+ * removes ONLY the network fetch on a cache-hit; ALL threshold checks below still
+ * run on the reused detail, and a null/miss falls through to fetchFreshPoolDetail
+ * (fail-closed preserved). ESM namespace bindings can't be redefined for tests,
+ * so route the peek through a settable impl.
+ */
+let _peekDiscoveryDetailImpl = (poolAddress, timeframe) => peekDiscoveryDetailByAddress(poolAddress, timeframe);
+export function __setPeekDiscoveryDetailForTests(peekFn) {
+  _peekDiscoveryDetailImpl = peekFn || ((p, t) => peekDiscoveryDetailByAddress(p, t));
+}
+export function __resetPeekDiscoveryDetailForTests() {
+  _peekDiscoveryDetailImpl = (p, t) => peekDiscoveryDetailByAddress(p, t);
+}
+
+/**
  * Vega — bounded retry-with-backoff for the pre-deploy snapshot READ fetch.
  * Retries ONLY transient errors (429/502/503/504/timeout) up to
  * SNAPSHOT_FETCH_MAX_RETRIES with exponential backoff (~1s/2s/4s/8s/16s). Non-transient
@@ -410,9 +429,26 @@ export function computeDrift(original, fresh) {
 
 async function validateDeployPoolThresholds(args) {
   let detail;
+  // 429-DEDUP (Vega 2026-07-07): discovery just fetched this pool's live detail
+  // seconds ago. Prefer that already-in-hand snapshot over a redundant network
+  // fetch that trips Meteora 429. Deep clone from Cassiopeia's peek — non-null =>
+  // use it as `detail` (skip the fetch entirely); ALL threshold checks below STILL
+  // run on it. null (miss/stale/TTL-0/malformed) => fall through to the fetch path
+  // exactly as before (fail-closed preserved). This is a proactive de-dup that
+  // sits ABOVE the reactive buildReuseDetailFromSnapshot 429-exhaust ride-through.
+  const peeked = _peekDiscoveryDetailImpl(args.pool_address);
+  if (peeked) {
+    detail = peeked;
+    log(
+      "snapshot_verify_peek",
+      `pre-deploy detail reused from live discovery cache for ${args.pool_address} (no re-fetch → no 429); all threshold checks still run`,
+    );
+  }
   try {
-    detail = await fetchFreshPoolDetail(args.pool_address);
-    if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
+    if (!detail) {
+      detail = await fetchFreshPoolDetail(args.pool_address);
+      if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
+    }
   } catch (error) {
     // Vega 2026-06-20 — 429 ride-through fallback. The bounded retry-with-backoff
     // already ran inside fetchFreshPoolDetail (6 attempts, ~31s) for transient
@@ -505,6 +541,15 @@ async function validateDeployPoolThresholds(args) {
   const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
   let volatilityDetail = detail;
   if ((config.screening.timeframe || "5m") !== volatilityTimeframe) {
+    // 429-DEDUP (Vega 2026-07-07): same proactive reuse for the secondary
+    // volatility-timeframe read. Prefer the already-fetched discovery detail for
+    // THIS timeframe over a redundant fetch. non-null => use it (skip fetch, vol
+    // floor/ceiling check below still runs on it); null => fetch as before, and
+    // the existing transient-exhaust ride-through / fail-close is untouched.
+    const peekedVol = _peekDiscoveryDetailImpl(args.pool_address, volatilityTimeframe);
+    if (peekedVol) {
+      volatilityDetail = peekedVol;
+    } else {
     try {
       volatilityDetail = await fetchFreshPoolDetail(args.pool_address, volatilityTimeframe);
     } catch (error) {
@@ -520,6 +565,7 @@ async function validateDeployPoolThresholds(args) {
           reason: `snapshot_verify_failed: could not verify pool ${volatilityTimeframe} volatility before deploy: ${error.message}`,
         };
       }
+    }
     }
   }
 

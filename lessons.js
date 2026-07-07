@@ -246,17 +246,32 @@ export async function recordPerformance(perf) {
  * Only generates a lesson if the outcome was clearly good or bad.
  */
 function derivLesson(perf) {
+  // Lyra integrity fix: NEVER derive a lesson from a paper trade. Paper PnL is
+  // fee-inclusive/optimistic and never touched the wallet — it poisoned the
+  // "PREFER" lessons (SPCX-SOL paper +11.57% became a top lesson, then live
+  // stop-lossed -10.8%). Only REAL closes teach the bot.
+  if ((perf.source || "live") === "paper") return null;
+
   const tags = [];
   const feeYieldPct = perf.initial_value_usd > 0
     ? ((perf.fees_earned_usd || 0) / perf.initial_value_usd) * 100
     : 0;
 
-  // Categorize outcome
-  const outcome = perf.pnl_pct >= 5 ? "good"
-    : (perf.pnl_pct >= 0 && feeYieldPct >= 2) ? "good"
-    : perf.pnl_pct >= 0 ? "neutral"
-    : perf.pnl_pct >= -5 ? "poor"
-    : "bad";
+  // Categorize outcome — WALLET-TRUTH first. A trade is a WIN only when its
+  // realized SOL delta (net of IL+fees+gas) clears the meaningful bar, and a
+  // LOSS only when it drops below it. This inverts the old fee-inclusive
+  // pnl_pct signal that mislabeled slow-bleed-to-stop trades (100% in-range,
+  // price walked straight down) as wins. Legacy records with no realized
+  // figure fall back to the pnl_pct heuristic.
+  const realized = realizedSol(perf);
+  const bar = meaningfulProfitBarSol();
+  const outcome = realized !== null
+    ? (realized >= bar ? "good" : realized <= -bar ? "bad" : "neutral")
+    : (perf.pnl_pct >= 5 ? "good"
+      : (perf.pnl_pct >= 0 && feeYieldPct >= 2) ? "good"
+      : perf.pnl_pct >= 0 ? "neutral"
+      : perf.pnl_pct >= -5 ? "poor"
+      : "bad");
 
   if (outcome === "neutral") return null; // nothing interesting to learn
 
@@ -277,8 +292,12 @@ function derivLesson(perf) {
     if (perf.range_efficiency < 30 && outcome === "bad") {
       rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
       tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
-    } else if (perf.range_efficiency > 80 && outcome === "good") {
-      rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
+    } else if (perf.range_efficiency > 80 && outcome === "good" && realized !== null && realized > 0) {
+      // 100%-in-range is a PREFER signal ONLY when paired with a positive
+      // realized SOL delta. Range-efficiency alone selects the slow-bleed
+      // profile: price walking straight DOWN through the range reads 100%
+      // in-range yet loses money. Never reward in-range efficiency in isolation.
+      rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, realized +${realized.toFixed(4)} SOL (PnL +${perf.pnl_pct}%).`;
       tags.push("efficient", perf.strategy);
     } else if (outcome === "bad" && perf.close_reason?.includes("volume")) {
       rule = `AVOID: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
@@ -347,8 +366,19 @@ function derivLesson(perf) {
 export function evolveThresholds(perfData, config) {
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
-  const winners = perfData.filter((p) => p.pnl_pct > 0);
-  const losers  = perfData.filter((p) => p.pnl_pct < -5);
+  // Lyra integrity fix: evolve thresholds ONLY from REAL closes. Paper trades
+  // poisoned the evolution (fee-inclusive/optimistic PnL that never touched the
+  // wallet). Exclude source==="paper" before any winner/loser math.
+  const real = perfData.filter((p) => (p.source || "live") !== "paper");
+  if (real.length < MIN_EVOLVE_POSITIONS) return null;
+
+  // Winner/loser classification is WALLET-TRUTH: realized SOL delta (net of
+  // IL+fees+gas), NOT fee-inclusive pnl_pct. A winner cleared the meaningful
+  // profit bar; a loser dropped below it. Legacy records with no realized
+  // figure fall back to the pnl_pct sign.
+  const bar = meaningfulProfitBarSol();
+  const winners = real.filter((p) => evolveIsWinner(p, bar));
+  const losers  = real.filter((p) => evolveIsLoser(p, bar));
 
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
@@ -433,7 +463,7 @@ export function evolveThresholds(perfData, config) {
 
   Object.assign(userConfig, changes);
   userConfig._lastEvolved = new Date().toISOString();
-  userConfig._positionsAtEvolution = perfData.length;
+  userConfig._positionsAtEvolution = real.length;
 
   fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
@@ -446,7 +476,7 @@ export function evolveThresholds(perfData, config) {
   const data = load();
   data.lessons.push({
     id: Date.now(),
-    rule: `[AUTO-EVOLVED @ ${perfData.length} positions] ${Object.entries(changes).map(([k, v]) => `${k}=${v}`).join(", ")} — ${Object.values(rationale).join("; ")}`,
+    rule: `[AUTO-EVOLVED @ ${real.length} real positions] ${Object.entries(changes).map(([k, v]) => `${k}=${v}`).join(", ")} — ${Object.values(rationale).join("; ")}`,
     tags: ["evolution", "config_change"],
     outcome: "manual",
     created_at: new Date().toISOString(),
@@ -460,6 +490,32 @@ export function evolveThresholds(perfData, config) {
 
 function isFiniteNum(n) {
   return typeof n === "number" && isFinite(n);
+}
+
+/**
+ * Wallet-truth realized SOL delta for a performance record (net of IL+fees+gas),
+ * or null when the record predates realized-SOL accounting. This is the ONLY
+ * honest win/loss signal — pnl_pct is fee-inclusive and masks principal bleed.
+ * @param {object} perf
+ * @returns {number|null}
+ */
+function realizedSol(perf) {
+  const v = Number(perf?.realized_sol_delta);
+  return Number.isFinite(v) ? v : null;
+}
+
+/** evolveThresholds winner test — realized SOL clears the meaningful bar (wallet-truth); legacy fallback = pnl_pct>0. */
+function evolveIsWinner(p, bar) {
+  const r = realizedSol(p);
+  if (r !== null) return r >= bar;
+  return Number(p?.pnl_pct) > 0;
+}
+
+/** evolveThresholds loser test — realized SOL below the negative bar (wallet-truth); legacy fallback = pnl_pct<-5. */
+function evolveIsLoser(p, bar) {
+  const r = realizedSol(p);
+  if (r !== null) return r <= -bar;
+  return Number(p?.pnl_pct) < -5;
 }
 
 function avg(arr) {

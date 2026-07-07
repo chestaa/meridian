@@ -146,19 +146,20 @@ try {
     );
   }
 
-  // ── 3. 5-paper-close cadence triggers evolveThresholds ──────
-  // We already have 2 records (paper + live). Add 4 more paper closes →
-  // performance.length hits 5 then 6; the % 5 === 0 check fires at length 5.
-  // To exercise it cleanly we'll reset and run exactly 5 paper closes with
-  // winner/loser split that evolveThresholds will actually move on.
+  // ── 3. Paper closes DO NOT evolve thresholds (Lyra integrity fix) ──
+  // Paper PnL is fee-inclusive/optimistic and never touched the wallet — it
+  // poisoned the learning loop. 5 paper closes hit the % 5 cadence but must be
+  // EXCLUDED from evolveThresholds → no [AUTO-EVOLVED] lesson, no derived
+  // PREFER/AVOID lessons from paper rows.
   {
     // Reset state
     fs.writeFileSync(LESSONS_FILE, JSON.stringify({ lessons: [], performance: [] }, null, 2));
-    // Reset config screening floors so evolution has headroom
+    // Reset config screening floors so evolution WOULD have headroom (proving
+    // the block is about source=paper, not lack of headroom).
     config.screening.minFeeActiveTvlRatio = 0.05;
     config.screening.minOrganic = 60;
 
-    // 3 winners (high fee_tvl, high organic, +pnl) + 2 losers (low fee_tvl, low organic, -pnl)
+    // 3 winners + 2 losers — a split that WOULD move thresholds if these were real.
     const scenarios = [
       { pnl: +8,  fee_tvl: 0.10, organic: 80 },
       { pnl: +12, fee_tvl: 0.11, organic: 82 },
@@ -185,15 +186,18 @@ try {
       "all 5 rows tagged source=paper",
       lessons.performance.every((r) => r.source === "paper"),
     );
-    // evolveThresholds runs synchronously inside recordPerformance via dynamic import.
-    // Successful evolution should push an [AUTO-EVOLVED ...] lesson.
     const evolved = lessons.lessons.some((l) =>
       typeof l.rule === "string" && l.rule.includes("AUTO-EVOLVED"),
     );
     assert(
-      "evolveThresholds fired at the 5-close cadence",
-      evolved,
-      `lessons rules: ${lessons.lessons.map((l) => l.rule?.slice(0, 40)).join(" | ")}`,
+      "paper closes DID NOT evolve thresholds (no AUTO-EVOLVED lesson)",
+      !evolved,
+      `unexpected evolution: ${lessons.lessons.map((l) => l.rule?.slice(0, 40)).join(" | ")}`,
+    );
+    assert(
+      "paper closes derived NO lessons at all (paper excluded from derivation)",
+      lessons.lessons.length === 0,
+      `got ${lessons.lessons.length} lessons`,
     );
   }
 
@@ -296,6 +300,134 @@ try {
       row && Math.abs(row.pnl_pct - 20) < 1e-6,
       `got pnl_pct=${row?.pnl_pct}`,
     );
+  }
+
+  // ── 7. 100%-in-range but NET-LOSING trade is NOT a PREFER lesson ──
+  // This is the poison signature: price walks straight DOWN through the range
+  // (range_efficiency=100%) while realized SOL is negative. The old code saw
+  // fee-inclusive pnl_pct>0 + high range-eff and derived a "PREFER" lesson.
+  // Now realized_sol_delta drives the outcome → this must NOT be a PREFER.
+  {
+    fs.writeFileSync(LESSONS_FILE, JSON.stringify({ lessons: [], performance: [] }, null, 2));
+    config.internalAgents.paperFeedsLessons = true;
+
+    await recordPerformance({
+      position: "bleed_pos",
+      pool: "BLEEDpool111",
+      pool_name: "BLEED-SOL",
+      strategy: "spot",
+      bin_range: 35,
+      bin_step: 100,
+      volatility: 1.5,
+      fee_tvl_ratio: 0.10,
+      organic_score: 75,
+      amount_sol: 0.5,
+      fees_earned_usd: 6,            // fee-inclusive pnl_pct would look positive
+      final_value_usd: 47,
+      initial_value_usd: 50,
+      minutes_in_range: 60,
+      minutes_held: 60,              // range_efficiency = 100%
+      close_reason: "stop loss",
+      source: "live",
+      realized_sol_delta: -0.03,     // WALLET-TRUTH: net loss
+    });
+    const lessons = readLessons();
+    const hasPrefer = lessons.lessons.some((l) =>
+      typeof l.rule === "string" && l.rule.startsWith("PREFER"),
+    );
+    assert(
+      "100%-in-range but net-losing trade did NOT derive a PREFER lesson",
+      !hasPrefer,
+      `lessons: ${lessons.lessons.map((l) => l.rule?.slice(0, 50)).join(" | ")}`,
+    );
+    // Should be classified bad (negative realized) → AVOID/FAILED, not PREFER/WORKED.
+    const derived = lessons.lessons.find((l) => l.sourceType === "performance");
+    assert(
+      "net-losing 100%-range trade derived a negative-outcome lesson (bad)",
+      derived && derived.outcome === "bad",
+      `got outcome=${derived?.outcome}`,
+    );
+  }
+
+  // ── 8. 100%-in-range WITH positive realized SOL IS a PREFER lesson ──
+  {
+    fs.writeFileSync(LESSONS_FILE, JSON.stringify({ lessons: [], performance: [] }, null, 2));
+    config.internalAgents.paperFeedsLessons = true;
+
+    await recordPerformance({
+      position: "good_range_pos",
+      pool: "GOODpool111",
+      pool_name: "GOOD-SOL",
+      strategy: "bid_ask",
+      bin_range: 35,
+      bin_step: 100,
+      volatility: 4.2,
+      fee_tvl_ratio: 0.15,
+      organic_score: 80,
+      amount_sol: 0.5,
+      fees_earned_usd: 8,
+      final_value_usd: 56,
+      initial_value_usd: 50,
+      minutes_in_range: 60,
+      minutes_held: 60,              // range_efficiency = 100%
+      close_reason: "take profit",
+      source: "live",
+      realized_sol_delta: +0.04,     // WALLET-TRUTH: net win
+    });
+    const lessons = readLessons();
+    const hasPrefer = lessons.lessons.some((l) =>
+      typeof l.rule === "string" && l.rule.startsWith("PREFER"),
+    );
+    assert(
+      "100%-in-range WITH positive realized SOL DID derive a PREFER lesson",
+      hasPrefer,
+      `lessons: ${lessons.lessons.map((l) => l.rule?.slice(0, 50)).join(" | ")}`,
+    );
+  }
+
+  // ── 9. evolveThresholds is realized-SOL-driven on LIVE records ──
+  // A record whose fee-inclusive pnl_pct is POSITIVE but whose realized SOL is
+  // NEGATIVE must count as a LOSER (not a winner). Build a split that only
+  // resolves correctly under realized-SOL classification.
+  {
+    const { evolveThresholds } = await import("../lessons.js");
+    const bar = 0.005; // matches DEFAULT_MIN_MEANINGFUL_PROFIT_SOL
+    const cfg = { screening: { minFeeActiveTvlRatio: 0.05, minOrganic: 60 } };
+
+    // 3 real winners: positive realized SOL, high fee_tvl + organic.
+    // 2 real losers: pnl_pct LOOKS positive (fee-inclusive) but realized SOL NEGATIVE,
+    //                low fee_tvl + organic → should push floors up if counted as losers.
+    const perfData = [
+      { source: "live", pnl_pct: +8,  realized_sol_delta: +0.02, fee_tvl_ratio: 0.12, organic_score: 82 },
+      { source: "live", pnl_pct: +6,  realized_sol_delta: +0.03, fee_tvl_ratio: 0.11, organic_score: 80 },
+      { source: "live", pnl_pct: +5,  realized_sol_delta: +0.015, fee_tvl_ratio: 0.13, organic_score: 84 },
+      { source: "live", pnl_pct: +2,  realized_sol_delta: -0.02, fee_tvl_ratio: 0.04, organic_score: 52 },
+      { source: "live", pnl_pct: +1,  realized_sol_delta: -0.03, fee_tvl_ratio: 0.03, organic_score: 55 },
+    ];
+    const result = evolveThresholds(perfData, cfg);
+    assert(
+      "evolveThresholds returned a result on 5 real records",
+      result !== null,
+      `got: ${result}`,
+    );
+    // Under fee-inclusive pnl_pct all 5 look like winners (all >0) → no losers,
+    // no signal to raise floors. Under realized-SOL the last 2 are losers with
+    // low fee_tvl/organic → floors should rise. Prove realized drove it.
+    assert(
+      "realized-SOL classification produced threshold changes (fee-inclusive would not)",
+      result && result.changes && Object.keys(result.changes).length > 0,
+      `changes: ${JSON.stringify(result?.changes)}`,
+    );
+
+    // Control: same records but with paper source → excluded → no evolution.
+    const paperData = perfData.map((p) => ({ ...p, source: "paper" }));
+    const paperResult = evolveThresholds(paperData, { screening: { minFeeActiveTvlRatio: 0.05, minOrganic: 60 } });
+    assert(
+      "all-paper dataset yields no evolution (paper excluded)",
+      paperResult === null,
+      `got: ${JSON.stringify(paperResult)}`,
+    );
+    void bar;
   }
 } finally {
   // ── Restore state ────────────────────────────────────────────

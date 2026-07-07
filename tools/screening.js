@@ -167,10 +167,67 @@ export function peekDiscoveryCache(reqParams) {
   return JSON.parse(JSON.stringify(hit.data));
 }
 
+/**
+ * By-address reuse primitive for the Vega pre-deploy snapshot-verify path (429
+ * ROOT-CAUSE, Cassiopeia). Returns a within-TTL cached RAW pool-detail object for
+ * `poolAddress` (DEEP-CLONED), or null when nothing fresh is cached. **Read-only —
+ * never triggers a fetch.** Checks the per-pool detail cache first (freshest
+ * single-pool detail), then scans the broad page cache for a matching
+ * `pool_address`. This lets `validateDeployPoolThresholds` (executor.js, Vega's
+ * money-path) reuse the pool data the discovery fetch ALREADY pulled this cycle
+ * instead of re-hitting the Pool-Discovery endpoint — the redundant re-fetch is
+ * itself the 429 source (Draco 2026-07-07).
+ *
+ * FAIL-CLOSED PRESERVED (anti-pattern #2): any miss, stale entry, disabled cache,
+ * empty page, or absent address → null. The caller MUST treat null as "no reuse"
+ * and fall through to its own fetch + existing fail-closed guard — this primitive
+ * NEVER fabricates a detail and NEVER lets a deploy proceed on unverified data.
+ * The reused object is a real live snapshot from the discovery fetch seconds
+ * earlier, bounded by the SAME cache TTLs that govern discovery reuse. Exported.
+ */
+export function peekDiscoveryDetailByAddress(poolAddress, timeframe = config.screening?.timeframe || "5m") {
+  if (!poolAddress) return null;
+  const now = Date.now();
+
+  // 1. Per-pool detail cache — exact (address|timeframe) key, freshest source.
+  const detailTtl = _discoveryDetailCacheTtlMs();
+  if (detailTtl > 0) {
+    const hit = _discoveryDetailCache.get(`${poolAddress}|${timeframe}`);
+    if (hit && hit.detail != null && now - hit.ts <= detailTtl) {
+      return JSON.parse(JSON.stringify(hit.detail));
+    }
+  }
+
+  // 2. Broad page cache — scan within-TTL pages for the pool by pool_address.
+  const pageTtl = _discoveryCacheTtlMs();
+  if (pageTtl > 0) {
+    for (const hit of _discoveryPageCache.values()) {
+      if (!hit || now - hit.ts > pageTtl) continue;
+      const pools = hit.data?.data;
+      if (!Array.isArray(pools)) continue;
+      const match = pools.find((p) => p?.pool_address === poolAddress);
+      if (match) return JSON.parse(JSON.stringify(match));
+    }
+  }
+  return null;
+}
+
 /** Test/ops hook — clear both discovery caches (page + per-pool detail). Exported. */
 export function clearDiscoveryCache() {
   _discoveryPageCache.clear();
   _discoveryDetailCache.clear();
+}
+
+/**
+ * Test seam — prime the discovery caches so the by-address reuse primitive can be
+ * exercised without a live fetch. `page` seeds the broad page cache under an
+ * arbitrary key; `detail` seeds the per-pool detail cache. `ageMs` back-dates the
+ * entry timestamp to test staleness. Production code never calls this.
+ */
+export function __primeDiscoveryCachesForTests({ pageKey, pageData, detailKey, detail, ageMs = 0 } = {}) {
+  const ts = Date.now() - ageMs;
+  if (pageKey != null) _discoveryPageCache.set(pageKey, { data: pageData, ts });
+  if (detailKey != null) _discoveryDetailCache.set(detailKey, { detail, ts });
 }
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
