@@ -37,6 +37,7 @@
 import { config, computeDeployAmount, computeDynamicDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { executeTool as defaultExecuteTool } from "../tools/executor.js";
 import { getWalletBalances as defaultGetWalletBalances } from "../tools/wallet.js";
+import { detectMarketRegime as defaultDetectMarketRegime } from "../tools/screening.js";
 import { log } from "../logger.js";
 
 // Test-only seams. Production code never calls these. Mirrors the pattern in
@@ -44,12 +45,16 @@ import { log } from "../logger.js";
 // this module pure + production-safe — defaults are bound at import time.
 let _executeTool = defaultExecuteTool;
 let _getWalletBalances = defaultGetWalletBalances;
+let _detectMarketRegime = defaultDetectMarketRegime;
 
 export function __setExecuteToolForTests(fn) {
   _executeTool = typeof fn === "function" ? fn : defaultExecuteTool;
 }
 export function __setGetWalletBalancesForTests(fn) {
   _getWalletBalances = typeof fn === "function" ? fn : defaultGetWalletBalances;
+}
+export function __setDetectMarketRegimeForTests(fn) {
+  _detectMarketRegime = typeof fn === "function" ? fn : defaultDetectMarketRegime;
 }
 
 function numberOrNull(value) {
@@ -228,6 +233,35 @@ export async function deployFromOrionVerdict(orionVerdict, candidate, context = 
     bin_step: numberOrNull(pool.bin_step),
   };
 
+  // ─── entry_features raw inputs (Vega — data-collection mode, 2026-07-10) ──
+  // The raw context snapshot for direction-gating (#2). Every value is ALREADY
+  // known this cycle — NO new API call is added here:
+  //   - SOL 24h regime: detectMarketRegime is 10-min cached and was populated by
+  //     this cycle's screening pass, so this reads the warm cache (fail-safe
+  //     NEUTRAL / null on any miss, never throws, never fabricates).
+  //   - token price change / flow / mcap: taken off the enriched candidate + pool.
+  // Absent inputs pass through as null (dlmm.buildEntryFeatures + state.js coerce).
+  const ti = candidate?.ti || {};
+  let solRegime24hPct = numberOrNull(context.solRegime24hPct);
+  if (solRegime24hPct == null) {
+    try {
+      const regime = await _detectMarketRegime({ s: config.screening });
+      solRegime24hPct = numberOrNull(regime?.sol24hChangePct);
+    } catch (e) {
+      log("agent", `[VEGA_DETERMINISTIC] regime read failed (entry_features): ${e.message}`);
+      solRegime24hPct = null;
+    }
+  }
+  const tokenPriceChange1h = numberOrNull(
+    ti?.stats_1h?.price_change ?? pool.price_change_1h ?? pool.price_change_pct,
+  );
+  const tokenPriceChange24h = numberOrNull(
+    ti?.stats_24h?.price_change ?? pool.price_change_24h,
+  );
+  const buyVol = numberOrNull(pool.buy_vol ?? pool.buy_vol_usd);
+  const sellVol = numberOrNull(pool.sell_vol ?? pool.sell_vol_usd);
+  const mcap = numberOrNull(pool.mcap ?? pool.market_cap);
+
   const args = {
     pool_address: poolAddress,
     pool_name: pool.name || null,
@@ -244,6 +278,13 @@ export async function deployFromOrionVerdict(orionVerdict, candidate, context = 
     fee_tvl_ratio: numberOrNull(pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio),
     organic_score: numberOrNull(pool.organic_score),
     candidate_snapshot: candidateSnapshot,
+    // entry_features raw inputs — threaded to deployPosition → buildEntryFeatures.
+    sol_regime_24h_pct: solRegime24hPct,
+    token_price_change_1h: tokenPriceChange1h,
+    token_price_change_24h: tokenPriceChange24h,
+    buy_vol: buyVol,
+    sell_vol: sellVol,
+    mcap,
   };
 
   log(

@@ -28,6 +28,26 @@ function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
   return cleaned || null;
 }
 
+// Vega — entry_features normalizer (data-collection mode, 2026-07-10). Guarantees
+// every position record carries a well-shaped 5-field entry_features object. Raw
+// data for direction-gating (#2). FAIL-SAFE (anti-pattern #2): each field is coerced
+// to a finite number or null — NEVER fabricated. buy_sell_flow_ratio is threaded
+// pre-computed by the deploy path (dlmm.buildEntryFeatures); here we only coerce.
+function normalizeEntryFeatures(ef) {
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const src = ef && typeof ef === "object" ? ef : {};
+  return {
+    sol_regime_24h_pct: num(src.sol_regime_24h_pct),
+    token_price_change_1h: num(src.token_price_change_1h),
+    token_price_change_24h: num(src.token_price_change_24h),
+    buy_sell_flow_ratio: num(src.buy_sell_flow_ratio),
+    mcap: num(src.mcap),
+  };
+}
+
 function load() {
   if (!fs.existsSync(STATE_FILE)) {
     return { positions: {}, recentEvents: [], lastUpdated: null };
@@ -70,6 +90,7 @@ export function trackPosition({
   initial_value_usd,
   is_bluechip = false,
   signal_snapshot = null,
+  entry_features = null,
 }) {
   const state = load();
   state.positions[position] = {
@@ -93,6 +114,11 @@ export function trackPosition({
     // memecoin path unchanged. bluechipPatientOorEnabled gates the live effect.
     is_bluechip: is_bluechip === true,
     signal_snapshot: signal_snapshot || null,
+    // Vega — entry_features (data-collection mode). Snapshot of the market/token
+    // context at deploy for later direction-gating (#2). Threaded from the in-cycle
+    // screening enrichment + market-regime read (NO new API call). Null fields where
+    // a value was unavailable at deploy (fail-safe, never fabricated).
+    entry_features: normalizeEntryFeatures(entry_features),
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
     last_claim_at: null,

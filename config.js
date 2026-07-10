@@ -462,7 +462,15 @@ export const config = {
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
-    deployAmountSol:       u.deployAmountSol       ?? 0.5,
+    // Vega — data-collection size PIN (2026-07-10). Default lowered 0.5 → 0.10.
+    // ROOT-CAUSE of the Jul 7-10 deploy deadlock: with floor===ceil===0.5 and a
+    // 0.737-SOL wallet, computeDeployAmount clamped to the deployable (~0.48) which
+    // then fell BELOW the executor minDeploy floor (max(0.02, deployAmountSol)=0.5),
+    // so all 35 deploy attempts were refused. Pinning floor=ceil=0.10 (this default
+    // + maxDeployAmount 0.10 via user-config on VPS) makes every deploy a UNIFORM
+    // 0.10 SOL bet that clears the floor. 0.10 is far under MAX_LIVE_POSITION_SOL
+    // (0.5 hard belt) and the bluechip cap — all money-side caps still bind above it.
+    deployAmountSol:       u.deployAmountSol       ?? 0.10,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
     // Trailing take-profit
@@ -685,9 +693,14 @@ export const config = {
     // Orion cost fix (2026-06-01) — cap how many scored candidates are rendered into the
     // SCREENER goal. Trims the dominant prompt-token driver; reporting still sees all.
     screeningPromptCandidateCap: u.screeningPromptCandidateCap ?? 5,
-    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "xiaomi/mimo-v2-omni",
-    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "xiaomi/mimo-v2-pro",
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "xiaomi/mimo-v2-omni",
+    // Deprecation refresh (2026-07-10, Orion) — hardcoded defaults realigned from the
+    // retired xiaomi v2 family (mimo-v2-omni / mimo-v2-pro, removed from OpenRouter) to
+    // the confirmed-live default deepseek/deepseek-v4-flash. These are overridden by
+    // user-config.json (already deepseek-v4-flash for all roles), so this is a hygiene
+    // fix that only bites if the user-config keys are ever unset — no runtime change.
+    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "deepseek/deepseek-v4-flash",
+    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "deepseek/deepseek-v4-flash",
+    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "deepseek/deepseek-v4-flash",
     routing: u.llmRouting ?? null,
   },
 

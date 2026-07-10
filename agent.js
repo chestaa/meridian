@@ -116,7 +116,7 @@ const client = new OpenAI({
   timeout: 5 * 60 * 1000,
 });
 
-const DEFAULT_MODEL = process.env.LLM_MODEL || "xiaomi/mimo-v2-omni";
+const DEFAULT_MODEL = process.env.LLM_MODEL || "deepseek/deepseek-v4-flash";
 
 function estimateTokens(messages, tools) {
   return Math.ceil((JSON.stringify(messages).length + JSON.stringify(tools || []).length) / 3.5);
@@ -201,12 +201,20 @@ function is400Error(error) {
 // Pillar A reshape (2026-05-23) — provider-diverse ladder after kimi-k2/mimo-v2-pro
 // retirement from routing. Routing now defaults to deepseek/deepseek-v4-flash across
 // all rungs, so the fallback ladder MUST use different providers to recover from
-// upstream/regional OR outages. Order: mimo-v2-pro (xiaomi, distinct provider) →
-// deepseek-v4-pro (sibling paid, different upstream) → stepfun free (last resort).
+// upstream/regional OR outages. Order: mimo-v2.5-pro (xiaomi, distinct provider) →
+// deepseek-v4-pro (sibling paid, different upstream) → step-3.7-flash (last resort).
+// Deprecation refresh (2026-07-10, Orion) — OpenRouter retired the ENTIRE v2 xiaomi
+// family (v2 → v2.5) and the stepfun `step-3.5-flash:free` free variant, which surfaced
+// as intermittent "This model has been deprecated" errors on the screening/health cron
+// whenever a deepseek-v4-flash 400 tripped the ladder. Aligned to current valid ids
+// (verified against OpenRouter /api/v1/models): mimo-v2.5-pro, deepseek-v4-pro (still
+// valid), step-3.7-flash. NOTE for Lyra: rung 3 is no longer a $0 free model — the
+// stepfun free tier was removed; step-3.7-flash is paid. Only ever hit as a last-resort
+// after two prior 400s, so cost impact is negligible.
 const FALLBACK_LADDER_400 = [
-  "xiaomi/mimo-v2-pro",          // distinct provider (xiaomi) — first defense vs deepseek upstream issues
+  "xiaomi/mimo-v2.5-pro",        // distinct provider (xiaomi) — first defense vs deepseek upstream issues
   "deepseek/deepseek-v4-pro",    // sibling paid model — different model id, still deepseek but premium tier
-  "stepfun/step-3.5-flash:free", // free last-resort (preserves HOTFIX-6 behavior)
+  "stepfun/step-3.7-flash",      // provider-diverse last-resort (was step-3.5-flash:free, now deprecated)
 ];
 
 function next400Fallback(currentModel, attemptedFallbacks) {
@@ -290,7 +298,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       log("llm_route", `role=${agentType} tier=${picked.tier} model=${picked.model} tokens=${picked.tokens ?? "n/a"} step=${step + 1}`);
 
       // Retry up to 3 times on transient provider errors (502, 503, 529)
-      const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
+      const FALLBACK_MODEL = "stepfun/step-3.7-flash";
       let response;
       let usedModel = activeModel;
       // Orion deeper fix — track which fallback models we've already tried for 400 errors

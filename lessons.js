@@ -169,9 +169,33 @@ export async function recordPerformance(perf) {
   // pre-existing records and the live close path stay backward-compatible.
   const source = perf.source === "paper" ? "paper" : "live";
 
+  // Lyra — entry_features JOURNAL INTEGRITY (data-collection mode, 2026-07-10).
+  // WHY: the money-path close sites (tools/dlmm.js recordPerformance calls) forward
+  // tracked.volatility/fee_tvl_ratio/etc. but do NOT forward tracked.entry_features —
+  // so the deploy-time market/token snapshot Vega captures would be DROPPED on close
+  // and never joined to the realized outcome, making data-mode worthless. The journal
+  // is Lyra's domain, so we resolve it here without touching any money/gate code:
+  // prefer the value the producer passed, else read it from the live state record by
+  // position address (positions persist with closed:true, never deleted, so the record
+  // is still present at record time). FAIL-SAFE (anti-pattern #2): unknown → null,
+  // NEVER fabricated. Paper closes (not in state.json) keep whatever perf carried.
+  let entryFeatures = (perf.entry_features && typeof perf.entry_features === "object")
+    ? perf.entry_features
+    : null;
+  if (!entryFeatures && perf.position) {
+    try {
+      const { getTrackedPosition } = await import("./state.js");
+      const tracked = getTrackedPosition(perf.position);
+      if (tracked?.entry_features && typeof tracked.entry_features === "object") {
+        entryFeatures = tracked.entry_features;
+      }
+    } catch { /* ignore — journal still writes; entry_features stays null (honest gap) */ }
+  }
+
   const entry = {
     ...perf,
     source,
+    entry_features: entryFeatures ?? null,
     pnl_usd: Math.round(pnl_usd * 100) / 100,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
     range_efficiency: Math.round(range_efficiency * 10) / 10,

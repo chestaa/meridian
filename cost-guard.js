@@ -35,9 +35,13 @@ const RATE_PER_1K_USD = {
   // HOTFIX-4 (2026-05-17): openrouter/healer-alpha deprecated, kept for audit
   // of historical records. Active replacement: xiaomi/mimo-v2-omni.
   "openrouter/healer-alpha": 0.00017,
-  "xiaomi/mimo-v2-omni": 0.000325,
-  "xiaomi/mimo-v2-pro": 0.000325,
-  "stepfun/step-3.5-flash:free": 0.0,
+  "xiaomi/mimo-v2-omni": 0.000325,        // deprecated (v2 retired) — kept for historical audit
+  "xiaomi/mimo-v2-pro": 0.000325,         // deprecated (v2 retired) — kept for historical audit
+  "stepfun/step-3.5-flash:free": 0.0,     // deprecated (:free removed) — kept for historical audit
+  // Deprecation refresh (2026-07-10, Orion) — current fallback-ladder ids. Rates are
+  // best-effort (same tier as their predecessors) pending OpenRouter-docs confirmation.
+  "xiaomi/mimo-v2.5-pro": 0.000325,
+  "stepfun/step-3.7-flash": 0.0002,
   "minimax/minimax-m2.5": 0.000399,
   "minimax/minimax-m2.7": 0.000399,
 };

@@ -608,6 +608,44 @@ export function isFastBidAskBonus(token_age_hours, volatility, cfg) {
 }
 
 // ─── Deploy Position ───────────────────────────────────────────
+/**
+ * Vega — entry_features builder (data-collection mode, 2026-07-10). PURE, exported
+ * for unit tests. Assembles the raw context snapshot persisted on the position at
+ * deploy, consumed later by direction-gating (#2). Every input is ALREADY known
+ * this cycle (screening enrichment + market-regime read) — this adds NO API call.
+ *
+ * FAIL-SAFE (anti-pattern #2): each field is a finite number or null — NEVER
+ * fabricated. buy_sell_flow_ratio = buy/(buy+sell) in [0,1] when both flow legs are
+ * finite AND total>0; otherwise null (missing/zero flow is unknown, not "balanced").
+ */
+export function buildEntryFeatures({
+  sol_regime_24h_pct,
+  token_price_change_1h,
+  token_price_change_24h,
+  buy_vol,
+  sell_vol,
+  mcap,
+} = {}) {
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const buy = num(buy_vol);
+  const sell = num(sell_vol);
+  let buy_sell_flow_ratio = null;
+  if (buy != null && sell != null) {
+    const total = buy + sell;
+    if (total > 0) buy_sell_flow_ratio = parseFloat((buy / total).toFixed(4));
+  }
+  return {
+    sol_regime_24h_pct: num(sol_regime_24h_pct),
+    token_price_change_1h: num(token_price_change_1h),
+    token_price_change_24h: num(token_price_change_24h),
+    buy_sell_flow_ratio,
+    mcap: num(mcap),
+  };
+}
+
 export async function deployPosition({
   pool_address,
   amount_sol, // legacy: will be used as amount_y if amount_y is not provided
@@ -628,8 +666,28 @@ export async function deployPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  // Vega — entry_features raw inputs (data-collection mode). Threaded from the
+  // in-cycle screening enrichment + market-regime read; NO new API call is made
+  // here. Any absent input → null on the persisted feature (fail-safe, never
+  // fabricated). Assembled by buildEntryFeatures → persisted by trackPosition.
+  sol_regime_24h_pct,
+  token_price_change_1h,
+  token_price_change_24h,
+  buy_vol,
+  sell_vol,
+  mcap,
 }) {
   pool_address = normalizeMint(pool_address);
+  // Vega — assemble the entry_features snapshot once (fail-safe; null where absent).
+  // Persisted by both trackPosition call sites below (relay + standard deploy paths).
+  const entryFeatures = buildEntryFeatures({
+    sol_regime_24h_pct,
+    token_price_change_1h,
+    token_price_change_24h,
+    buy_vol,
+    sell_vol,
+    mcap,
+  });
   // Strategy resolution priority:
   //   1. explicit `strategy` (LLM/manual override) — always wins
   //   2. volume-regime pick — only when enabled AND no explicit strategy
@@ -978,6 +1036,7 @@ export async function deployPosition({
           amount_x: finalAmountX,
           active_bin: activeBin.binId,
           initial_value_usd,
+          entry_features: entryFeatures,
         });
       }
 
@@ -1112,6 +1171,7 @@ export async function deployPosition({
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
       initial_value_usd,
+      entry_features: entryFeatures,
     });
 
     appendDecision({

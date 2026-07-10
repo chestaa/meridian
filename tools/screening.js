@@ -816,6 +816,41 @@ export function marketRegimeGateRejectReason(pool, regimeResult, s) {
 }
 
 /**
+ * entry_features handoff builder (Cassiopeia ↔ Vega, DATA-COLLECTION MODE). PURE fn.
+ *
+ * Packages the ALREADY-FETCHED in-cycle entry conditions (market regime, SOL 24h
+ * change, base-token price change, OKX buy/sell flow, mcap) into a stable shape so
+ * Vega's deploy path (trackPosition — Vega owns it) can PERSIST them onto the
+ * position for later loss-attribution / calibration.
+ *
+ * STRICTLY telemetry — this is NOT a gate and NEVER rejects. It makes NO API calls;
+ * every input is a value already computed this cycle (regime from the gate block,
+ * the rest condensed/enriched onto the candidate). Because this is data collection
+ * and not a safety decision, a missing/non-finite field is recorded as `null`
+ * (honest gap) — the fail-closed-reject rule applies to GATES, not to telemetry we
+ * are merely persisting.
+ *
+ * @param {object} candidate - condensed+enriched candidate (price_change_pct, buy_vol, sell_vol, mcap)
+ * @param {object|null} regime - detectMarketRegime() result for this cycle (or null if not run)
+ * @param {number} [capturedAt=Date.now()] - capture timestamp (ms)
+ * @returns {object} entry_features payload
+ */
+export function buildEntryFeatures(candidate, regime, capturedAt = Date.now()) {
+  const numOrNull = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const c = candidate || {};
+  return {
+    regime: regime?.regime ?? null,
+    sol_24h_change_pct: numOrNull(regime?.sol24hChangePct),
+    regime_source: regime?.source ?? null,
+    price_change_pct: numOrNull(c.price_change_pct),
+    buy_vol: numOrNull(c.buy_vol),
+    sell_vol: numOrNull(c.sell_vol),
+    mcap: numOrNull(c.mcap),
+    captured_at: capturedAt,
+  };
+}
+
+/**
  * Cassiopeia — quote-organic gate (pure decision fn, raw-pool shape).
  *
  * THE 7TH FUNNEL WALL (Draco empirical 2026-06-11): `minQuoteOrganic 60` rejected
@@ -2314,8 +2349,13 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // ready). FAIL-SAFE: missing regime data → NEUTRAL → deploy as legacy (never a
   // blind freeze). ANTI-DORMANCY: only fires on regime===DOWNTREND, releases the
   // moment SOL recovers above the threshold next cycle.
+  // Captured once per cycle for BOTH the gate AND the entry_features handoff below
+  // (Vega persists these onto the position at deploy). Reuses the in-cycle value —
+  // detectMarketRegime is 10-min cached, so no extra fetch even when read twice.
+  let cycleRegime = null;
   if (eff.marketRegimeGateEnabled === true && eligible.length > 0) {
     const regimeResult = await detectMarketRegime({ s: eff });
+    cycleRegime = regimeResult;
     const beforeRegime = eligible.length;
     const kept = eligible.filter((p) => {
       const reason = marketRegimeGateRejectReason(p, regimeResult, eff);
@@ -2793,6 +2833,19 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     || eff.tokenAgeSweetSpotBonusEnabled === true;
   if (eligible.length > 1 && reRankEnabled) {
     eligible.sort((a, b) => scoreCandidate(b, eff) - scoreCandidate(a, eff));
+  }
+
+  // ── entry_features handoff (Cassiopeia ↔ Vega, DATA-COLLECTION MODE) ──────────
+  // Thread the ALREADY-FETCHED in-cycle regime / price-change / flow / mcap onto
+  // each surviving candidate so Vega's deploy path (trackPosition, which Vega owns)
+  // can PERSIST the entry conditions for later loss-attribution / calibration.
+  // STRICTLY telemetry — NOT a gate, never rejects. NO new API calls: every field
+  // is a value already computed this cycle (regime from the gate block above, the
+  // rest condensed/enriched onto the candidate). Missing → null (honest gap; this
+  // is data collection, not a safety decision, so a null is recorded, never faked).
+  const capturedAt = Date.now();
+  for (const c of eligible) {
+    c.entry_features = buildEntryFeatures(c, cycleRegime, capturedAt);
   }
 
   return {

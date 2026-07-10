@@ -26,7 +26,13 @@ export const MODEL_PRICING_USD_PER_1M = {
   // mimo-v2-pro) pending confirmation from OpenRouter docs.
   "xiaomi/mimo-v2-omni": { input: 1.50, output: 5.00 },
   "openrouter/healer-alpha": { input: 3.00, output: 15.00 },
-  "stepfun/step-3.5-flash:free": { input: 0, output: 0 },
+  "stepfun/step-3.5-flash:free": { input: 0, output: 0 },  // deprecated (:free removed) — kept for historical audit
+  // Deprecation refresh (2026-07-10, Orion) — current fallback-ladder ids after the
+  // xiaomi v2 family + stepfun :free tier were retired from OpenRouter. Rates best-effort
+  // (mimo-v2.5-pro = same tier as mimo-v2-pro; step-3.7-flash is now PAID, not free)
+  // pending OpenRouter-docs confirmation; override via LLM_PRICING_OVERRIDE_JSON.
+  "xiaomi/mimo-v2.5-pro": { input: 1.50, output: 5.00 },
+  "stepfun/step-3.7-flash": { input: 0.20, output: 0.20 },
   // Conservative catch-all for unknown models
   default: { input: 1.00, output: 3.00 },
 };
