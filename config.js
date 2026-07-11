@@ -253,7 +253,12 @@ export const config = {
     // vol<2.5 = slow-bleed band (EV −0.41). Default OFF (opt-in: Bro enables with the lane).
     // FAIL-CLOSED (anti-pattern #2): missing ftvl OR vol → reject (edge_filter_data_unknown).
     edgeFilterEnabled:     u.edgeFilterEnabled     ?? false,
-    edgeFilterFtvlMin:     u.edgeFilterFtvlMin     ?? 0.2,
+    // Track-B B1 (Cassiopeia 2026-07-11): floor lowered 0.2 → 0.10 so the data-mode
+    // fee/TVL overlay stops being cosmetic and ADMITS [0.10,0.20) pools for density
+    // data collection (the feeTvlHighBonus ranking already prefers the denser end
+    // inside that band). ftvlMax (1.0) and the vol floor (2.5) are UNCHANGED — this
+    // widens the LOW edge of the accepted fee/TVL band only, it is not a safety loosen.
+    edgeFilterFtvlMin:     u.edgeFilterFtvlMin     ?? 0.10,
     edgeFilterFtvlMax:     u.edgeFilterFtvlMax     ?? 1.0,
     edgeFilterMinVolatility: u.edgeFilterMinVolatility ?? 2.5,
     // ─── Enrich-before-gate for the holder floor (Cassiopeia) ───
@@ -341,8 +346,11 @@ export const config = {
     // the "king" line), full weight at/above target. The actual reject floor stays
     // modest (minFeeActiveTvlRatio — base 0.06, live overlay 0.10). FAIL-SAFE
     // (anti-pattern #2): missing fee/TVL → 0 bonus (NEUTRAL, never penalize/reject).
-    // Default OFF (opt-in — Bro Dikta enables after paper-soak).
-    feeTvlHighBonusEnabled: u.feeTvlHighBonusEnabled ?? false,
+    // Track-B B1 (Cassiopeia 2026-07-11): default flipped OFF → TRUE. This is a
+    // RANKING bonus only (re-sort in getTopCandidates) — it rejects NOTHING and is
+    // funnel-neutral, so turning it on cannot starve deploys. It floats fee-dense
+    // pools (toward the 0.20 "king" line) to the top of the cost-flat judge slice.
+    feeTvlHighBonusEnabled: u.feeTvlHighBonusEnabled ?? true,
     feeTvlHighBonusWeight:  u.feeTvlHighBonusWeight  ?? 250,
     feeTvlHighBonusFloor:   u.feeTvlHighBonusFloor   ?? 0.10,
     feeTvlHighBonusTarget:  u.feeTvlHighBonusTarget  ?? 0.20,
@@ -386,6 +394,24 @@ export const config = {
     marketRegimeGateEnabled:     u.marketRegimeGateEnabled     ?? true,
     regimeDowntrendThresholdPct: u.regimeDowntrendThresholdPct ?? -5,  // SOL 24h <= -5% = downtrend (pause memecoin)
     regimeUptrendThresholdPct:   u.regimeUptrendThresholdPct   ?? 5,   // SOL 24h >= +5% = uptrend (label only; doesn't gate)
+    // ─── Direction gate (Cassiopeia — Track-B B2, 2026-07-11) ───
+    // Per-POOL directional guard (vs marketRegimeGate's market-wide SOL beta). A pool
+    // whose OWN price is measurably DOWN at entry has an asymmetric single-side-SOL
+    // narrow payoff (limited bounce upside, full bleed if it keeps falling) — the same
+    // stop-out mechanism marketRegimeGate addresses, but at the pool level. Pauses a
+    // deploy when price_change_pct <= directionMaxNegPriceChangePct AND (flow-confirm
+    // off OR buy_share below directionMinBuyShare). buy_share = buy_vol/(buy_vol+sell_vol).
+    // FAIL-OPEN (directional/QUALITY gate, NOT rug/safety — follows the marketRegimeGate
+    // precedent): missing/non-finite price_change_pct → NEUTRAL → deploy as legacy,
+    // NEVER a freeze; missing flow (with flow-confirm on) → cannot confirm bearish →
+    // deploy. strictNumeric so Number(null)===0 can't fabricate a flat 0% reading. Only
+    // rejects on a positively-MEASURED downtrend. Reject reason: direction_downtrend_at_entry.
+    // Default OFF (opt-in) — Draco sets directionGateEnabled=true in VPS user-config to
+    // activate live. Reloadable.
+    directionGateEnabled:          u.directionGateEnabled          ?? false,
+    directionMaxNegPriceChangePct: u.directionMaxNegPriceChangePct ?? -4,   // price_change_pct <= -4% = downtrend at entry
+    directionRequireFlowConfirm:   u.directionRequireFlowConfirm   ?? true, // true = only pause if OKX buy/sell flow also bearish
+    directionMinBuyShare:          u.directionMinBuyShare          ?? 0.40, // buy_share below this (with flow present) = bearish flow
     // ─── Bluechip income-engine dual-mode (Cassiopeia — Wave 2 / Phase 1) ───
     // SEPARATE, PARALLEL path for deep STABLE pools (SOL-USDC, JLP, JitoSOL, LSTs).
     // Default OFF — turning it on needs Bro + Vega (deploy structure: two-sided
@@ -1033,6 +1059,10 @@ export function reloadScreeningThresholds() {
     if (fresh.marketRegimeGateEnabled     !== undefined) s.marketRegimeGateEnabled = fresh.marketRegimeGateEnabled;
     if (fresh.regimeDowntrendThresholdPct != null) s.regimeDowntrendThresholdPct = fresh.regimeDowntrendThresholdPct;
     if (fresh.regimeUptrendThresholdPct   != null) s.regimeUptrendThresholdPct = fresh.regimeUptrendThresholdPct;
+    if (fresh.directionGateEnabled          !== undefined) s.directionGateEnabled = fresh.directionGateEnabled;
+    if (fresh.directionMaxNegPriceChangePct != null) s.directionMaxNegPriceChangePct = fresh.directionMaxNegPriceChangePct;
+    if (fresh.directionRequireFlowConfirm   !== undefined) s.directionRequireFlowConfirm = fresh.directionRequireFlowConfirm;
+    if (fresh.directionMinBuyShare          != null) s.directionMinBuyShare = fresh.directionMinBuyShare;
     if (fresh.bluechipModeEnabled    !== undefined) s.bluechipModeEnabled    = fresh.bluechipModeEnabled;
     if (fresh.bluechipMinTvl         != null) s.bluechipMinTvl         = fresh.bluechipMinTvl;
     if (fresh.bluechipMinVolume      != null) s.bluechipMinVolume      = fresh.bluechipMinVolume;

@@ -816,6 +816,67 @@ export function marketRegimeGateRejectReason(pool, regimeResult, s) {
 }
 
 /**
+ * Direction gate (Cassiopeia — Track-B B2). PURE + unit-tested + exported.
+ *
+ * Per-POOL directional guard, the pool-level complement of marketRegimeGate (which
+ * pauses on the MARKET-WIDE SOL beta). A single-side-SOL narrow position deployed
+ * into a token that is ALREADY falling at entry has an ASYMMETRIC payoff — limited
+ * bounce upside, full bleed if it keeps dropping (the same stop-out mechanism that
+ * drove the T3 bleed, but observed on the individual pool's price action). This
+ * PAUSES the deploy when the pool's own price is measurably down at entry.
+ *
+ * Reject when:
+ *   price_change_pct <= directionMaxNegPriceChangePct   (measured downtrend at entry)
+ *   AND ( directionRequireFlowConfirm === false          (price-only mode), OR
+ *         buy_share < directionMinBuyShare )             (OKX flow confirms bearish)
+ *   where buy_share = buy_vol / (buy_vol + sell_vol).
+ *
+ * FAIL-OPEN (anti-pattern #2 nuance): this is a DIRECTIONAL / QUALITY gate, NOT a
+ * rug/safety gate, so it follows the marketRegimeGate precedent of failing OPEN, not
+ * closed — a data gap must never FREEZE deploys (that would be a blind dormancy).
+ *   - missing/non-finite price_change_pct → NEUTRAL → deploy as legacy (never pause).
+ *   - flow-confirm ON but buy/sell flow absent/zero → cannot CONFIRM bearish → deploy.
+ * Uses strictNumeric so Number(null)===0 cannot fabricate a flat 0% reading. The gate
+ * only ever pauses on a positively-MEASURED downtrend (with confirming flow when required).
+ *
+ * NOTE on the call slot: this fires in getTopCandidates in the SAME pre-enrichment
+ * slot as marketRegimeGate (before PVP/Jupiter/OKX + judge, so a paused pool costs
+ * nothing). price_change_pct is present pre-enrichment (condensed from the discovery
+ * API's pool_price_change_pct); buy_vol/sell_vol are OKX-enriched LATER, so at this
+ * slot the flow branch fails OPEN — with directionRequireFlowConfirm=true the gate is
+ * effectively price-measured-but-flow-lenient. Set directionRequireFlowConfirm=false
+ * (user-config) for a pure price-down reject.
+ *
+ * @param {object} candidate - condensed candidate (price_change_pct, buy_vol, sell_vol)
+ * @param {object} s - effective screening thresholds
+ * @returns {string|null} reject reason or null (deploy allowed / gate off / fail-open)
+ */
+export function directionGateRejectReason(candidate, s) {
+  if (s?.directionGateEnabled !== true) return null;      // gate off → no-op
+  // FAIL-OPEN: no measured price change → cannot assert a downtrend → deploy as legacy.
+  const pct = strictNumeric(candidate?.price_change_pct);
+  if (pct == null) return null;
+  const maxNeg = numeric(s?.directionMaxNegPriceChangePct);
+  if (maxNeg == null) return null;                        // misconfigured threshold → no-op (fail-open)
+  if (pct > maxNeg) return null;                          // not a downtrend at entry → allow
+  // Price is measured down at/below the threshold.
+  if (s?.directionRequireFlowConfirm === false) {
+    return "direction_downtrend_at_entry";                // price-only mode → pause
+  }
+  // Flow confirmation required: pause only when flow is PRESENT and bearish.
+  const buy = strictNumeric(candidate?.buy_vol);
+  const sell = strictNumeric(candidate?.sell_vol);
+  if (buy == null || sell == null) return null;           // FAIL-OPEN: flow unknown → cannot confirm → allow
+  const total = buy + sell;
+  if (total <= 0) return null;                            // no flow → cannot confirm → allow
+  const minBuyShare = numeric(s?.directionMinBuyShare);
+  if (minBuyShare == null) return null;                   // misconfigured → fail-open
+  const buyShare = buy / total;
+  if (buyShare < minBuyShare) return "direction_downtrend_at_entry"; // sellers dominant → pause
+  return null;                                            // buyers still stepping in → allow
+}
+
+/**
  * entry_features handoff builder (Cassiopeia ↔ Vega, DATA-COLLECTION MODE). PURE fn.
  *
  * Packages the ALREADY-FETCHED in-cycle entry conditions (market regime, SOL 24h
@@ -2369,6 +2430,29 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     eligible.splice(0, eligible.length, ...kept);
     if (eligible.length < beforeRegime) {
       log("screening", `Market-regime DOWNTREND paused ${beforeRegime - eligible.length} memecoin pool(s) — STOP BLEED (SOL 24h ${regimeResult.sol24hChangePct == null ? "n/a" : regimeResult.sol24hChangePct.toFixed(2) + "%"})`);
+    }
+  }
+
+  // Direction gate (Cassiopeia — Track-B B2). Per-POOL directional guard, the pool-
+  // level complement of the market-regime gate above. Runs in the SAME pre-enrichment
+  // slot (before PVP/Jupiter/OKX + judge → a paused pool costs nothing). Pauses a
+  // deploy when the pool's OWN price is measurably down at entry (asymmetric single-
+  // side-SOL narrow payoff). FAIL-OPEN: missing price change → deploy as legacy (never
+  // a freeze). See directionGateRejectReason for the flow-confirm slot nuance.
+  if (eff.directionGateEnabled === true && eligible.length > 0) {
+    const beforeDir = eligible.length;
+    const kept = eligible.filter((p) => {
+      const reason = directionGateRejectReason(p, eff);
+      if (reason) {
+        log("screening", `Direction gate: paused ${p.name} — ${reason} (price_change ${p.price_change_pct == null ? "n/a" : p.price_change_pct + "%"})`);
+        pushFilteredReason(filteredOut, p, reason);
+        return false;
+      }
+      return true;
+    });
+    eligible.splice(0, eligible.length, ...kept);
+    if (eligible.length < beforeDir) {
+      log("screening", `Direction gate paused ${beforeDir - eligible.length} downtrend-at-entry pool(s)`);
     }
   }
 
