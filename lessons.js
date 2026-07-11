@@ -920,6 +920,10 @@ export function getTradeJournal({ limit = 10 } = {}) {
       realized_sol: Number.isFinite(realized) ? Math.round(realized * 10000) / 10000 : null,
       fees_earned_usd: Number.isFinite(Number(r.fees_earned_usd)) ? Number(r.fees_earned_usd) : null,
       fees_earned_sol: Number.isFinite(Number(r.fees_earned_sol)) ? Number(r.fees_earned_sol) : null,
+      // Close reason surfaced for /journal (formatCloseReason maps it to plain
+      // Indonesian, incl. Andromeda's oor_up_fast_harvest / give_back_protect
+      // when they appear). null when the record predates reason capture.
+      close_reason: r.close_reason || null,
       source: r.source === "paper" ? "paper" : "live",
       result: classify(r),
     };

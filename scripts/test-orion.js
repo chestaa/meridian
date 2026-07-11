@@ -53,7 +53,7 @@ const fakeClient = {
 };
 
 // 3) Import orion AFTER env is set, then inject fake client.
-const { judgeCandidates, formatOrionVerdicts, judgeCandidateSchema, __setClientForTests } = await import("../agents/orion.js");
+const { judgeCandidates, formatOrionVerdicts, judgeCandidateSchema, flowHint, __setClientForTests } = await import("../agents/orion.js");
 __setClientForTests(fakeClient);
 
 // 4) Synthetic candidates matching index.js `passing` shape.
@@ -166,6 +166,112 @@ check(
   "index.js getLoneCandidateSkipReason rejects non-finite fee BEFORE the floor check (fail-closed)",
   /if\s*\(!Number\.isFinite\(globalFeesSol\)\)\s*\{\s*\n?\s*return\s+["']token_fees_unknown/.test(idxSrc)
 );
+
+// ── Market-maker alignment: flowHint pure fn (short-gamma flow tier) ──────────
+// balanced/buy-leaning flow = favorable (two-sided churn, price holds); sell-
+// dominated flow = price dumping = the loser pattern. 0.40 boundary mirrors the
+// direction gate's directionMinBuyShare so judge + gate speak the same language.
+check("flowHint: buy-dominated → buy_leaning", flowHint(80, 20)?.tier === "buy_leaning");
+check("flowHint: 50/50 → balanced", flowHint(50, 50)?.tier === "balanced");
+check("flowHint: sell-dominated → sell_leaning", flowHint(20, 80)?.tier === "sell_leaning");
+check("flowHint: 0.60 boundary → buy_leaning", flowHint(60, 40)?.tier === "buy_leaning");
+check("flowHint: just under 0.60 → balanced", flowHint(59, 41)?.tier === "balanced");
+check("flowHint: 0.40 boundary → balanced", flowHint(40, 60)?.tier === "balanced");
+check("flowHint: just under 0.40 → sell_leaning", flowHint(39, 61)?.tier === "sell_leaning");
+check("flowHint: buy_share_pct computed", flowHint(75, 25)?.buy_share_pct === 75);
+// FAIL-SAFE (anti-pattern #2): bad/absent flow → null (neutral, never fabricate).
+check("flowHint: null vols → null", flowHint(null, null) === null);
+check("flowHint: zero total → null", flowHint(0, 0) === null);
+check("flowHint: negative vol → null", flowHint(-1, 50) === null);
+check("flowHint: NaN vol → null", flowHint(NaN, 50) === null);
+check("flowHint: string garbage → null", flowHint("n/a", 50) === null);
+
+// ── Two-fixture market-maker behavioral check (deterministic, ZERO live spend) ─
+// Orion's job is signal EXTRACTION + prompt framing; the LLM does the weighting.
+// So we (a) assert each fixture's compact payload carries the correct decision-
+// weighting signals, and (b) run both through a faithful "thesis oracle" mock that
+// applies the SAME market-maker rule the prompt documents, reading ONLY the payload
+// orion built. This is NOT circular: if compactCandidate/flowHint dropped momentum,
+// flow, or fee density, the oracle would see nulls and decide wrong — so the pair
+// proves the payload is sufficient AND correctly structured for a thesis-following
+// judge to reach the right call. No real LLM tokens spent.
+let lastPayload = null;
+const thesisOracle = {
+  chat: { completions: { create: async (payload) => {
+    const um = payload.messages?.find?.((m) => m.role === "user")?.content || "{}";
+    try { lastPayload = JSON.parse(um); } catch { lastPayload = null; }
+    const c = lastPayload?.candidate || {};
+    const mom = c?.metrics?.price_change_pct;
+    const feeTvl = c?.metrics?.fee_active_tvl_ratio;
+    const tier = c?.flow?.tier;
+    // Market-maker thesis (mirrors the SYSTEM_PROMPT): SKIP on negative momentum OR
+    // sell-dominated flow OR thin fee density; ENTER only when fee density is healthy
+    // AND flow is not sell-leaning AND momentum is not negative.
+    const skip = (Number.isFinite(mom) && mom < 0) || tier === "sell_leaning" || !(feeTvl >= 0.10);
+    const decision = skip ? "skip" : "enter";
+    return {
+      choices: [{ finish_reason: "tool_calls", message: { tool_calls: [{
+        function: { name: "judge_candidate", arguments: JSON.stringify({
+          pool_address: c?.pool_address || "X",
+          decision,
+          confidence: skip ? 20 : 74,
+          reason: skip ? "negative momentum / sell flow / thin fees" : "high fee density, balanced flow, flat-to-up",
+          recommended_bins_below: 45,
+        }) },
+      }] } }],
+      usage: { prompt_tokens: 50, completion_tokens: 12, total_tokens: 62 },
+    };
+  } } },
+};
+__setClientForTests(thesisOracle);
+
+// FIXTURE 1 — DUMPING TOKEN (SKIP-weighted): -2.5% momentum sits in the -4..0 gray
+// zone the direction gate does NOT catch, plus sell-dominated flow (buy 3k / sell 9k
+// = 25% buy). Exactly the loser pattern a market-maker judge must reject.
+const [dumpVerdict] = await judgeCandidates([{
+  pool: { pool: "PoolDUMP", name: "DUMP-SOL", bin_step: 100, fee_active_tvl_ratio: 0.15,
+    volume_window: 20000, tvl: 40000, volatility: 3, organic_score: 80, mcap: 700000,
+    token_age_hours: 20, price_change_pct: -2.5, buy_vol: 3000, sell_vol: 9000 },
+  sw: { in_pool: [] }, n: { narrative: "x" }, ti: { audit: {} }, mem: null,
+}], { portfolio: { sol: 2 }, positions: { total_positions: 0 } });
+check("DUMPING: payload carries negative momentum (-2.5)", lastPayload?.candidate?.metrics?.price_change_pct === -2.5);
+check("DUMPING: payload carries sell_leaning flow", lastPayload?.candidate?.flow?.tier === "sell_leaning");
+check("DUMPING fixture is SKIP-weighted → skip", dumpVerdict?.decision === "skip");
+
+// FIXTURE 2 — HIGH FEE DENSITY + BALANCED FLOW (ENTER-weighted): fee/TVL 0.20 (the
+// "king" line), balanced flow (buy 5k / sell 5k = 50%), flat-to-up momentum (+1.5%).
+// Fee density + non-negative momentum + balanced flow all aligned = the ENTER case.
+const [enterVerdict] = await judgeCandidates([{
+  pool: { pool: "PoolFEE", name: "FEE-SOL", bin_step: 100, fee_active_tvl_ratio: 0.20,
+    volume_window: 30000, tvl: 35000, volatility: 3.5, organic_score: 82, mcap: 900000,
+    token_age_hours: 30, price_change_pct: 1.5, buy_vol: 5000, sell_vol: 5000 },
+  sw: { in_pool: [] }, n: { narrative: "x" }, ti: { audit: {} }, mem: null,
+}], { portfolio: { sol: 2 }, positions: { total_positions: 0 } });
+check("ENTER: payload carries high fee density (>= 0.10)", lastPayload?.candidate?.metrics?.fee_active_tvl_ratio >= 0.10);
+check("ENTER: payload carries balanced flow", lastPayload?.candidate?.flow?.tier === "balanced");
+check("ENTER: payload carries non-negative momentum", lastPayload?.candidate?.metrics?.price_change_pct >= 0);
+check("ENTER fixture is ENTER-weighted → enter", enterVerdict?.decision === "enter");
+
+// The two fixtures reach OPPOSITE decisions under the same thesis → alignment holds.
+check("SKIP-weighted and ENTER-weighted fixtures diverge", dumpVerdict?.decision !== enterVerdict?.decision);
+__setClientForTests(fakeClient); // restore
+
+// ── Prompt language: the market-maker alignment is actually in the prompt ─────
+const fsMod = await import("node:fs");
+const orionSrc2 = fsMod.readFileSync(new URL("../agents/orion.js", import.meta.url), "utf8");
+check("prompt: SHORT-GAMMA instrument framing present", /SHORT-GAMMA/.test(orionSrc2));
+check("prompt: 'might pump' is NOT an enter reason", /Might pump 50%' is NOT a reason to enter/i.test(orionSrc2));
+check("prompt: negative momentum = strong skip", /NEGATIVE MOMENTUM = STRONG SKIP/.test(orionSrc2));
+check("prompt: names the -4..0 gray zone the gate misses", /-4\.\.0 gray zone/.test(orionSrc2));
+check("prompt: prizes fee density", /PRIZE FEE DENSITY/.test(orionSrc2));
+check("prompt: flow tier factor present", /FLOW: flow\.tier/.test(orionSrc2));
+// Confidence rubric anchored to the 0.1-SOL data-probe floor (55 is NOT junk).
+check("rubric: 55-69 = 0.1-SOL data probe", /55-69 = worth a small 0\.1-SOL/.test(orionSrc2));
+check("rubric: 55 explicitly NOT junk", /55 is NOT junk/.test(orionSrc2));
+check("rubric: >=70 = solid", />=70 = SOLID setup/.test(orionSrc2));
+// Cost invariant: still exactly one LLM call per judge (no new call site added).
+check("still a single chat.completions.create per judge",
+  (orionSrc2.match(/chat\.completions\.create/g) || []).length === 1);
 
 console.log(`\n${passed} assertions passed.`);
 

@@ -25,7 +25,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { recordRealizedLoss } from "../account-circuit-breaker.js";
-import { computeLiveRealizedSolDelta } from "../realized-sol.js";
+import { computeLiveRealizedSolDelta, sumCloseGasSolFromFees } from "../realized-sol.js";
 import { getSigningWallet } from "../wallet-loader.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { isBluechipMintPair } from "./screening.js";
@@ -112,6 +112,43 @@ function getConnection() {
 
 function getWallet() {
   return getSigningWallet();
+}
+
+// ─── Vega close-formula accuracy fix (2026-07-11, Draco on-chain reconcile) ────
+// Measure ACTUAL close gas from the confirmed close-tx fees, so the realized-SOL
+// formula subtracts real gas rather than the conservative flat DEFAULT_CLOSE_GAS_SOL.
+// The wallet is the fee-payer on the direct close path (sendAndConfirmTransaction
+// with [wallet]), so getTransaction(sig).meta.fee IS this wallet's gas cost.
+//
+// FAIL-SAFE (anti-pattern #2/#3): read-only, runs AFTER the close is confirmed and
+// state is already recorded — it can NEVER affect the close TX itself. If ANY leg
+// is unreadable (RPC hiccup, sig not yet indexed) it returns null and the formula
+// falls back to the conservative flat estimate — we never under-count gas (which
+// would flatter the loss). Never throws into the accounting path.
+async function measureCloseGasSol(signatures) {
+  try {
+    const sigs = (Array.isArray(signatures) ? signatures : [])
+      .filter((s) => typeof s === "string" && s.length > 0);
+    if (sigs.length === 0) return null;
+    const conn = getConnection();
+    const feeLamports = [];
+    for (const sig of sigs) {
+      const tx = await conn.getTransaction(sig, {
+        maxSupportedTransactionVersion: 0,
+        commitment: "confirmed",
+      });
+      const fee = tx?.meta?.fee;
+      // Any missing leg → bail to null so we fall back to the conservative flat
+      // estimate rather than book a partial (under-counted) gas figure.
+      // Explicit null/undefined guard FIRST: Number(null)===0 is finite and would
+      // slip an unreadable fee through as 0 gas (under-count → flatter loss).
+      if (fee == null || !Number.isFinite(Number(fee))) return null;
+      feeLamports.push(Number(fee));
+    }
+    return sumCloseGasSolFromFees(feeLamports);
+  } catch (_e) {
+    return null; // never let accounting-gas measurement escalate
+  }
 }
 
 // ─── Test seam (production-inert) ──────────────────────────────
@@ -1983,6 +2020,11 @@ export async function closePosition({ position_address, reason }) {
         }
 
         // Vega fix #1 — formula-based realized SOL delta (relay close path).
+        // NOTE: measured-gas (Item 1) is deliberately NOT applied here — the relay
+        // (Agent Meridian zap-out) execution model does not guarantee THIS wallet is
+        // the fee-payer, so a getTransaction fee would not cleanly equal wallet gas.
+        // The conservative flat DEFAULT_CLOSE_GAS_SOL is kept for the relay path
+        // (loss-overstating, never flattering). Draco's reconcile is the direct path.
         const relayCloseRsd = config.internalAgents?.realizedSolAccounting !== false
           ? computeLiveRealizedSolDelta({
               solDeployed: tracked.amount_sol ?? null,
@@ -2015,6 +2057,10 @@ export async function closePosition({ position_address, reason }) {
           minutes_in_range: minutesHeld - minutesOOR,
           minutes_held: minutesHeld,
           close_reason: reason || "agent decision",
+          // Vega Item 2 (2026-07-11) — canonical entry_features forward (relay path).
+          // Same owner-side defense-in-depth as the direct path. Additive; null gap
+          // when unknown, never fabricated.
+          entry_features: tracked.entry_features ?? null,
           realized_sol_delta: relayCloseRsd?.realized_sol_delta ?? null,
           realized_sol_delta_pct: relayCloseRsd?.realized_sol_delta_pct ?? null,
           realized_sol_method: relayCloseRsd?.method ?? null,
@@ -2312,11 +2358,24 @@ export async function closePosition({ position_address, reason }) {
       // Vega fix #1 — formula-based realized SOL delta persisted into the
       // performance record (the more precise wallet-delta is computed in the
       // executor close handler for the live notification). Flagged as estimate.
+      //
+      // Close-formula ACCURACY fix (2026-07-11, Draco on-chain reconcile): thread
+      // MEASURED close gas (actual tx fees this wallet paid) instead of the flat
+      // conservative estimate. The flat 0.00203928 SOL/close over-deducted
+      // ~0.00067 SOL/trade → over 12 trades it overstated loss by ~0.008 SOL
+      // (formula −0.027 vs on-chain −0.019). Measuring the real fees removes that
+      // systematic bias so per-trade realized matches on-chain reality. Rent nets
+      // out on both sides (paid at open, refunded at close) so it is correctly
+      // absent from the formula — returned capital, never booked as profit.
+      // FAIL-SAFE: measureCloseGasSol → null on any read failure → formula falls
+      // back to the conservative flat estimate (never under-counts gas).
+      const measuredCloseGasSol = await measureCloseGasSol(txHashes);
       const closeRsd = config.internalAgents?.realizedSolAccounting !== false
         ? computeLiveRealizedSolDelta({
             solDeployed: tracked.amount_sol ?? null,
             solReceivedOnClose: Number.isFinite(withdrawnSol) ? withdrawnSol : null,
             feesClaimedSol: Number.isFinite(feesSol) ? feesSol : null,
+            gasSpentSol: Number.isFinite(measuredCloseGasSol) ? measuredCloseGasSol : undefined,
             finalValueUsd,
             pnlPct,
           })
@@ -2344,6 +2403,12 @@ export async function closePosition({ position_address, reason }) {
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: reason || "agent decision",
+        // Vega Item 2 (2026-07-11) — canonical entry_features forward. Owner-side
+        // defense-in-depth: dlmm.js is the source of truth for the closing position,
+        // so it forwards the deploy-time feature snapshot directly. lessons.js also
+        // backfills from tracked, but writing it here guarantees the field is present
+        // even if that fallback path changes. Additive, never fabricated (null gap).
+        entry_features: tracked.entry_features ?? null,
         realized_sol_delta: closeRsd?.realized_sol_delta ?? null,
         realized_sol_delta_pct: closeRsd?.realized_sol_delta_pct ?? null,
         realized_sol_method: closeRsd?.method ?? null,

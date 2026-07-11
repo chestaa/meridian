@@ -88,6 +88,25 @@ export function classifyTrade(r, minWinSol = DEFAULT_MIN_MEANINGFUL_PROFIT_SOL) 
   return { win: lp > 0, basis: "lp_fallback", tier: "UNKNOWN", realizedSol: null };
 }
 
+/**
+ * Escape HTML entities for Telegram `parse_mode: "HTML"` (BUG fix 2026-07-11,
+ * Draco found). The boss-report is sent with parse_mode HTML; any raw `<`, `>`,
+ * or `&` in INTERPOLATED external text (LLM reject reasons, token names, etc.)
+ * makes Telegram 400 with "can't parse entities" — e.g. a reason like
+ * "mcap &lt; $200k" or "rug &amp; bot" silently drops the WHOLE report. Apply to
+ * every externally-sourced string interpolated into an HTML section; NEVER to the
+ * intentional <b>/<i>/<code> tags we author. Escapes & FIRST (order matters).
+ * @param {*} value
+ * @returns {string}
+ */
+export function escapeHtml(value) {
+  if (value == null) return "";
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(path.join(ROOT, file), "utf8")); }
   catch { return null; }
@@ -111,6 +130,46 @@ function countFiles(dir) {
     if (!fs.existsSync(full)) return 0;
     return fs.readdirSync(full).filter(f => !f.startsWith(".")).length;
   } catch { return 0; }
+}
+
+/**
+ * Classify a signal file (inbox/processed/rejected) by its ORIGIN source.
+ * Files are named "<ts>-[<ts>-]<sourceLabel>.txt": signal-runner's moveFile
+ * prepends one timestamp, the inbox writer (auto-screener saveToInbox OR the
+ * discord-listener) prepends another → up to two leading "<digits>-" groups.
+ *   - auto-screener      → "screener-<SYMBOL>"       → "screener"
+ *   - manual/test drops  → "hanta…" / "test…"        → "manual"
+ *   - discord listener   → "<channel>-<symbol>"      → "discord"
+ * IMPORTANT: the LIVE, productive Discord path (MeteoraIDN ranked-digest) is
+ * merged into native discovery and therefore emits "screener-" files — it is
+ * counted under `screener`. `discord` here means ONLY the standalone
+ * discord-listener file-inbox path (channel-named files).
+ * Pure + exported for tests.
+ */
+export function classifySignalSource(filename) {
+  let s = String(filename || "").replace(/\.(txt|md)$/i, "");
+  s = s.replace(/^\d+-/, "").replace(/^\d+-/, ""); // strip up to 2 leading timestamps
+  const head = s.toLowerCase();
+  if (!head) return "other";
+  if (head.startsWith("screener")) return "screener";
+  if (/^(hanta|test|manual)/.test(head)) return "manual";
+  return "discord";
+}
+
+// Count files in a signal dir, bucketed by classifySignalSource origin.
+function countFilesBySource(dir) {
+  const out = { screener: 0, discord: 0, manual: 0, other: 0, total: 0 };
+  try {
+    const full = path.join(ROOT, dir);
+    if (!fs.existsSync(full)) return out;
+    for (const f of fs.readdirSync(full)) {
+      if (f.startsWith(".")) continue;
+      const bucket = classifySignalSource(f);
+      out[bucket] = (out[bucket] || 0) + 1;
+      out.total++;
+    }
+  } catch { /* leave zeros */ }
+  return out;
 }
 
 function progressBar(pct, len = 10) {
@@ -469,8 +528,46 @@ export function buildOrionRejectionsSection(entries) {
     `🏹 <b>Orion rejected (24h)</b>: ${skips.length} signals`,
   ];
   for (const [reason, count] of top) {
-    lines.push(`• <b>${count}×</b> ${reason}`);
+    // reason is raw LLM/free text — MUST be HTML-escaped or a literal <, >, &
+    // (e.g. "mcap < $200k") 400s the whole report under parse_mode HTML.
+    lines.push(`• <b>${count}×</b> ${escapeHtml(reason)}`);
   }
+  return lines.join("\n");
+}
+
+/**
+ * Signal pipeline summary — CUMULATIVE file counts since inception.
+ *
+ * FIX (Sirius 2026-07-11): the old section was titled "📡 Sinyal Discord" and
+ * rendered `countFiles("signals/rejected")` as if it were the Discord reject
+ * count, while NEVER counting signals/processed. Two lies stacked:
+ *   1. rejected/processed files are ~94% auto-screener; only a tiny, long-dead
+ *      tail is the discord-listener path — so labelling the whole pile "Discord"
+ *      was wrong (investigated: 371/394 rejected = screener; discord file-inbox
+ *      last produced 2026-05-16).
+ *   2. the missing processed count made a HEALTHY pipeline (684 passed) read as
+ *      "0 passed".
+ * This version shows PASSED (processed) + REJECTED + WAITING with an honest
+ * per-source split, and stops claiming the numbers are Discord.
+ *
+ * @param {{screener:number,discord:number,manual:number,other:number,total:number}} processed
+ * @param {object} rejected  same shape
+ * @param {object} inbox     same shape
+ */
+export function buildSignalSection(processed, rejected, inbox) {
+  const p = processed || {}, r = rejected || {}, i = inbox || {};
+  const pT = p.total || 0, rT = r.total || 0, iT = i.total || 0;
+  const split = (o) =>
+    `screening ${o.screener || 0} · Discord ${o.discord || 0} · manual ${(o.manual || 0) + (o.other || 0)}`;
+  const lines = [
+    `📡 Sinyal (screening + Discord) — total sejak awal`,
+    `✅ Lolos filter: <b>${pT}</b>`,
+    `❌ Ditolak filter: <b>${rT}</b>`,
+    iT > 0 ? `⏳ Menunggu diproses: <b>${iT}</b>` : `⏳ Menunggu: <b>0</b>`,
+  ];
+  if (pT > 0) lines.push(`<i>Lolos per sumber: ${split(p)}</i>`);
+  if (rT > 0) lines.push(`<i>Ditolak per sumber: ${split(r)}</i>`);
+  lines.push(`<i>Discord masuk lewat merge screening (ranked-digest), bukan pile terpisah.</i>`);
   return lines.join("\n");
 }
 
@@ -729,8 +826,11 @@ async function runBossReport() {
   const openLiveCount = Object.values(stateData.positions || {}).filter(p => p && !p.closed).length;
 
   // ─── signals ─────────────────────────────────────────────────────
-  const inboxCount    = countFiles("signals/inbox");
-  const rejectedCount = countFiles("signals/rejected");
+  // Bucketed by ORIGIN source AND now counting signals/processed (the old
+  // section never did → healthy pipeline read "0 passed"). See buildSignalSection.
+  const signalProcessed = countFilesBySource("signals/processed");
+  const signalRejected  = countFilesBySource("signals/rejected");
+  const signalInbox     = countFilesBySource("signals/inbox");
 
   // ─── LLM cost ────────────────────────────────────────────────────
   const llmData = readJson("llm-usage.json") || {};
@@ -787,14 +887,7 @@ async function runBossReport() {
     : DEFAULT_MIN_MEANINGFUL_PROFIT_SOL;
   const tradeSection = buildTradeSection(livePerf, tradeArr, openLiveCount, 30, minWinSol);
 
-  const signalSection = (() => {
-    const lines = [`📡 Sinyal Discord`];
-    if (inboxCount > 0) lines.push(`⏳ Menunggu diproses: <b>${inboxCount}</b>`);
-    else lines.push(`⏳ Menunggu: <b>0</b> (belum ada sinyal masuk)`);
-    lines.push(`❌ Ditolak filter: ${rejectedCount}`);
-    lines.push(`<i>Sumber: #dlmm-exotic-opps, #dlmm-multiday-opps, #metlex-dlmm-bot, #metlex-dammv2-bot</i>`);
-    return lines.join("\n");
-  })();
+  const signalSection = buildSignalSection(signalProcessed, signalRejected, signalInbox);
 
   const cbSection = (() => {
     const statusLine = cbHalted

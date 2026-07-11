@@ -2347,7 +2347,24 @@ async function telegramHandler(msg) {
         const cur = config.management.solMode ? "◎" : "$";
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
         const claimNote = result.claim_txs?.length ? `\nTx klaim fee: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Posisi ${pos.pair} ditutup\nUntung/Rugi: ${cur}${result.pnl_usd ?? "?"}\nTx tutup: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        // Money-honesty (Lyra) — lead with the LEDGER realized SOL (wallet truth,
+        // net IL+slippage+gas), demote price-only LP-PnL. Win/loss keyed on the
+        // realized sign, NOT pnl%. ledger_realized_sol_delta is dlmm.js's single
+        // source of truth (== the number booked to lessons.json).
+        const rsd = Number(result.ledger_realized_sol_delta);
+        const rsdPct = Number(result.ledger_realized_sol_delta_pct);
+        const hasRsd = Number.isFinite(rsd);
+        const closeEmoji = hasRsd ? (rsd > 0 ? "✅" : rsd < 0 ? "🔴" : "⚪") : "🔒";
+        const pnlUsdNum = Number(result.pnl_usd);
+        const pnlPctNum = Number(result.pnl_pct);
+        const realizedLine = hasRsd
+          ? `💰 Realized SOL: ${rsd >= 0 ? "+" : ""}${rsd.toFixed(4)} SOL${Number.isFinite(rsdPct) ? ` (${rsdPct >= 0 ? "+" : ""}${rsdPct.toFixed(2)}%)` : ""} — uang bersih ke wallet`
+          : `💰 Realized SOL: belum tersedia (pakai angka harga di bawah)`;
+        const lpLine = `LP-PnL (harga saja, bukan SOL bersih): ${Number.isFinite(pnlUsdNum) ? `${cur}${pnlUsdNum.toFixed(2)}` : "?"}${Number.isFinite(pnlPctNum) ? ` (${pnlPctNum >= 0 ? "+" : ""}${pnlPctNum.toFixed(2)}%)` : ""}`;
+        const closeExplainer = (hasRsd && rsd < 0)
+          ? `\nℹ️ "Diterima < dikirim" wajar: rent akun balik pas close & sisa token di-swap ke SOL di tx terpisah — patokan Realized SOL di atas.`
+          : "";
+        await sendMessage(`${closeEmoji} Posisi ${pos.pair} ditutup\n${realizedLine}\n${lpLine}\nTx tutup: ${closeTxs?.join(", ") || "n/a"}${claimNote}${closeExplainer}`);
       } else {
         await sendMessage(`❌ Gagal menutup posisi: ${result.error || result.message || 'Close failed'}`);
       }

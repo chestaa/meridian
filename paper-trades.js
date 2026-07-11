@@ -352,6 +352,44 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
       trade.peak_pnl_pct = pnlPct;
     }
 
+    // ── Give-back protection (Andromeda Track-B PROFIT, paper mirror) ───────
+    // Same rule as state.js#updatePnlAndCheckExits: once the peak >= giveBackPeakPct
+    // (4%) but BELOW the trailing arm (trailingTriggerPct), a decay of >=
+    // giveBackDropPct (2%) from peak closes in profit — locks ~+3% instead of the
+    // reptilecoin round-trip (+5.43% → −0.96%). COMPLEMENTS trailing (owns the
+    // sub-trailing zone; ceiling ∞ when trailing disabled). HARD-guarded to
+    // pnlPct > 0 → never shields a loss / SL untouched. Runs BEFORE break-even so
+    // the harvest lands higher. FAIL-SAFE: non-finite peak/PnL → skip. Default OFF.
+    if (
+      mgmt.giveBackProtectEnabled === true &&
+      Number.isFinite(pnlPct) &&
+      pnlPct > 0 &&
+      trade.peak_pnl_pct != null &&
+      Number.isFinite(Number(trade.peak_pnl_pct))
+    ) {
+      const peak = Number(trade.peak_pnl_pct);
+      const armPct = Number(mgmt.giveBackPeakPct ?? 4);
+      const dropPct = Number(mgmt.giveBackDropPct ?? 2);
+      const ceil =
+        mgmt.trailingTakeProfit && Number.isFinite(Number(mgmt.trailingTriggerPct))
+          ? Number(mgmt.trailingTriggerPct)
+          : Infinity;
+      const gaveBack = peak - pnlPct;
+      if (
+        Number.isFinite(armPct) &&
+        Number.isFinite(dropPct) &&
+        dropPct > 0 &&
+        peak >= armPct &&
+        peak < ceil &&
+        gaveBack >= dropPct
+      ) {
+        return {
+          action: "GIVE_BACK_PROTECT",
+          reason: `give_back_protect: peak ${peak.toFixed(2)}% → current ${pnlPct.toFixed(2)}% (gave back ${gaveBack.toFixed(2)}% >= ${dropPct}%, below trailing arm ${ceil === Infinity ? "∞" : ceil + "%"}) — harvesting before round-trip`,
+        };
+      }
+    }
+
     // Vega EXIT-3 #1 — Break-even stop ARM (paper mirror). Once peak crosses
     // breakEvenArmPct, be_armed flips true (idempotent, never disarms) and the
     // effective floor ratchets UP to breakEvenStopPct. Default OFF.
@@ -578,6 +616,28 @@ export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
     if (trade.out_of_range_since) {
       const minutesOOR = Math.floor((Date.now() - new Date(trade.out_of_range_since).getTime()) / 60000);
       const normalLimit = mgmt.outOfRangeWaitMinutes ?? 30;
+
+      // ── Fast OOR-UP harvest (Andromeda Track-B PROFIT, paper mirror) ──────
+      // Mirrors state.js#updatePnlAndCheckExits: an OOR-UP single-side-SOL position
+      // is 100% idle SOL (zero fee accrual), so harvest FAST (default 3m ≈ one
+      // management cycle of whipsaw tolerance) to FREE capital rather than parking
+      // it for the generic 30m timer. Direction is the paper price-vs-entry sign
+      // proxy (paperDirection), read INDEPENDENT of oorDirectionalExitEnabled (own
+      // flag). Takes PRECEDENCE over the "ride the pump" hold below — real 12-trade
+      // data refuted that hold for this instrument (OOR-UP is idle SOL, not an
+      // appreciating token). CLOSES (never holds) so it cannot shield a loss —
+      // STOP_LOSS + break-even already ran ABOVE this block on the fee-inclusive
+      // net PnL. FAIL-SAFE (anti-pattern #2): non-finite timer → skip → legacy
+      // timer / directional path owns it. Default OFF (oorUpFastExitEnabled).
+      if (mgmt.oorUpFastExitEnabled === true && paperDirection === "UP") {
+        const fastMin = Number(mgmt.oorUpFastExitMinutes ?? 3);
+        if (Number.isFinite(fastMin) && fastMin >= 0 && minutesOOR >= fastMin) {
+          return {
+            action: "OOR_UP_FAST_HARVEST",
+            reason: `oor_up_fast_harvest: OOR-UP ${minutesOOR}m >= ${fastMin}m — 100% idle SOL (zero fee accrual), harvesting to free capital`,
+          };
+        }
+      }
 
       // OOR-UP + in-profit (fee-inclusive pnl already computed above) → ARM
       // trailing, do NOT hard-close on the OOR timer. Pump captured; trailing

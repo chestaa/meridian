@@ -12,6 +12,9 @@ import {
   buildScreeningSummarySection,
   plainRejectBucket,
   isDeployFailure,
+  escapeHtml,
+  classifySignalSource,
+  buildSignalSection,
 } from "./boss-report.js";
 
 let pass = 0;
@@ -156,6 +159,33 @@ console.log("\n[buildOrionRejectionsSection]");
   assert("returns null on empty signal entries", emptyText === null);
 }
 
+// ── Test: HTML-escape in the send path (BUG fix 2026-07-11) ─────
+// parse_mode HTML 400s on raw <, >, & in interpolated free text. A reject reason
+// like "mcap < $200k & bot flagged" MUST render escaped or the whole report drops.
+console.log("\n[escapeHtml + HTML-safe Orion section]");
+{
+  assert("escapeHtml turns < into &lt;", escapeHtml("mcap < $200k") === "mcap &lt; $200k");
+  assert("escapeHtml turns > into &gt;", escapeHtml("5M > cap") === "5M &gt; cap");
+  assert("escapeHtml turns & into &amp; (order-safe)", escapeHtml("rug & bot") === "rug &amp; bot");
+  assert("escapeHtml passes plain $200 unchanged", escapeHtml("net $200 profit") === "net $200 profit");
+  assert("escapeHtml handles a <b>-like raw tag", escapeHtml("<b>fake</b>") === "&lt;b&gt;fake&lt;/b&gt;");
+  assert("escapeHtml null → empty string", escapeHtml(null) === "");
+
+  // End-to-end: a raw reason with <, &, $200, and a <b>-like tag flows through
+  // buildOrionRejectionsSection HTML-safe (no raw '<'/'&' survives except our tags).
+  const rawReasonEntries = [
+    { ts: recentIso, llm: { decision: "skip", reason: "mcap < $200k & top10 > 60% <b>rug</b>" } },
+    { ts: recentIso, llm: { decision: "skip", reason: "mcap < $200k & top10 > 60% <b>rug</b>" } },
+  ];
+  const htmlText = buildOrionRejectionsSection(rawReasonEntries);
+  assert("raw reason escaped: contains &lt; not literal '< $200'", htmlText.includes("&lt; $200k") && !htmlText.includes("< $200k"));
+  assert("raw reason escaped: & became &amp;", htmlText.includes("&amp; top10"));
+  assert("raw reason escaped: injected <b> tag neutralised", htmlText.includes("&lt;b&gt;rug&lt;/b&gt;"));
+  assert("our authored <b> header tag preserved", htmlText.includes("<b>Orion rejected"));
+  // The ONLY '<' followed by 'b>' should be our own tags, never the payload's.
+  assert("no unescaped payload tag leaks", !/<b>rug<\/b>/.test(htmlText));
+}
+
 // ── Test: buildScreeningSummarySection ──────────────────────────
 console.log("\n[buildScreeningSummarySection]");
 {
@@ -244,6 +274,52 @@ console.log("\n[isDeployFailure]");
   assert("'Deploy attempt did not succeed' summary = failure", isDeployFailure({ summary: "Deploy attempt did not succeed" }) === true);
   assert("judge 'LLM chose no deploy' = NOT a deploy failure", isDeployFailure({ summary: "LLM chose no deploy", reason: "organic too low" }) === false);
   assert("no candidate = NOT a deploy failure", isDeployFailure({ summary: "No candidates available" }) === false);
+}
+
+// ── Test: classifySignalSource (origin bucketing) ───────────────
+// Filenames below are REAL patterns observed on the VPS 2026-07-11 signal dirs.
+console.log("\n[classifySignalSource]");
+{
+  // auto-screener: signal-runner prepends one ts, saveToInbox prepends another → 2 ts groups
+  assert("2-ts screener → screener", classifySignalSource("1783781805072-1783781770832-screener-HAALAND.txt") === "screener");
+  assert("2-ts screener-ok → screener", classifySignalSource("1783778182076-1783778160967-screener-ok.txt") === "screener");
+  // discord-listener: channel-named files (dead since 2026-05-16)
+  assert("2-ts meridian-discussion → discord", classifySignalSource("1778914294516-1778849359-meridian-discussion.txt") === "discord");
+  assert("2-ts agentmeridian → discord", classifySignalSource("1778853412585-1774802787-agentmeridian.txt") === "discord");
+  // manual/test drops: single ts prefix
+  assert("1-ts hanta-service-test → manual", classifySignalSource("1778638695950-hanta-service-test.txt") === "manual");
+  assert("1-ts hanta-clean → manual", classifySignalSource("1778638094114-hanta-clean.txt") === "manual");
+  assert("test prefix → manual", classifySignalSource("1778638000000-test-foo.txt") === "manual");
+  // edge cases
+  assert("no ts prefix screener → screener", classifySignalSource("screener-ABC.txt") === "screener");
+  assert(".md ext handled", classifySignalSource("1778914294516-meridian-discussion.md") === "discord");
+  assert("empty → other", classifySignalSource("") === "other");
+  assert("null-safe → other", classifySignalSource(null) === "other");
+  assert("only-timestamps → other", classifySignalSource("1783781805072-.txt") === "other");
+}
+
+// ── Test: buildSignalSection (honest processed+rejected+inbox counting) ──
+console.log("\n[buildSignalSection]");
+{
+  // Real VPS distribution 2026-07-11: processed 685 (683 screener + 2 discord),
+  // rejected 394 (371 screener + 19 discord + 4 manual), inbox 0.
+  const processed = { screener: 683, discord: 2, manual: 0, other: 0, total: 685 };
+  const rejected  = { screener: 371, discord: 19, manual: 4, other: 0, total: 394 };
+  const inbox     = { screener: 0, discord: 0, manual: 0, other: 0, total: 0 };
+  const out = buildSignalSection(processed, rejected, inbox);
+  assert("shows PASSED count (was the 0-passed bug)", out.includes("Lolos filter: <b>685</b>"));
+  assert("shows REJECTED count", out.includes("Ditolak filter: <b>394</b>"));
+  assert("shows WAITING 0", out.includes("Menunggu: <b>0</b>") || out.includes("Menunggu diproses: <b>0</b>"));
+  assert("per-source split on passed", out.includes("screening 683") && out.includes("Discord 2"));
+  assert("per-source split on rejected", out.includes("screening 371") && out.includes("Discord 19"));
+  assert("no longer titled bare 'Sinyal Discord'", !/📡 Sinyal Discord\b/.test(out));
+  assert("clarifies Discord merges into screening", /merge screening|ranked-digest/.test(out));
+  // null-safety (graceful degradation)
+  const empty = buildSignalSection(null, null, null);
+  assert("null args → still renders, 0/0/0", empty.includes("<b>0</b>"));
+  // inbox waiting path
+  const withWaiting = buildSignalSection(processed, rejected, { screener: 3, discord: 0, manual: 0, other: 0, total: 3 });
+  assert("waiting>0 renders 'Menunggu diproses'", withWaiting.includes("Menunggu diproses: <b>3</b>"));
 }
 
 // ── Summary ─────────────────────────────────────────────────────

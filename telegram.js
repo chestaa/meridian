@@ -555,6 +555,32 @@ export function htmlEscape(value) {
     .replace(/>/g, "&gt;");
 }
 
+// ─── Close-outcome win/loss sign (Lyra money-honesty, single source of truth) ──
+// The win/loss/breakeven marker for a CLOSE must key on the number that actually
+// moved the wallet — NOT the flattering price-only pnl%. A trade whose LP-PnL
+// reads +0.5% but whose realized SOL delta is negative (slippage+gas ate the thin
+// win) MUST read as a loss (🔴), never a fake win (✅). Preference chain:
+//   realized SOL delta → price-only pnlSol → pnlPct → neutral (⚪).
+// Kept pure + exported so /journal, /close and notifyClose all decide the sign
+// identically (no drift between the three surfaces). FAIL-SAFE (anti-pattern #2):
+// when NO honest basis is finite, returns ⚪ — never fabricates a win/loss.
+export function closeOutcomeEmoji({ realizedSolDelta, pnlSol, pnlPct } = {}) {
+  // Check finiteness on the RAW values (NOT Number(x)) — Number(null)===0 and
+  // Number("")===0 are finite, which would fabricate a breakeven ⚪ instead of
+  // falling through to the next honest basis (anti-pattern #2). Number.isFinite
+  // (no coercion) is false for null/undefined/NaN/strings, so a missing realized
+  // figure correctly falls through to pnlSol → pnlPct.
+  const basis = Number.isFinite(realizedSolDelta)
+    ? realizedSolDelta
+    : Number.isFinite(pnlSol)
+      ? pnlSol
+      : Number.isFinite(pnlPct)
+        ? pnlPct
+        : NaN;
+  const sign = Number.isFinite(basis) ? Math.sign(basis) : 0;
+  return sign > 0 ? "✅" : sign < 0 ? "🔴" : "⚪";
+}
+
 // ─── OOR cooldown state (Vega fix #4) ────────────────────────────
 // Per-position cooldown so notifyOutOfRange doesn't spam every mgmt tick.
 const OOR_ALERT_COOLDOWN_MS = (config.management?.oorCooldownHours ?? 6) * 60 * 60 * 1000; // driven by config, was hardcoded 6h
@@ -626,43 +652,70 @@ export async function notifyClose({ pair, pnlUsd, pnlPct, pnlSol, feesSol, durat
       return;
     }
   }
-  const sign = (pnlUsd ?? 0) >= 0 ? "+" : "";
-  const header = dryRun ? `🔵 <b>SIMULATION — Paper Close</b>` : `🔒 <b>Closed</b>`;
-  // Vega fix #1 — clearly label the price-only LP-PnL so it is never confused
-  // with the TRUE economic outcome below it.
-  const lpLabelPct = Number.isFinite(lpPnlPct) ? lpPnlPct : pnlPct;
-  const pnlLine = `LP-PnL (price-only): ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${(lpLabelPct ?? 0) >= 0 ? "+" : ""}${(lpLabelPct ?? 0).toFixed(2)}%)`;
-  const pnlSolLine = Number.isFinite(pnlSol)
-    ? `\nPnL SOL: ${pnlSol >= 0 ? "+" : ""}${Number(pnlSol).toFixed(4)} SOL`
-    : "";
-  const feesLine = Number.isFinite(feesSol) && feesSol > 0
-    ? `\nFees collected: ${Number(feesSol).toFixed(4)} SOL`
-    : "";
-  // Vega fix #1 — TRUE realized SOL delta (economic outcome incl. IL + close-swap
-  // slippage + gas). This is the number the wallet actually moved by. ⚠️ flags an
-  // estimate (formula/paper-sim) vs a measured wallet delta.
-  let realizedLine = "";
-  if (Number.isFinite(realizedSolDelta)) {
+
+  // ── Outcome sign — keyed to WALLET-TRUTH realized SOL, NOT the flattering
+  // price-only pnl% (Lyra money-honesty fix, Bro complaint 2026-07-11). A trade
+  // whose LP-PnL reads +0.5% but whose wallet delta is negative (slippage+gas ate
+  // the thin win) must READ as a loss. Emoji follows the number that actually
+  // moved the wallet, via the shared closeOutcomeEmoji() single-source-of-truth.
+  const hasRealized = Number.isFinite(realizedSolDelta);
+  const resultEmoji = closeOutcomeEmoji({ realizedSolDelta, pnlSol, pnlPct });
+
+  const header = dryRun
+    ? `🔵 <b>SIMULATION — Paper Close</b> ${resultEmoji}`
+    : `${resultEmoji} <b>Closed</b>`;
+
+  // ── LEAD LINE — Realized SOL (wallet truth): big, first, bold. This is the
+  // number the wallet actually moved by (net IL + close-swap slippage + gas).
+  // ⚠️est flags a formula/paper estimate vs a measured wallet delta.
+  let realizedLead;
+  if (hasRealized) {
     const estTag = realizedSolEstimate ? " ⚠️est" : "";
     const pctTag = Number.isFinite(realizedSolDeltaPct)
       ? ` (${realizedSolDeltaPct >= 0 ? "+" : ""}${Number(realizedSolDeltaPct).toFixed(2)}%)`
       : "";
-    realizedLine = `\n<b>Realized SOL: ${realizedSolDelta >= 0 ? "+" : ""}${Number(realizedSolDelta).toFixed(4)} SOL${pctTag}${estTag}</b>`;
+    realizedLead =
+      `💰 <b>Realized SOL: ${realizedSolDelta >= 0 ? "+" : ""}${Number(realizedSolDelta).toFixed(4)} SOL${pctTag}${estTag}</b>\n` +
+      `<i>(uang bersih masuk wallet — sudah dikurangi IL + slippage + gas close)</i>`;
+  } else {
+    // No ledger figure (legacy record / paper without sim delta). Be honest —
+    // NEVER claim a wallet-truth number we don't have (anti-pattern #2).
+    realizedLead = `💰 <b>Realized SOL: belum tersedia</b>\n<i>(pakai angka harga di bawah — belum ada catatan ledger)</i>`;
   }
-  const durationLine = Number.isFinite(durationMin) && durationMin >= 0
-    ? `\nDuration: ${formatDuration(durationMin)}`
+
+  // ── SECONDARY — price-only LP-PnL, clearly demoted + labelled so it is NEVER
+  // read as the net SOL outcome. This was the misleading headline Bro flagged.
+  const lpLabelPct = Number.isFinite(lpPnlPct) ? lpPnlPct : pnlPct;
+  const lpUsdStr = Number.isFinite(pnlUsd)
+    ? `${pnlUsd >= 0 ? "+" : ""}$${Number(pnlUsd).toFixed(2)} `
+    : "";
+  const lpPnlLine = `\nLP-PnL (harga saja, bukan SOL bersih): ${lpUsdStr}(${(lpLabelPct ?? 0) >= 0 ? "+" : ""}${(lpLabelPct ?? 0).toFixed(2)}%)`;
+
+  const feesLine = Number.isFinite(feesSol) && feesSol > 0
+    ? `\nFees collected: ${Number(feesSol).toFixed(4)} SOL`
     : "";
   const feeInclusiveLine = Number.isFinite(feeInclusivePnlPct)
     ? `\nFee-inclusive PnL: ${feeInclusivePnlPct >= 0 ? "+" : ""}${Number(feeInclusivePnlPct).toFixed(2)}%`
     : "";
+  const durationLine = Number.isFinite(durationMin) && durationMin >= 0
+    ? `\nDuration: ${formatDuration(durationMin)}`
+    : "";
+
+  // ── "received < sent" explainer — shown ONCE, only on a LIVE loss (the
+  // confusing case where less SOL comes back than went in). One short line so
+  // Bro stops being puzzled by the raw explorer view.
+  const explainerLine = (!dryRun && hasRealized && Number(realizedSolDelta) < 0)
+    ? `\n<i>ℹ️ "Diterima &lt; dikirim" itu wajar: rent akun posisi balik pas close &amp; sisa token di-swap ke SOL di tx terpisah — patokan = Realized SOL di atas, bukan 1 baris di explorer.</i>`
+    : "";
+
   await sendHTML(
     `${header} ${htmlEscape(pair)}\n` +
-    pnlLine +
-    realizedLine +
-    pnlSolLine +
+    realizedLead +
+    lpPnlLine +
     feesLine +
     feeInclusiveLine +
-    durationLine
+    durationLine +
+    explainerLine
   );
 }
 

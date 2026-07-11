@@ -62,6 +62,52 @@ export const DEFAULT_CLOSE_GAS_SOL = 0.00203928;
 // book on the base→SOL exit swap). Paper has no real book, so we model a haircut.
 export const DEFAULT_PAPER_EXIT_SLIPPAGE_PCT = 1.0;
 
+export const LAMPORTS_PER_SOL_ACC = 1_000_000_000;
+
+/**
+ * Vega close-formula accuracy fix (2026-07-11 — Draco on-chain reconcile):
+ * sum the ACTUAL per-transaction fee lamports of a close sequence into SOL, so the
+ * realized-SOL formula can subtract MEASURED close gas instead of the flat
+ * `DEFAULT_CLOSE_GAS_SOL` estimate.
+ *
+ * ROOT CAUSE this addresses: the flat estimate 0.00203928 SOL/close was set
+ * conservatively HIGH; real burner close gas averaged lower, so the formula
+ * over-deducted ~0.00067 SOL/trade → over 12 trades it OVERSTATED loss by ~0.008
+ * SOL (formula −0.027 vs on-chain −0.019). Rent nets out on both sides (paid at
+ * open, refunded at close — see computeLiveRealizedSolDelta docs), so gas was the
+ * only mis-calibrated term. Measuring the real tx fees removes the estimate error.
+ *
+ * HONESTY RULE (anti-pattern #2 — never flatter): returns null unless EVERY entry
+ * is a finite, non-negative fee. A PARTIAL sum (some tx fees unreadable) would
+ * UNDER-count gas → understate loss → a flattering bias; the caller must instead
+ * fall back to the CONSERVATIVE flat estimate. So this fn only yields a number
+ * when the full close-gas is known; otherwise null (fall back, never guess low).
+ *
+ * Pure. No I/O. The getTransaction reads that produce `feeLamportsList` live in
+ * the caller (dlmm.js), keeping this module I/O-free and unit-testable.
+ *
+ * @param {Array<number|string|null>} feeLamportsList per-tx meta.fee, in lamports
+ * @returns {number|null} total close gas in SOL, or null if any leg is unreadable
+ */
+export function sumCloseGasSolFromFees(feeLamportsList) {
+  if (!Array.isArray(feeLamportsList) || feeLamportsList.length === 0) return null;
+  let totalLamports = 0;
+  for (const raw of feeLamportsList) {
+    // Explicit missing-leg guard FIRST: Number(null)===0 and Number('')===0 would
+    // silently pass the finite/non-negative check and book the unreadable leg as
+    // 0 gas → UNDER-count gas → flatter the loss (anti-pattern #2 fail-open). A
+    // missing/blank leg means the fee is unreadable → fail-closed to null so the
+    // caller uses the conservative flat estimate, never guesses low.
+    if (raw == null || raw === "") return null;
+    const n = Number(raw);
+    // Any non-finite/negative leg → cannot honestly total → null (caller falls
+    // back to the conservative flat estimate, never under-counts gas).
+    if (!Number.isFinite(n) || n < 0) return null;
+    totalLamports += n;
+  }
+  return round8(totalLamports / LAMPORTS_PER_SOL_ACC);
+}
+
 function finiteOrNull(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;

@@ -567,6 +567,44 @@ export const config = {
     // paper-soak; bluechip mode itself stays PAUSED. Requires
     // oorDirectionalExitEnabled (the directional substrate) to be ON to take effect.
     bluechipPatientOorEnabled: u.bluechipPatientOorEnabled ?? false,
+    // ─── Andromeda Track-B PROFIT — Fast OOR-UP harvest (paper + live) ──────
+    // Confirmed short-gamma reality: a single-side-SOL position goes OOR-UP the
+    // instant price ticks up through the deploy bin → it is then 100% idle SOL
+    // (the quote leg), accruing ZERO fees. The generic outOfRangeWaitMinutes
+    // (30m) just parks dead capital. This harvests OOR-UP FAST (default 3m ≈ one
+    // management cycle of whipsaw tolerance) to lock the ~+3% winners realize
+    // here and FREE the capital for redeploy — velocity is the edge. Direction is
+    // read via oorDirection() INDEPENDENT of oorDirectionalExitEnabled (own flag);
+    // when on it takes precedence over the (data-refuted) "ride the pump" hold.
+    // It CLOSES (never holds) so it cannot shield a loss — SL + break-even run
+    // ABOVE the OOR block on the fee-inclusive net PnL. FAIL-SAFE: direction
+    // UNKNOWN (bin fields missing) → skip → legacy timer owns it. Distinct
+    // close-reason token `oor_up_fast_harvest` for separate EV audit (Lyra).
+    // Reversibility: oorUpFastExitEnabled=false → legacy OOR behavior unchanged.
+    // Recommended live: enabled=true, minutes=3.
+    oorUpFastExitEnabled:  u.oorUpFastExitEnabled  ?? false,
+    oorUpFastExitMinutes:  u.oorUpFastExitMinutes  ?? 3,
+    // ─── Andromeda Track-B PROFIT — Give-back protection (paper + live) ─────
+    // Confirmed: peaks cluster ~+4.7–5.4% then round-trip (reptilecoin peaked
+    // +5.43% and gave it ALL back to the −0.96% break-even stop); the +18%
+    // trailingTriggerPct NEVER arms on this instrument. Give-back is a LOW-trigger
+    // trailing harvest that OWNS the sub-trailing zone: once the confirmed peak
+    // >= giveBackPeakPct (4%) but BELOW where trailing takes over (trailingTrigger
+    // Pct), a decay of >= giveBackDropPct (2%) from that peak closes the position,
+    // locking ~+3% instead of round-tripping. COMPLEMENTS trailing TP (does NOT
+    // touch trailingTriggerPct/trailingDropPct) — give-back owns [giveBackPeakPct,
+    // trailingTriggerPct), trailing owns the rest; if trailing is disabled the
+    // ceiling is ∞. HARD-guarded to net PnL > 0 → mutually exclusive with STOP_LOSS
+    // (fires only on negative PnL), so SL stays untouched and give-back can only
+    // ever HARVEST a profitable position. Runs BEFORE break-even so the gain lands
+    // higher (at peak − drop, not the 0% floor). FAIL-SAFE: peak/PnL missing/
+    // non-finite/suspicious → skip → break-even/SL/trailing own it. Distinct
+    // close-reason token `give_back_protect` for separate EV audit (Lyra).
+    // Reversibility: giveBackProtectEnabled=false → no rule. Recommended live:
+    // enabled=true, peakPct=4, dropPct=2.
+    giveBackProtectEnabled: u.giveBackProtectEnabled ?? false,
+    giveBackPeakPct:        u.giveBackPeakPct        ?? 4,
+    giveBackDropPct:        u.giveBackDropPct        ?? 2,
     // Andromeda PR-A — max-drawdown-recovery exit (paper-trades.js).
     // ARM when max_drawdown (peak−trough) >= armPct; FIRE when current pnl
     // recovers deltaPct above trough. Distinct from trailing TP, which gates

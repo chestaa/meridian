@@ -79,7 +79,32 @@ const SYSTEM_PROMPT = [
   "FACTOR among many, not a new gate: a strong pool with healthy fee/TVL and decent volume",
   "still enters even at larger TVL — only let micro-share DEMOTE a pool that is otherwise",
   "merely borderline. Never skip a clearly good pool solely on TVL size (no dormancy).",
-  "confidence is 0-100. reason <= 400 chars, specific and terse.",
+  // ── Market-maker instrument (short-gamma) — internalize the payoff ───────────
+  // Single-side-SOL LP is a MARKET-MAKER on a SHORT-GAMMA instrument: capped
+  // upside (fees only), full downside to the stop. We do NOT bet on direction.
+  "MARKET-MAKER INSTRUMENT (internalize): our single-side-SOL position is SHORT-GAMMA —",
+  "upside is CAPPED at the fees we earn (~+3-5%), while downside runs to the stop if price",
+  "falls out of range. 'Might pump 50%' is NOT a reason to enter: we capture NONE of that",
+  "move, only fees while price churns in/above range. The pool pays ONLY if price holds",
+  "in/above range AND churns — so judge fee-earning potential, not directional upside.",
+  "NEGATIVE MOMENTUM = STRONG SKIP: metrics.price_change_pct is the token's recent move. A",
+  "token already falling at entry bleeds through the stop. The hard gate only rejects moves",
+  "<= -4%; you MUST also weigh the -4..0 gray zone the gate does NOT catch — the more",
+  "negative, the stronger the skip. Flat-to-up momentum is what we want; never enter a",
+  "bleeding token just because it looks 'safe'.",
+  "FLOW: flow.tier (buy_leaning|balanced|sell_leaning) is our pre-computed buy/sell volume",
+  "split. balanced or buy_leaning = healthy two-sided churn / buyers stepping in -> favorable",
+  "(fees both directions, price holds). sell_leaning = sellers dominating = price dumping ->",
+  "red flag, lean skip. null = flow unknown (ignore this factor).",
+  "PRIZE FEE DENSITY over generic fundamentals: high fee/TVL (>= 0.10 good, ~0.20 is king)",
+  "and a real base fee (bin_step-driven) are the PRIMARY reason to enter. A 'safe' token with",
+  "clean fundamentals but THIN fee density does NOT pay a market-maker -> skip it.",
+  // ── Confidence rubric anchored to the live 0.1-SOL data-probe floor (55) ─────
+  "confidence is 0-100. RUBRIC: >=70 = SOLID setup (fee density + non-negative momentum +",
+  "balanced/buy flow all aligned) — deploy with conviction. 55-69 = worth a small 0.1-SOL",
+  "DATA PROBE: the thesis is present but one factor is soft; 55 is NOT junk, it is a real",
+  "'probe it to learn' vote, not a reluctant pass. <55 = skip. Only ENTER at a confidence",
+  "you'd stand behind; when genuinely in doubt, skip. reason <= 400 chars, specific and terse.",
   "If you'd enter, suggest recommended_bins_below in [35,69]: low vol -> 35, vol>=5 -> 69, linear.",
 ].join(" ");
 
@@ -140,7 +165,16 @@ function compactCandidate(c) {
       organic: pool.organic_score,
       mcap: pool.mcap,
       age_hours: pool.token_age_hours,
+      // Market-maker momentum signal: token's recent price move. NEGATIVE = the
+      // loser pattern (bleeds through the stop). Present on the condensed pool
+      // (from discovery pool_price_change_pct); the -4..0 gray zone the direction
+      // gate does NOT reject is exactly where the judge earns its keep.
+      price_change_pct: pool.price_change_pct ?? null,
     },
+    // Pre-computed buy/sell flow tier (small models can't divide reliably). null
+    // when OKX flow is absent (fail-safe neutral). buy_vol/sell_vol are enriched
+    // onto the condensed pool in getTopCandidates.
+    flow: flowHint(pool.buy_vol, pool.sell_vol),
     audit: {
       top10_pct: ti?.audit?.top_holders_pct,
       bot_pct: ti?.audit?.bot_holders_pct,
@@ -210,6 +244,41 @@ export function profitShareHint(positionSol, tvlUsd, solUsd = null) {
   // 0.05% is the RED line from Bro's brief (our take below it = $0.001-class).
   const tier = sharePct < 0.05 ? "micro" : sharePct < 0.2 ? "thin" : "healthy";
   return { fee_share_pct: Number(sharePct.toFixed(4)), tier };
+}
+
+/**
+ * Pure buy/sell flow hint for the market-maker judge.
+ *
+ * A single-side-SOL DLMM position is SHORT-GAMMA: it pays only when price churns
+ * IN/ABOVE range, so two-sided (balanced) or buy-leaning flow is favorable (fees
+ * captured both directions, price holds up) while sell-dominated flow means
+ * sellers are winning = price dumping = the loser pattern. Small models can't
+ * divide reliably, so we hand them a pre-computed buy_share % + a tier word.
+ *
+ *   buy_share = buy_vol / (buy_vol + sell_vol)
+ *   >= 0.60 -> buy_leaning · 0.40-0.60 -> balanced · < 0.40 -> sell_leaning
+ *
+ * The 0.40 boundary mirrors the deterministic direction gate's directionMinBuyShare
+ * (screening.js) so the judge and the gate speak the same language.
+ *
+ * FAIL-SAFE (anti-pattern #2): missing/non-finite/negative flow, or zero total
+ * volume → null (NEUTRAL — the LLM ignores the factor; never fabricate a
+ * direction). NOT a gate: returns a hint only; the decision stays with the LLM.
+ *
+ * @param {number} buyVol   buy-side volume (USD), OKX-enriched
+ * @param {number} sellVol  sell-side volume (USD), OKX-enriched
+ * @returns {{ buy_share_pct: number, tier: string }|null}
+ */
+export function flowHint(buyVol, sellVol) {
+  const buy = Number(buyVol);
+  const sell = Number(sellVol);
+  if (!Number.isFinite(buy) || !Number.isFinite(sell)) return null;
+  if (buy < 0 || sell < 0) return null;
+  const total = buy + sell;
+  if (total <= 0) return null;
+  const share = buy / total;
+  const tier = share >= 0.60 ? "buy_leaning" : share >= 0.40 ? "balanced" : "sell_leaning";
+  return { buy_share_pct: Number((share * 100).toFixed(1)), tier };
 }
 
 async function judgeOne(candidate, context) {

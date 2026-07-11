@@ -625,6 +625,64 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   if (changed) save(state);
 
+  // ── Give-back protection (Andromeda Track-B PROFIT) ─────────────────────
+  // Confirmed short-gamma reality: peaks cluster ~+4.7–5.4% then round-trip
+  // (reptilecoin peaked +5.43%, gave it ALL back to the −0.96% break-even stop).
+  // The +18% trailing trigger NEVER arms on this instrument, so a modest pump
+  // that fades is otherwise caught only at break-even (0%) or worse. Give-back is
+  // a LOW-trigger trailing harvest that OWNS the sub-trailing zone: once the
+  // CONFIRMED peak >= giveBackPeakPct (4%) — but BELOW where trailing takes over
+  // (trailingTriggerPct) — a decay of >= giveBackDropPct (2%) from that peak
+  // closes the position, locking ~+3% instead of round-tripping.
+  //
+  // COMPLEMENTS trailing TP (does NOT touch trailingTriggerPct/trailingDropPct):
+  // give-back owns [giveBackPeakPct, trailingTriggerPct); trailing owns the rest.
+  // If trailing is disabled the ceiling is ∞ (give-back owns all peaks >= arm).
+  //
+  // SL UNTOUCHED / never shields a loss: HARD-guarded to currentPnlPct > 0, so it
+  // is mutually exclusive with STOP_LOSS (fires only on negative PnL) — give-back
+  // can only ever HARVEST a profitable position. Runs BEFORE break-even so it
+  // captures the gain higher up (at peak − drop) instead of riding to the 0%
+  // break-even floor; break-even + SL remain the backstop when give-back is off or
+  // the drop overshoots the zone between cycles. Uses pos.peak_pnl_pct (the
+  // confirmed high-water mark, de-noised by the 15s peak recheck) like trailing TP.
+  //
+  // FAIL-SAFE (anti-pattern #2): peak/PnL missing/non-finite/suspicious → skip
+  // (legacy trailing/break-even/SL own it). Default OFF (giveBackProtectEnabled).
+  if (
+    mgmtConfig.giveBackProtectEnabled === true &&
+    !pnl_pct_suspicious &&
+    currentPnlPct != null &&
+    Number.isFinite(Number(currentPnlPct)) &&
+    Number(currentPnlPct) > 0 &&
+    Number.isFinite(Number(pos.peak_pnl_pct))
+  ) {
+    const peak = Number(pos.peak_pnl_pct);
+    const armPct = Number(mgmtConfig.giveBackPeakPct ?? 4);
+    const dropPct = Number(mgmtConfig.giveBackDropPct ?? 2);
+    const ceil =
+      mgmtConfig.trailingTakeProfit && Number.isFinite(Number(mgmtConfig.trailingTriggerPct))
+        ? Number(mgmtConfig.trailingTriggerPct)
+        : Infinity;
+    const gaveBack = peak - Number(currentPnlPct);
+    if (
+      Number.isFinite(armPct) &&
+      Number.isFinite(dropPct) &&
+      dropPct > 0 &&
+      peak >= armPct &&
+      peak < ceil &&
+      gaveBack >= dropPct
+    ) {
+      return {
+        action: "GIVE_BACK_PROTECT",
+        reason: `give_back_protect: peak ${peak.toFixed(2)}% → current ${Number(currentPnlPct).toFixed(2)}% (gave back ${gaveBack.toFixed(2)}% >= ${dropPct}%, below trailing arm ${ceil === Infinity ? "∞" : ceil + "%"}) — harvesting before round-trip`,
+        peak_pnl_pct: peak,
+        current_pnl_pct: Number(currentPnlPct),
+        drop_from_peak_pct: gaveBack,
+      };
+    }
+  }
+
   // ── Break-even stop (Vega EXIT-3 #1) ───────────────────────────────────
   // Runs BEFORE the fixed SL so the HIGHER floor wins (anti-pattern guard: a
   // ratcheted break-even at 0% must pre-empt the -8% SL — else the position
@@ -820,6 +878,39 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Out of range too long ──────────────────────────────────────
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
+
+    // ── Fast OOR-UP harvest (Andromeda Track-B PROFIT) ────────────────────
+    // Confirmed short-gamma reality: a single-side-SOL position goes OOR-UP the
+    // instant price ticks up through the deploy bin — it is then 100% idle SOL
+    // (the quote leg), accruing ZERO fees. The generic outOfRangeWaitMinutes
+    // (30m) just parks dead capital while it earns nothing. Harvest FAST (default
+    // 3m ≈ one management cycle of whipsaw tolerance) to lock the ~+3% winners
+    // realize here and FREE the capital for redeploy — velocity is the edge.
+    //
+    // Direction read via oorDirection() INDEPENDENT of oorDirectionalExitEnabled
+    // (this rule has its own flag). When enabled it takes PRECEDENCE over the
+    // directional "ride the pump" hold below — real 12-trade data refuted that
+    // hold for this instrument (OOR-UP is idle SOL, not an appreciating token). It
+    // CLOSES (never holds), so it can never shield a loss: STOP_LOSS + break-even
+    // already ran ABOVE this block on the fee-inclusive net PnL, so we are strictly
+    // above the stop floor here. Freeing idle capital even at a small PnL beats
+    // babysitting it for 30m.
+    //
+    // FAIL-SAFE (anti-pattern #2): direction UNKNOWN (bin fields missing/
+    // non-finite) or non-finite timer → SKIP → the legacy timer / directional
+    // path owns it. Default OFF (oorUpFastExitEnabled).
+    if (mgmtConfig.oorUpFastExitEnabled === true) {
+      const fastMin = Number(mgmtConfig.oorUpFastExitMinutes ?? 3);
+      const fastDir = oorDirection(positionData);
+      if (fastDir === "UP" && Number.isFinite(fastMin) && fastMin >= 0 && minutesOOR >= fastMin) {
+        return {
+          action: "OOR_UP_FAST_HARVEST",
+          reason: `oor_up_fast_harvest: OOR-UP ${minutesOOR}m >= ${fastMin}m — 100% idle SOL (zero fee accrual), harvesting to free capital`,
+          minutes_out_of_range: minutesOOR,
+          current_pnl_pct: currentPnlPct ?? null,
+        };
+      }
+    }
 
     // Vega FIX#1 — OOR DIRECTIONAL handling. Only active when the flag is on AND
     // we can read the bin fields. FAIL-SAFE: direction UNKNOWN (missing bins) →
