@@ -1,5 +1,5 @@
 {
-  "ts": "2026-07-11T11:02:30.107Z",
+  "ts": "2026-07-11T11:07:29.708Z",
   "wallet": {
     "pubkey": "DgA9MZ…1Hiu",
     "sol_free": 0.40164,
@@ -22,7 +22,7 @@
     "halted": false,
     "realized_loss_sol": 0.000958
   },
-  "llm_cost_24h_usd": 0.0645,
+  "llm_cost_24h_usd": 0.0601,
   "services_active": [
     "meridian",
     "signal-runner",
