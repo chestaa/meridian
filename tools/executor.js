@@ -25,6 +25,7 @@ import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import { recordDeployOutflow } from "../deploy-outflow-ledger.js";
+import { recordDeployGas, DEFAULT_DEPLOY_GAS_SOL } from "../deploy-gas-ledger.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -47,7 +48,7 @@ const TIMEFRAME_MINUTES = {
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap, notifyDeployFailure } from "../telegram.js";
 import { assertCircuitOK, CircuitBreakerError } from "../account-circuit-breaker.js";
-import { computeLiveRealizedSolDelta } from "../realized-sol.js";
+import { selectNotifyRealizedSol } from "../realized-sol.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -1034,23 +1035,12 @@ export async function executeTool(name, args) {
     }
   }
 
-  // ─── Vega fix #1 — pre-close wallet SOL snapshot ──────────────
-  // Capture wallet SOL right BEFORE a live close so we can measure the TRUE
-  // economic outcome (wallet_after - wallet_before) once the close + post-close
-  // auto-swap have settled. This inherently includes IL + swap slippage + gas.
-  // LIVE only; DRY_RUN paper closes are handled in paper-trades.js. Read-only —
-  // does not influence the close decision or TX in any way.
-  let _walletSolBeforeClose = null;
-  if (
-    name === "close_position" &&
-    process.env.DRY_RUN !== "true" &&
-    config.internalAgents?.realizedSolAccounting !== false
-  ) {
-    try {
-      const balBefore = await getWalletBalances({}).catch(() => null);
-      _walletSolBeforeClose = balBefore?.sol != null ? Number(balBefore.sol) : null;
-    } catch (_e) { /* accounting probe must never block close */ }
-  }
+  // ─── Vega 2026-07-11 — pre-close wallet snapshot REMOVED ──────
+  // The wallet-delta method it fed was Lyra-forensic-confirmed to lie under
+  // maxPositions>1 (a concurrent position's returned modal corrupts the wallet
+  // snapshot → this trade's realized figure inflates, the fake "+55%"). The
+  // notify now surfaces the per-trade-attributed LEDGER figure (see the close
+  // handler below), so no pre-close wallet read is needed.
 
   // ─── Execute ──────────────────────────────
   try {
@@ -1100,6 +1090,18 @@ export async function executeTool(name, args) {
           if (Number.isFinite(modalSol) && modalSol > 0) {
             try { recordDeployOutflow(modalSol); } catch (_e) { /* never block deploy notify */ }
           }
+          // Vega 2026-07-11 FIX #2 — deploy-gas visibility. The per-trade realized
+          // formula (realized-sol.js) captures IL + exit slippage + CLOSE gas but
+          // NOT the DEPLOY-leg gas (~0.003 SOL/tx; ~0.042 SOL/day at 14 deploys —
+          // ~half the daily tuition, previously invisible). Record an ESTIMATE
+          // (DEFAULT_DEPLOY_GAS_SOL × observed tx-count) into a rolling daily
+          // aggregate the audit (Lyra) reads via getDeployGasDailySol(). Estimate-
+          // only, additive, does NOT touch the per-trade close formula (no double-
+          // count risk). Reporting-only — never blocks the deploy notify.
+          const deployTxCount = Array.isArray(result.txs) && result.txs.length > 0
+            ? result.txs.length
+            : (result.tx ? 1 : 1);
+          try { recordDeployGas(DEFAULT_DEPLOY_GAS_SOL * deployTxCount); } catch (_e) { /* never block deploy notify */ }
         }
         notifyDeploy({
           pair: result.pool_name || args.pool_name || wd.pool_address?.slice(0, 8) || args.pool_address?.slice(0, 8),
@@ -1140,60 +1142,29 @@ export async function executeTool(name, args) {
           }
         }
 
-        // Vega fix #1 + honesty-audit 2026-06-21 — TRUE realized SOL delta, SINGLE
-        // SOURCE OF TRUTH with the ledger. Now that close + auto-swap have settled,
-        // measure the wallet-level economic outcome.
+        // Vega 2026-07-11 — realized SOL delta, SINGLE SOURCE OF TRUTH = the LEDGER.
         //
-        // Preferred: wallet-delta = (wallet_after - wallet_before) - sol_deployed.
-        // The (after - before) gain is the MODAL RETURNED + fees - gas; subtracting
-        // the deployed modal yields the true economic delta. WITHOUT this subtraction
-        // a break-even trade reads ≈ +100% because the returned modal looks like
-        // profit (the glippy "+103%" / SOLANGELES "+63%" trust-eroder). This is the
-        // SAME economic quantity the ledger (lessons.json) records via the formula
-        // path, so notif == ledger.
+        // The notify now surfaces the EXACT per-trade-attributed figure dlmm.js
+        // already wrote into lessons.json (`received + fees - deployed - close_gas`,
+        // threaded here as result.ledger_realized_sol_*). Telegram + the LLM result
+        // therefore report the IDENTICAL number the learning loop books.
         //
-        // Fallback: when the wallet snapshot or sol_deployed is unavailable, use the
-        // EXACT figure dlmm.js already wrote to the ledger (result.ledger_realized_*)
-        // — never recompute a divergent number for the notif.
-        // Additive only — lp_pnl_pct (result.pnl_pct) is left untouched.
+        // The old wallet-delta method (wallet_after - wallet_before - deployed) is
+        // GONE: Lyra forensic-confirmed it lies under maxPositions>1, because a
+        // CONCURRENT position's returned modal lands in the same wallet snapshot and
+        // is miscounted as this trade's profit (the fake "+55%"). Wallet-delta is
+        // unfixable without per-trade wallet attribution — which the formula path
+        // already does correctly — so we use the ledger figure everywhere.
+        //
+        // Anti-pattern #2: if the ledger figure is missing, honest null — NEVER a
+        // wallet-inflated fallback. Additive only — lp_pnl_pct is left untouched.
         if (!isDry && config.internalAgents?.realizedSolAccounting !== false) {
-          try {
-            let walletSolAfter = null;
-            const balAfter = await getWalletBalances({}).catch(() => null);
-            walletSolAfter = balAfter?.sol != null ? Number(balAfter.sol) : null;
-            const rsd = computeLiveRealizedSolDelta({
-              walletSolBefore: _walletSolBeforeClose,
-              walletSolAfter,
-              solDeployed: result.sol_deployed ?? null,
-              solReceivedOnClose: result.sol_received ?? null,
-              feesClaimedSol: result.fees_claimed_sol ?? result.fees_sol ?? null,
-              // Vega honesty fix #1 (2026-06-23) — economics cross-check so the
-              // formula path refuses a fabricated ~-100% from present-but-zero SOL.
-              pnlPct: result.pnl_pct ?? null,
-            });
-            // Use the wallet/formula computation only if it actually produced a
-            // figure; otherwise fall back to the ledger figure so notif == ledger
-            // and we NEVER surface a modal-inflated number.
-            if (rsd.realized_sol_delta != null) {
-              result.realized_sol_delta = rsd.realized_sol_delta;
-              result.realized_sol_delta_pct = rsd.realized_sol_delta_pct;
-              result.realized_sol_method = rsd.method;
-              result.realized_sol_estimate = rsd.estimate;
-            } else if (result.ledger_realized_sol_delta != null) {
-              result.realized_sol_delta = result.ledger_realized_sol_delta;
-              result.realized_sol_delta_pct = result.ledger_realized_sol_delta_pct;
-              result.realized_sol_method = result.ledger_realized_sol_method;
-              result.realized_sol_estimate = result.ledger_realized_sol_estimate;
-            } else {
-              result.realized_sol_delta = null;
-              result.realized_sol_delta_pct = null;
-              result.realized_sol_method = "unavailable";
-              result.realized_sol_estimate = true;
-            }
-            result.lp_pnl_pct = result.pnl_pct ?? null; // explicit label: price-only LP-PnL
-          } catch (e) {
-            log("executor_warn", `realized SOL delta computation failed: ${e.message}`);
-          }
+          const notifRsd = selectNotifyRealizedSol(result);
+          result.realized_sol_delta = notifRsd.realized_sol_delta;
+          result.realized_sol_delta_pct = notifRsd.realized_sol_delta_pct;
+          result.realized_sol_method = notifRsd.realized_sol_method;
+          result.realized_sol_estimate = notifRsd.realized_sol_estimate;
+          result.lp_pnl_pct = result.pnl_pct ?? null; // explicit label: price-only LP-PnL
         }
 
         // Fire close notification AFTER auto-swap + realized-delta so the message

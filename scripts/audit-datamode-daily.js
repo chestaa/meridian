@@ -13,6 +13,32 @@
 //   3. cumulative realized PnL < -0.15 SOL
 //   4. entry_features MISSING on > 20% of closes  (data-capture integrity)
 //
+// PLUS integrity guards (the fake-realized bug must not silently recur):
+//
+//   G1. realized_sol_delta present + finite on EVERY live close  (ledger integrity)
+//   G2. inflation-signature scan: realized_sol_delta positive & large (>= +40% or
+//       >= +0.03 SOL) WHILE the price-only LP-PnL (pnl_pct/lp_pnl_pct) is NEGATIVE.
+//       That combination is the tell-tale of the old wallet-delta bug (a concurrent
+//       position's returned modal miscounted as this trade's profit → fake "+55%").
+//
+// DIVERGENCE-GUARD HONESTY: post Vega 2026-07-11 fix, the notify-reported realized
+// and the ledger realized are the SAME field (result.realized_sol_delta ===
+// result.ledger_realized_sol_delta). The notify value itself lands only in a
+// Telegram message — it is NOT persisted to any queryable store — so a literal
+// notify-vs-ledger diff cannot be recomputed after the fact. The practical guard is
+// therefore G1 (assert the ledger figure the ledger writes is present+finite) plus
+// G2 (flag the old bug's inflation signature should it ever reappear in a record).
+//
+// DEPLOY-GAS DRAG: per-trade realized (realized-sol.js) captures IL + exit slippage
+// + CLOSE-leg gas, but NOT the DEPLOY-leg gas (~0.003 SOL/tx; ~0.042 SOL/day at ~14
+// deploys — roughly HALF the daily tuition, previously invisible). This audit surfaces
+// it so the TRUE daily economics (realized PnL − deploy gas) are visible. Source:
+// deploy-gas-ledger.getDeployGasDailySol(). CAVEAT: that ledger is in-memory / process-
+// local, so a separate audit invocation reads it as 0 (only the running bot process
+// has the live total). When the live ledger reads 0 we fall back to an ESTIMATE =
+// (closes in last 24h) × DEFAULT_DEPLOY_GAS_SOL — labelled as an estimate, never
+// dressed up as a measured figure (anti-pattern #2).
+//
 // SOURCE OF TRUTH: lessons.json performance[] (realized_sol_delta, source field).
 // Real money only — source !== "paper". See memory: realized-pnl-source-of-truth,
 // loss-attribution-64-live-2026-07-06.
@@ -38,6 +64,20 @@ const MIN_CLOSES_FOR_WR_TRIGGER = 10;
 const WR_FLOOR_PCT = 20;
 const CUM_PNL_FLOOR_SOL = -0.15;
 const EF_MISSING_CEIL_PCT = 20;
+const DAY_MS = 86400000;
+
+// Inflation-signature thresholds (integrity guard G2). The old wallet-delta bug
+// produced a fake realized ~ +55% / ~+0.05 SOL on a 0.10 deploy while the position's
+// price-only LP-PnL was NEGATIVE. A modest positive realized on a slight price dip is
+// LEGIT (fees can net the wallet positive), so we only flag when realized is BOTH
+// positive AND large enough that fees alone can't plausibly explain it while LP-PnL
+// is underwater. Fail-safe: never flag on absent data.
+const INFLATION_PCT_FLOOR = 40;   // realized_sol_delta_pct >= this WHILE lp_pnl < 0
+const INFLATION_ABS_SOL = 0.03;   // fallback abs floor (~+30% on a 0.10 deploy) when pct absent
+
+// Fallback deploy-gas per-tx estimate, used only if deploy-gas-ledger.js can't be
+// imported (kept in sync with deploy-gas-ledger.DEFAULT_DEPLOY_GAS_SOL).
+let DEFAULT_DEPLOY_GAS_SOL = 0.003;
 
 function arg(name, fallback = null) {
   const i = process.argv.indexOf(name);
@@ -92,6 +132,42 @@ function isWin(r) {
   return Number(r?.pnl_usd ?? 0) > 0;
 }
 
+// realized_sol_delta_pct as written by the executor/ledger; null if absent/non-finite.
+function realizedPct(r) {
+  const v = Number(r?.realized_sol_delta_pct);
+  return Number.isFinite(v) ? v : null;
+}
+
+// Price-only LP-PnL pct. lessons.js writes it as pnl_pct (= apiPnlPct, price-only);
+// the executor labels the same value lp_pnl_pct on the result. Read either.
+function lpPnlPct(r) {
+  const v = Number(r?.lp_pnl_pct ?? r?.pnl_pct);
+  return Number.isFinite(v) ? v : null;
+}
+
+// Integrity guard G2 — old fake-realized bug signature. Fires ONLY on a live close
+// whose realized SOL is positive AND large (>= +40% or, if pct is absent, >= +0.03 SOL)
+// WHILE its price-only LP-PnL is negative. FAIL-SAFE: any missing input → false (a
+// data gap is caught by G1, not mislabelled as inflation here).
+function inflationSignature(r) {
+  const rs = realized(r);       // SOL
+  const rsPct = realizedPct(r); // %
+  const lp = lpPnlPct(r);       // %
+  if (rs === null || lp === null || rs <= 0 || lp >= 0) return false;
+  const bigPct = rsPct !== null && rsPct >= INFLATION_PCT_FLOOR;
+  const bigAbsFallback = rsPct === null && rs >= INFLATION_ABS_SOL;
+  return bigPct || bigAbsFallback;
+}
+
+function parseTs(r) {
+  const t = Date.parse(r?.recorded_at || r?.closed_at || "");
+  return Number.isFinite(t) ? t : null;
+}
+
+function round4(n) {
+  return Number.isFinite(n) ? Math.round(n * 10000) / 10000 : n;
+}
+
 // CB-style daily realized loss reconstruction (mirrors recordRealizedLoss):
 // lossSol = amount_sol * (-pnl_pct/100) summed over losing closes that day.
 // pnl_pct here is the API price-only pct forwarded into the record.
@@ -113,7 +189,7 @@ function readLiveCbHalt() {
   }
 }
 
-function main() {
+async function main() {
   const { ok, reason, rows } = loadPerformance();
 
   // Filter: real money (source !== "paper") AND within the data-mode window.
@@ -168,6 +244,82 @@ function main() {
   }
   const liveCb = readLiveCbHalt();
 
+  // ── Integrity guards (G1 ledger presence, G2 inflation signature) ─────────
+  // Only meaningful for LIVE closes (paper never had a wallet realized figure).
+  const liveWindowed = windowed.filter((r) => (r?.source || "live") !== "paper");
+  const missingRealized = liveWindowed.filter((r) => realized(r) === null);
+  const inflationHits = liveWindowed.filter(inflationSignature);
+  const g1Fired = missingRealized.length > 0;
+  const g2Fired = inflationHits.length > 0;
+
+  function describeRow(r) {
+    const rs = realized(r);
+    const rsPct = realizedPct(r);
+    const lp = lpPnlPct(r);
+    const name = r?.pool_name || (r?.pool ? String(r.pool).slice(0, 8) : "?");
+    const day = dayOf(r) || "?";
+    return `${name}@${day} realized=${rs === null ? "MISSING" : rs.toFixed(4) + " SOL"}` +
+           `${rsPct === null ? "" : " (" + rsPct.toFixed(1) + "%)"}` +
+           ` lp_pnl=${lp === null ? "?" : lp.toFixed(1) + "%"} amt=${Number(r?.amount_sol ?? 0).toFixed(3)} SOL`;
+  }
+
+  const integrityGuards = [
+    {
+      id: "realized_sol_delta_present_all_live_closes",
+      label: "G1 — realized_sol_delta present+finite on every live close",
+      fired: g1Fired,
+      detail: g1Fired
+        ? `${missingRealized.length}/${liveWindowed.length} live close(s) MISSING realized_sol_delta: ${missingRealized.slice(0, 5).map(describeRow).join(" | ")}${missingRealized.length > 5 ? " …" : ""}`
+        : `all ${liveWindowed.length} live close(s) carry a finite ledger realized_sol_delta`,
+    },
+    {
+      id: "realized_inflation_signature",
+      label: "G2 — fake-realized inflation signature (realized big-positive while LP-PnL negative)",
+      fired: g2Fired,
+      detail: g2Fired
+        ? `${inflationHits.length} close(s) match the old-bug tell (>=+${INFLATION_PCT_FLOOR}% or >=+${INFLATION_ABS_SOL} SOL realized WHILE lp_pnl<0): ${inflationHits.slice(0, 5).map(describeRow).join(" | ")}${inflationHits.length > 5 ? " …" : ""}`
+        : `no inflation signature in ${liveWindowed.length} live close(s)`,
+    },
+  ];
+  const anyIntegrityFired = integrityGuards.some((g) => g.fired);
+
+  // ── Deploy-gas drag (true daily economics = realized PnL − deploy gas) ─────
+  // getDeployGasDailySol() is a rolling 24h total from an in-memory, process-local
+  // ledger; a separate audit process sees 0 (only the running bot holds the live
+  // total). When live reads 0 we fall back to an estimate from close-count.
+  const now = Date.now();
+  let deployGasLiveSol = null;
+  let deployGasCount = null;
+  let deployGasLedgerAvailable = false;
+  let deployGasLedgerError = null;
+  try {
+    const gasMod = await import("../deploy-gas-ledger.js");
+    if (Number.isFinite(Number(gasMod.DEFAULT_DEPLOY_GAS_SOL))) DEFAULT_DEPLOY_GAS_SOL = Number(gasMod.DEFAULT_DEPLOY_GAS_SOL);
+    deployGasLiveSol = Number(gasMod.getDeployGasDailySol(now));
+    deployGasCount = Number(gasMod.getDeployGasCount(now));
+    deployGasLedgerAvailable = true;
+  } catch (e) {
+    deployGasLedgerError = e.message;
+  }
+
+  // Estimate deploy gas from lessons closes as a proxy for deploys (1 deploy ≈ 1 close).
+  const closes24h = liveWindowed.filter((r) => { const t = parseTs(r); return t !== null && (now - t) <= DAY_MS; });
+  const deployGasEstimate24hSol = round4(closes24h.length * DEFAULT_DEPLOY_GAS_SOL);
+  const deployGasEstimateWindowSol = round4(liveWindowed.length * DEFAULT_DEPLOY_GAS_SOL);
+
+  // Effective daily deploy gas: prefer the live ledger figure when it's a positive
+  // in-process total; otherwise use the estimate (honestly flagged).
+  const liveGasUsable = deployGasLedgerAvailable && Number.isFinite(deployGasLiveSol) && deployGasLiveSol > 0;
+  const effectiveDailyDeployGasSol = liveGasUsable ? round4(deployGasLiveSol) : deployGasEstimate24hSol;
+  const deployGasSource = liveGasUsable ? "live-ledger" : (deployGasLedgerAvailable ? "estimate (live ledger 0 — separate process)" : `estimate (ledger unavailable: ${deployGasLedgerError})`);
+
+  // Realized over last 24h to pair with the daily deploy-gas figure.
+  let realized24hSol = 0;
+  let realized24hKnown = false;
+  for (const r of closes24h) { const rs = realized(r); if (rs !== null) { realized24hSol += rs; realized24hKnown = true; } }
+  const netDaily24hSol = realized24hKnown ? round4(realized24hSol - effectiveDailyDeployGasSol) : null;
+  const netWindowWithGasSol = cumKnown ? round4(cumPnlSol - deployGasEstimateWindowSol) : null;
+
   // ── Rollback triggers ─────────────────────────────────────────────────────
   const triggers = [
     {
@@ -196,6 +348,7 @@ function main() {
     },
   ];
   const anyFired = triggers.some((t) => t.fired);
+  const exitAlert = anyFired || anyIntegrityFired;
 
   const report = {
     generated_at: new Date().toISOString(),
@@ -211,6 +364,22 @@ function main() {
     entry_features_field_coverage: fieldCounts,
     cb_halted_days_reconstructed: haltedDays,
     live_cb: liveCb,
+    deploy_gas: {
+      default_per_tx_sol: DEFAULT_DEPLOY_GAS_SOL,
+      ledger_available: deployGasLedgerAvailable,
+      ledger_error: deployGasLedgerError,
+      live_daily_sol: deployGasLedgerAvailable ? round4(deployGasLiveSol) : null,
+      live_deploy_count: deployGasCount,
+      estimate_24h_sol: deployGasEstimate24hSol,
+      estimate_window_sol: deployGasEstimateWindowSol,
+      effective_daily_sol: effectiveDailyDeployGasSol,
+      source: deployGasSource,
+      realized_24h_sol: realized24hKnown ? round4(realized24hSol) : null,
+      net_daily_24h_sol: netDaily24hSol,
+      net_window_with_gas_sol: netWindowWithGasSol,
+    },
+    integrity_guards: integrityGuards,
+    INTEGRITY_ALERT: anyIntegrityFired,
     triggers,
     ROLLBACK_RECOMMENDED: anyFired,
   };
@@ -232,16 +401,34 @@ function main() {
     console.log(`  CB halted days (reconstructed) . ${haltedDays.join(", ") || "none"}`);
     console.log(`  live CB halted today ........... ${liveCb.halted_today}${liveCb.corrupt ? " (STATE CORRUPT)" : ""}`);
     console.log(line);
+    console.log("  DEPLOY-GAS DRAG (true daily economics = realized − deploy gas)");
+    console.log(`  deploy gas / day ............... ${effectiveDailyDeployGasSol.toFixed(4)} SOL  [${deployGasSource}]`);
+    if (deployGasLedgerAvailable) console.log(`    live ledger .................. ${round4(deployGasLiveSol).toFixed(4)} SOL (${deployGasCount} deploy(s) in-process, 24h)`);
+    console.log(`    estimate (closes×${DEFAULT_DEPLOY_GAS_SOL}) ....... 24h=${deployGasEstimate24hSol.toFixed(4)} SOL (${closes24h.length} closes)  window=${deployGasEstimateWindowSol.toFixed(4)} SOL (${liveWindowed.length} closes)`);
+    console.log(`  realized last 24h .............. ${realized24hKnown ? round4(realized24hSol).toFixed(4) + " SOL" : "unknown"}`);
+    console.log(`  NET last 24h (realized − gas) .. ${netDaily24hSol === null ? "unknown" : netDaily24hSol.toFixed(4) + " SOL"}`);
+    console.log(`  NET window (cum realized − gas)  ${netWindowWithGasSol === null ? "unknown" : netWindowWithGasSol.toFixed(4) + " SOL"}`);
+    console.log(line);
+    console.log("  INTEGRITY GUARDS (fake-realized bug watch)");
+    for (const g of integrityGuards) {
+      console.log(`  [${g.fired ? "🔴 FIRED" : "🟢 ok  "}] ${g.label}`);
+      console.log(`             ${g.detail}`);
+    }
+    console.log(line);
     for (const t of triggers) {
       console.log(`  [${t.fired ? "🔴 FIRED" : "🟢 ok  "}] ${t.label}`);
       console.log(`             ${t.detail}`);
     }
     console.log(line);
+    console.log(`  INTEGRITY ALERT: ${anyIntegrityFired ? "🔴 YES — fake-realized signature/gap; escalate to Polaris → Bro" : "🟢 NO — ledger integrity intact"}`);
     console.log(`  ROLLBACK RECOMMENDED: ${anyFired ? "🔴 YES — escalate to Polaris → Bro" : "🟢 NO — continue data-mode"}`);
     console.log(line);
   }
 
-  process.exit(anyFired ? 1 : 0);
+  process.exit(exitAlert ? 1 : 0);
 }
 
-main();
+main().catch((e) => {
+  console.error(`audit-datamode-daily fatal: ${e?.stack || e?.message || e}`);
+  process.exit(2);
+});

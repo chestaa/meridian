@@ -173,6 +173,50 @@ export function computeLiveRealizedSolDelta({
 }
 
 /**
+ * NOTIFY single source of truth (Vega 2026-07-11).
+ *
+ * Given a close result that carries the LEDGER figures dlmm.js already computed
+ * (the per-trade-attributed formula path — `received + fees - deployed - gas` —
+ * which is the EXACT number written into lessons.json), return the fields to
+ * surface in the Telegram notif AND the LLM `result`. Both must report the SAME
+ * number the ledger records.
+ *
+ * This DELIBERATELY does NOT use any wallet-delta method. Lyra forensic
+ * (2026-07-11): under maxPositions>1, the wallet snapshot `(after - before)` is
+ * corrupted by a CONCURRENT position's returned modal (e.g. another trade's 0.10
+ * SOL lands in the same wallet between the two reads and is miscounted as THIS
+ * trade's profit → fake "+55%"). Wallet-delta is unfixable without per-trade
+ * wallet attribution, and the formula path ALREADY does that attribution
+ * correctly — so we use the ledger figure everywhere and notif == ledger by
+ * construction.
+ *
+ * Anti-pattern #2 (never fabricate): if the ledger figure is missing, return an
+ * honest null — NEVER fall back to the broken wallet-delta.
+ *
+ * Pure. No I/O, no wallet read.
+ *
+ * @param {object} result close-position result carrying ledger_realized_sol_*
+ * @returns {{ realized_sol_delta: number|null, realized_sol_delta_pct: number|null,
+ *             realized_sol_method: string|null, realized_sol_estimate: boolean|null }}
+ */
+export function selectNotifyRealizedSol(result = {}) {
+  if (result && result.ledger_realized_sol_delta != null) {
+    return {
+      realized_sol_delta: result.ledger_realized_sol_delta,
+      realized_sol_delta_pct: result.ledger_realized_sol_delta_pct ?? null,
+      realized_sol_method: result.ledger_realized_sol_method ?? null,
+      realized_sol_estimate: result.ledger_realized_sol_estimate ?? null,
+    };
+  }
+  return {
+    realized_sol_delta: null,
+    realized_sol_delta_pct: null,
+    realized_sol_method: "unavailable",
+    realized_sol_estimate: true,
+  };
+}
+
+/**
  * Compute realized SOL delta for a PAPER close.
  *
  * Paper has no wallet, so we SIMULATE the exit: take the price-proxy LP-PnL,
