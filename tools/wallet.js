@@ -274,6 +274,47 @@ export function normalizeMint(mint) {
   return mint;
 }
 
+/**
+ * Resolve the max-slippage cap (bps) for a swap. Reads config, fails CLOSED to a
+ * safe 200 bps (2%) if the config value is missing / non-finite / non-positive —
+ * NEVER inherits an unbounded default (anti-pattern #2). Bounded to a hard
+ * ceiling so a fat-finger config can't reopen the 50% leak the relay had.
+ */
+export const SWAP_SLIPPAGE_HARD_CEILING_BPS = 500; // 5% — absolute money-path max
+export function resolveSwapMaxSlippageBps() {
+  const raw = Number(config?.jupiter?.swapMaxSlippageBps);
+  if (!Number.isFinite(raw) || raw <= 0) return 200; // fail-closed safe default
+  return Math.min(Math.round(raw), SWAP_SLIPPAGE_HARD_CEILING_BPS);
+}
+
+/**
+ * Pure pre-execution slippage guard. Given a Jupiter order response and the cap
+ * (bps), decide whether the swap may proceed. Reads the order's expected price
+ * impact (`priceImpactPct`, a decimal fraction e.g. "0.015" = 1.5%). If the
+ * impact is present and exceeds the cap → BLOCK (fail-closed, don't eat a bad
+ * fill). If the impact field is absent/unparseable we do NOT block on that alone:
+ * the slippageBps sent on the order is the on-chain ceiling (the tx reverts
+ * rather than fills worse), so Jupiter enforces the same bound at execution.
+ * Returns { ok, reason, priceImpactBps }.
+ */
+export function swapSlippageGuard(order, capBps) {
+  const rawImpact = order?.priceImpactPct;
+  const impactFrac = Number(rawImpact);
+  if (rawImpact == null || rawImpact === "" || !Number.isFinite(impactFrac)) {
+    // No readable impact — rely on the on-chain slippageBps ceiling.
+    return { ok: true, reason: "price_impact_unknown_relying_on_slippage_bps", priceImpactBps: null };
+  }
+  const priceImpactBps = Math.abs(impactFrac) * 10000;
+  if (priceImpactBps > capBps) {
+    return {
+      ok: false,
+      reason: `price_impact_${priceImpactBps.toFixed(1)}bps_exceeds_cap_${capBps}bps`,
+      priceImpactBps,
+    };
+  }
+  return { ok: true, reason: "within_cap", priceImpactBps };
+}
+
 export async function swapToken({
   input_mint,
   output_mint,
@@ -304,11 +345,16 @@ export async function swapToken({
     const amountStr = Math.floor(amount * Math.pow(10, decimals)).toString();
 
     // ─── Get Swap V2 order (unsigned tx + requestId) ───────────
+    // Vega money-path: send an EXPLICIT slippage ceiling (bps). Previously
+    // omitted → rode the Jupiter default; now bounded so the tx reverts on-chain
+    // rather than fills worse than the cap.
+    const maxSlippageBps = resolveSwapMaxSlippageBps();
     const search = new URLSearchParams({
       inputMint: input_mint,
       outputMint: output_mint,
       amount: amountStr,
       taker: wallet.publicKey.toString(),
+      slippageBps: String(maxSlippageBps),
     });
     const referralParams = getJupiterReferralParams();
     if (referralParams) {
@@ -329,6 +375,31 @@ export async function swapToken({
     const order = await orderRes.json();
     if (order.errorCode || order.errorMessage) {
       throw new Error(`Swap V2 order error: ${order.errorMessage || order.errorCode}`);
+    }
+
+    // ─── Pre-execution slippage guard (Vega, anti-pattern #2) ──
+    // If the quoted price impact exceeds the cap, SKIP the swap — do NOT sign or
+    // send. The token simply stays in the wallet (an unswapped dust bag with an
+    // alert) rather than eating a bad fill. This is the optional post-close dust
+    // swap only; the position close/withdraw itself already completed on-chain
+    // upstream and is NEVER gated by this guard.
+    const guard = swapSlippageGuard(order, maxSlippageBps);
+    if (!guard.ok) {
+      log(
+        "swap_warn",
+        `Swap SKIPPED (slippage guard): ${guard.reason}. Token ${input_mint} left in wallet; no bad fill taken.`,
+      );
+      return {
+        success: false,
+        skipped: true,
+        reason: "slippage_guard",
+        detail: guard.reason,
+        price_impact_bps: guard.priceImpactBps,
+        max_slippage_bps: maxSlippageBps,
+        input_mint,
+        output_mint,
+        amount,
+      };
     }
 
     const { transaction: unsignedTx, requestId } = order;

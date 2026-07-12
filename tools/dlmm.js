@@ -54,7 +54,7 @@ export const MAX_LIVE_POSITION_SOL = 0.5;
 
 // Wrapped-SOL mint — the ONLY mint a single-side SOL deploy may deposit into.
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
-import { normalizeMint } from "./wallet.js";
+import { normalizeMint, resolveSwapMaxSlippageBps } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 
@@ -1889,7 +1889,12 @@ export async function closePosition({ position_address, reason }) {
           positionId: position_address,
           owner: wallet.publicKey.toString(),
           bps: 10000,
-          slippageBps: 5000,
+          // Vega money-path hardening (2026-07-12): was a hard 5000 (50%) — a
+          // real leak vector if this dormant relay path were ever enabled. Now
+          // capped to the same config ceiling as the active swap (default 200 =
+          // 2%, hard-clamped ≤500). DORMANT (lpAgentRelayEnabled=false) so no
+          // behavior change today — this just defuses the bomb.
+          slippageBps: resolveSwapMaxSlippageBps(),
           output: closeOutput,
           provider: "OKX",
           type: "meteora",

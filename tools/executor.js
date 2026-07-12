@@ -871,6 +871,8 @@ const toolMap = {
       publicApiKey: ["api", "publicApiKey"],
       agentMeridianApiUrl: ["api", "url"],
       lpAgentRelayEnabled: ["api", "lpAgentRelayEnabled"],
+      // swap-path slippage ceiling (Vega money-path hardening)
+      swapMaxSlippageBps: ["jupiter", "swapMaxSlippageBps"],
       // chart indicators
       chartIndicatorsEnabled: ["indicators", "enabled", ["chartIndicators", "enabled"]],
       indicatorEntryPreset: ["indicators", "entryPreset", ["chartIndicators", "entryPreset"]],
@@ -1132,10 +1134,20 @@ export async function executeTool(name, args) {
             if (token && token.usd >= 0.10) {
               log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
               const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
-              // Tell the model the swap already happened so it doesn't call swap_token again
-              result.auto_swapped = true;
-              result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-              if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+              if (swapResult?.skipped) {
+                // Vega slippage guard skipped the optional dust swap — the CLOSE
+                // already succeeded on-chain; the token stays in the wallet. Be
+                // HONEST to the model: do NOT claim it was swapped.
+                result.auto_swapped = false;
+                result.auto_swap_skipped = true;
+                result.auto_swap_note = `Post-close swap of ${token.symbol || result.base_mint.slice(0, 8)} → SOL SKIPPED by slippage guard (${swapResult.detail}). Token remains in wallet; retry manually when the pool is less thin. Position is already closed.`;
+                log("executor_warn", `Post-close dust swap skipped (slippage guard): ${swapResult.detail}`);
+              } else {
+                // Tell the model the swap already happened so it doesn't call swap_token again
+                result.auto_swapped = true;
+                result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
+                if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+              }
             }
           } catch (e) {
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);

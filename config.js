@@ -875,6 +875,18 @@ export const config = {
     referralFeeBps: Number(
       process.env.JUPITER_REFERRAL_FEE_BPS ?? 50,
     ),
+    // Vega money-path hardening (2026-07-12, Draco drain-forensic follow-up).
+    // The active token→SOL dust swap (tools/wallet.js swapToken) previously set
+    // NO slippageBps → rode the Jupiter default. Fine on ~0.03 SOL dust today,
+    // but a larger OOR-down token bag on a thin pool could eat a bad fill. This
+    // cap (a) is sent as slippageBps on the Jupiter order (on-chain ceiling — the
+    // tx reverts rather than fills worse), and (b) is a pre-execution guard: if
+    // the quoted price impact exceeds the cap we SKIP the swap (fail-closed,
+    // anti-pattern #2 — the token stays in the wallet with an alert rather than a
+    // silent bad fill). Default 200 bps = 2% (task range 1-3%). User-tunable so
+    // Bro can loosen for a genuinely thin exit if ever needed. Also the CEILING
+    // applied to the dormant LPAgent relay zap-out (was hard 5000/50%).
+    swapMaxSlippageBps: Number(u.swapMaxSlippageBps ?? 200),
   },
 
   // ─── Telegram Notification Mode ────────
