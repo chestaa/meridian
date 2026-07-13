@@ -1,8 +1,8 @@
 {
-  "ts": "2026-07-13T06:04:20.610Z",
+  "ts": "2026-07-13T06:09:21.784Z",
   "wallet": {
     "pubkey": "DgA9MZ…1Hiu",
-    "sol_free": 0.191473,
+    "sol_free": 0.448847,
     "tokens": []
   },
   "summary": {
@@ -10,17 +10,17 @@
     "open_total_value_sol": 0,
     "open_aggregate_pnl_pct": 0,
     "closed_24h_count": 13,
-    "closed_24h_pnl_sum_sol": -0.00263,
-    "closed_24h_realized_sol_sum": -0.003015,
-    "closed_7d_count": 38,
-    "closed_7d_pnl_sum_sol": -0.00553,
-    "closed_7d_realized_sol_sum": -0.043378,
+    "closed_24h_pnl_sum_sol": -0.00257,
+    "closed_24h_realized_sol_sum": -0.003041,
+    "closed_7d_count": 39,
+    "closed_7d_pnl_sum_sol": -0.00577,
+    "closed_7d_realized_sol_sum": -0.043409,
     "win_rate_24h": 0,
     "win_rate_7d": 0
   },
   "circuit_breaker": {
     "halted": false,
-    "realized_loss_sol": 0.015112
+    "realized_loss_sol": 0.015348
   },
   "llm_cost_24h_usd": 0.0647,
   "services_active": [
