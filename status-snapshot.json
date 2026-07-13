@@ -1,20 +1,20 @@
 {
-  "ts": "2026-07-13T00:27:02.131Z",
+  "ts": "2026-07-13T00:32:03.266Z",
   "wallet": {
     "pubkey": "DgA9MZ…1Hiu",
-    "sol_free": 0.45818,
+    "sol_free": 0.715714,
     "tokens": []
   },
   "summary": {
     "open_count": 0,
     "open_total_value_sol": 0,
     "open_aggregate_pnl_pct": 0,
-    "closed_24h_count": 9,
-    "closed_24h_pnl_sum_sol": 0.00763,
-    "closed_24h_realized_sol_sum": 0.006898,
-    "closed_7d_count": 34,
-    "closed_7d_pnl_sum_sol": 0.00473,
-    "closed_7d_realized_sol_sum": -0.033464,
+    "closed_24h_count": 10,
+    "closed_24h_pnl_sum_sol": 0.00929,
+    "closed_24h_realized_sol_sum": 0.007201,
+    "closed_7d_count": 35,
+    "closed_7d_pnl_sum_sol": 0.00639,
+    "closed_7d_realized_sol_sum": -0.033161,
     "win_rate_24h": 0,
     "win_rate_7d": 0
   },
@@ -22,7 +22,7 @@
     "halted": false,
     "realized_loss_sol": 0
   },
-  "llm_cost_24h_usd": 0.0624,
+  "llm_cost_24h_usd": 0.0638,
   "services_active": [
     "meridian",
     "signal-runner",
