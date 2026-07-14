@@ -2086,6 +2086,102 @@ export function buildDiscoveryFilters(s) {
   ].filter(Boolean).join("&&");
 }
 
+// ─── Two-sided PAPER supplement — bluechip/LST-SOL surfacing (Cassiopeia — Track-A) ──
+//
+// WHY THIS EXISTS: the main broad discovery fetch sorts `broadSortBy`
+// (fee_active_tvl_ratio:desc) and clips to `broadDiscoveryPageSize`. Deep bluechip /
+// LST-SOL pools have LOW fee/TVL (JitoSOL-SOL ≈1% APR → tiny fee/TVL ratio) so they
+// sort to the BOTTOM of that page and fall off the clip — the SAME root cause as the
+// 3-week bluechip dormancy. On top of that, the broad memecoin mcap CEILING
+// (broadMcapCeil 50M) drops large-cap bluechip base legs (JitoSOL mcap ≫50M) at the
+// SERVER before we ever see them. Result: the two-sided PAPER lane collects ZERO data
+// because its candidates never reach rawPools.
+//
+// THE FIX (surfacing only — NOT a gate change, NOT a loosening): a supplementary fetch
+// of the SAME universe sorted by `tvl:desc` (deep pools FIRST → the deep LST-SOL /
+// bluechip pools land at the TOP of the page, immune to the fee/TVL clip) with a WIDE
+// bluechip-inclusive mcap ceiling (bluechipBroadMcapCeil, $1T) so large-cap bluechip
+// base legs survive the server pre-filter. The surfaced pools are then filtered to
+// GENUINE two-sided paper candidates (isTwoSidedPaperCandidate — both legs bluechip,
+// wSOL=quote) so the merge stays TIGHT and never injects random deep pools into the
+// funnel. They run the EXACT SAME gate routing as any other pool downstream: the
+// inverted bluechip SURFACING gate + the mandatory twoSidedBaseLegGateReason base-leg
+// SAFETY gate (rug/mint/freeze/bot/top10 on the held base leg — surfacing does NOT
+// weaken safety).
+//
+// HARD ISOLATION: fetchTwoSidedPaperSupplement returns [] BEFORE any fetch when the
+// paper lane is inactive (live single-side OR flag-off) → in live this is a complete
+// no-op: zero extra API cost, rawPools byte-identical, main fetch/sort/clip untouched.
+
+/**
+ * Supplement filter builder. PURE + exported for tests. Same cheap sanity flags as the
+ * broad filter, a low tvl floor, and a WIDE mcap ceiling (bluechipBroadMcapCeil) so
+ * large-cap bluechip base legs are NOT dropped server-side. Strict SUPERSET of the
+ * candidate set — it can only let MORE through; isTwoSidedPaperCandidate narrows it back
+ * to genuine bluechip/LST-SOL pairs client-side.
+ */
+export function buildTwoSidedPaperSupplementFilters(s) {
+  const sanity = [
+    "base_token_has_critical_warnings=false",
+    "quote_token_has_critical_warnings=false",
+    s.excludeHighSupplyConcentration ? "base_token_has_high_supply_concentration=false" : null,
+    "base_token_has_high_single_ownership=false",
+    "pool_type=dlmm",
+  ];
+  const mcapFloor = numeric(s.broadMcapFloor);
+  // WIDE ceiling — bluechip base legs (JitoSOL/SOL/etc.) have mcap far above the memecoin
+  // broad ceiling (50M). Use the bluechip broad ceiling so they survive the server filter;
+  // fall back to the memecoin broad ceiling only if the bluechip key is unset.
+  const mcapCeil = numeric(s.bluechipBroadMcapCeil) ?? numeric(s.broadMcapCeil);
+  const tvlFloor = numeric(s.broadMinTvl);
+  return [
+    ...sanity,
+    mcapFloor != null ? `base_token_market_cap>=${mcapFloor}` : null,
+    mcapCeil  != null ? `base_token_market_cap<=${mcapCeil}`  : null,
+    tvlFloor  != null ? `tvl>=${tvlFloor}` : null,
+  ].filter(Boolean).join("&&");
+}
+
+/**
+ * Fetch + surface the deep bluechip/LST-SOL pools the main fee/TVL-sorted fetch clips.
+ * Exported for tests. HARD NO-OP (returns [] before any fetch) when the paper lane is
+ * inactive → live discovery byte-identical, zero extra API cost. Lyra: exactly ONE
+ * supplementary page fetch per cycle, and ONLY in DRY_RUN paper mode; it shares the
+ * discovery page cache (own key, so no collision with the main fetch), so same-cycle
+ * repeats are served from cache. Fail-safe: a fetch error → [] (log + skip), never
+ * throws into the discovery path.
+ */
+export async function fetchTwoSidedPaperSupplement(s) {
+  if (!twoSidedPaperLaneActive(config, process.env.DRY_RUN)) return [];
+
+  const filters = buildTwoSidedPaperSupplementFilters(s);
+  const pageSize = numeric(s.broadDiscoveryPageSize) ?? 1000;
+  let data;
+  try {
+    data = await fetchPoolDiscoveryPage({
+      page_size: pageSize,
+      filters,
+      timeframe: s.timeframe,
+      category: s.category,
+      sort_by: "tvl:desc", // deep pools FIRST — surfaces low-fee/TVL deep LST-SOL pools
+    });
+  } catch (e) {
+    log("screening", `Two-sided paper supplement fetch failed: ${e.message} — skipping (paper lane)`);
+    return [];
+  }
+
+  const raw = Array.isArray(data.data) ? data.data : [];
+  // Keep ONLY genuine two-sided paper candidates (both legs bluechip, wSOL=quote). This
+  // keeps the merge TIGHT — a random deep memecoin pool in the tvl:desc page is dropped
+  // here and never pollutes the funnel. Base-leg SAFETY is enforced later downstream.
+  const candidates = raw.filter((p) => isTwoSidedPaperCandidate(p, config, process.env.DRY_RUN));
+  log(
+    "screening",
+    `Two-sided paper supplement: ${candidates.length}/${raw.length} bluechip/LST-SOL candidate(s) surfaced (tvl:desc, paper lane)`,
+  );
+  return candidates;
+}
+
 export async function discoverPools({
   page_size = 50,
   // returnLimit caps the gate-passed `pools` array we RETURN (token-bloat guard for
@@ -2133,6 +2229,29 @@ export async function discoverPools({
     if (!pool?.pool_address) continue;
     tagSignalSource(pool, "meteora");
     recordSignalSighting(pool.pool_address, "meteora");
+  }
+
+  // Two-sided PAPER supplement (Cassiopeia — Track-A surfacing fix). INERT in live /
+  // flag-off: fetchTwoSidedPaperSupplement returns [] BEFORE any fetch, so this whole
+  // block is skipped and rawPools is byte-identical to the pre-fix path (no extra API
+  // call, main fetch/sort/clip untouched). When the paper lane is active it pulls the
+  // deep bluechip/LST-SOL pools the fee/TVL sort + memecoin mcap ceiling drop, and
+  // MERGES only NEW ones (dedup by pool_address — a pool already in the main page wins,
+  // preserving its metrics/provenance). Merged pools take the SAME gate routing below:
+  // inverted bluechip surfacing gate + mandatory twoSidedBaseLegGateReason safety.
+  const twoSidedSupplement = await fetchTwoSidedPaperSupplement(s);
+  if (twoSidedSupplement.length > 0) {
+    const seenAddrs = new Set(rawPools.map((p) => p?.pool_address).filter(Boolean));
+    let merged = 0;
+    for (const p of twoSidedSupplement) {
+      if (!p?.pool_address || seenAddrs.has(p.pool_address)) continue;
+      seenAddrs.add(p.pool_address);
+      tagSignalSource(p, "meteora");
+      recordSignalSighting(p.pool_address, "meteora");
+      rawPools.push(p);
+      merged++;
+    }
+    if (merged > 0) log("screening", `Two-sided paper supplement merged ${merged} new bluechip/LST-SOL pool(s) into discovery`);
   }
 
   if (config.screening.useDiscordSignals) {
