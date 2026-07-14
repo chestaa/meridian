@@ -239,11 +239,15 @@ config.liveOverrides = origLiveOverrides;
 // ─── 9) Blocked safety check propagates ────────────────────────────────────
 console.log("\n[9] blocked-by-safety propagates");
 
-installExecutorStub({ blocked: true, reason: "circuit_breaker: daily loss reached" });
+// NOTE: use the REAL assertCircuitOK reason format here. The old stub used the
+// phantom string "circuit_breaker: daily loss reached" which matches NO production
+// code path — it leaked into a log forensic (2026-07-14) and was mistaken for a
+// real wallet-delta guard. The authoritative block reason is realized-loss based.
+installExecutorStub({ blocked: true, reason: "Circuit breaker tripped: Daily SOL loss cap hit (0.1100 SOL ≥ 0.1 SOL)." });
 resetCallTracking();
 const blocked = await deployFromOrionVerdict(enterVerdict, goodCandidate, { walletSol: 5 });
 check("blocked → deployed=false", blocked?.deployed === false);
-check("blocked → error includes reason", String(blocked?.error || "").includes("circuit_breaker"));
+check("blocked → error includes reason", String(blocked?.error || "").includes("Circuit breaker tripped"));
 
 // ─── 10) Tool error propagates ─────────────────────────────────────────────
 console.log("\n[10] tool error propagates");

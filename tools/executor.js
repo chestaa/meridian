@@ -1254,7 +1254,23 @@ export async function executeTool(name, args) {
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
-      // Account-level daily loss guard — must be first, before any other validation
+      // Account-level daily loss guard — must be first, before any other validation.
+      //
+      // INVARIANT (Vega 2026-07-14, false-"daily loss reached" incident): the daily-loss
+      // BLOCK decision is derived SOLELY from the authoritative realized-loss ledger inside
+      // account-circuit-breaker.js (`state.realized_loss_sol` / `state.halted`, set only by
+      // recordRealizedLoss on a CLOSED position). It is NEVER a wallet-delta
+      // (day-start balance − current liquid balance). The live SOL balance read below is
+      // passed to assertCircuitOK for ONE purpose only: seeding `starting_balance_sol` on
+      // the first deploy-check of a new UTC day. On an already-seeded day the balance is
+      // ignored entirely (getOrInitState returns the existing state untouched).
+      //
+      // WHY this matters: when capital is DEPLOYED in an open position, the liquid balance
+      // dips (recoverable capital, not loss). A wallet-delta check would misread that dip as
+      // a "daily loss" and falsely block deploys — the exact false-positive class already
+      // killed in the notify path (f7abb852). This guard cannot do that: it reads realized
+      // loss, not liquid balance. DO NOT reintroduce a wallet-delta comparison here.
+      // Regression lock: scripts/test-circuit-deployed-capital-dip.js.
       try {
         const balForCircuit = process.env.DRY_RUN !== "true"
           ? (await getWalletBalances().catch(() => null))?.sol ?? null
