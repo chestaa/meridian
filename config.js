@@ -779,14 +779,15 @@ export const config = {
     //     NEITHER this phase → live two-sided is unconditionally refused. This flag
     //     flips ONLY on Bro's explicit go AFTER Andromeda live monitoring + burner
     //     setup are confirmed. Do NOT set true.
-    //   twoSidedNotionalCapSol (default 0.10) — config tunable for the TOTAL
+    //   twoSidedNotionalCapSol (default 0.20) — config tunable for the TOTAL
     //     two-sided notional (Y-leg + X-leg-in-SOL). Bounded by the code-pinned
-    //     MAX_TWO_SIDED_NOTIONAL_SOL ceiling: it can TIGHTEN below 0.10 but can
-    //     NEVER exceed it (anti-pattern #7).
+    //     MAX_TWO_SIDED_NOTIONAL_SOL ceiling (0.20): it can TIGHTEN below 0.20 but
+    //     can NEVER exceed it (anti-pattern #7). Raised 0.10→0.20 with the code
+    //     ceiling for the first-ever live two-sided (Bro go-live 2026-07-14).
     //   twoSidedXSharePct (default 0.5) — fraction of the total notional routed to
     //     the token-X leg via the entry swap (the rest stays as the SOL Y leg).
     twoSidedLiveAuthorized:       u.twoSidedLiveAuthorized       ?? false,
-    twoSidedNotionalCapSol:       numericConfig(u.twoSidedNotionalCapSol) ?? 0.1,
+    twoSidedNotionalCapSol:       numericConfig(u.twoSidedNotionalCapSol) ?? 0.2,
     twoSidedXSharePct:            numericConfig(u.twoSidedXSharePct) ?? 0.5,
   },
 

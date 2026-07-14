@@ -56,6 +56,19 @@ function normalizeEntryFeatures(ef) {
   };
 }
 
+// Andromeda — module-level STRICT numeric coercion (anti-pattern #2). Mirrors the
+// local `num` in normalizeEntryFeatures: only a real finite number (or non-empty
+// numeric string) survives; null/''/false/[] → null (NEVER the Number(null)===0
+// fabrication trap). Used by the live two-sided mark-to-market.
+function strictNum(v) {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
 function load() {
   if (!fs.existsSync(STATE_FILE)) {
     return { positions: {}, recentEvents: [], lastUpdated: null };
@@ -99,6 +112,10 @@ export function trackPosition({
   is_bluechip = false,
   signal_snapshot = null,
   entry_features = null,
+  two_sided = false,
+  entry_price = null,
+  entry_swap_cost_sol = null,
+  notional = null,
 }) {
   const state = load();
   state.positions[position] = {
@@ -127,6 +144,33 @@ export function trackPosition({
     // screening enrichment + market-regime read (NO new API call). Null fields where
     // a value was unavailable at deploy (fail-safe, never fabricated).
     entry_features: normalizeEntryFeatures(entry_features),
+    // Andromeda Track-C — LIVE two-sided position marker + two-leg geometry.
+    // Distinct from single-side records. `two_sided` flags the INVERTED two-asset
+    // exit path (evaluateTwoSidedLiveExit); `two_sided_live` carries the leg shape
+    // the live mark-to-market needs BEYOND what getMyPositions marks on-chain:
+    //   - y_leg_sol            : nominal SOL deposited into the wSOL (quote) leg
+    //   - x_leg_tokens         : token-X acquired via the entry swap (upper bins)
+    //   - entry_price          : SOL-per-token at deploy (deposit basis reference)
+    //   - entry_swap_cost_sol  : SOL drag of the SOL→token-X entry swap. This is
+    //     NOT captured in the on-chain deposit basis, so the live two-asset PnL
+    //     subtracts it from the on-chain net → honest end-to-end.
+    //   - notional_sol         : total exposure = y_leg + x_leg-in-SOL (the drag
+    //     denominator).
+    // For a single-side deploy `two_sided` stays false and `two_sided_live` is null
+    // → the record AND the exit path are byte-for-byte unchanged.
+    two_sided: two_sided === true,
+    two_sided_live:
+      two_sided === true
+        ? {
+            y_leg_sol: strictNum(amount_sol),
+            x_leg_tokens: strictNum(amount_x),
+            entry_price: strictNum(entry_price),
+            entry_swap_cost_sol: strictNum(entry_swap_cost_sol),
+            notional_sol: strictNum(
+              notional && typeof notional === "object" ? notional.total_notional_sol : notional,
+            ),
+          }
+        : null,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
     last_claim_at: null,
@@ -482,6 +526,162 @@ export function oorDirection(positionData) {
   return "IN";
 }
 
+// ─── Andromeda Track-C — LIVE two-sided (two-asset) mark-to-market ──────────
+// A LIVE two-sided position is a REAL on-chain DLMM position holding BOTH a
+// token-X leg (upper bins, appreciates on price-up) AND a SOL-Y leg (lower bins).
+// UNLIKE paper (which had to synthesize the two-asset value from a nominal Y leg),
+// the on-chain PnL API already marks BOTH legs to market: positionData
+// .pnl_pct_fee_inclusive is (current two-leg value + fees − deposit basis) / basis,
+// with REAL IL embedded — this SOLVES the paper model's "Y-leg nominal" honesty gap
+// automatically (no re-derivation from a nominal leg, no separate price fetch).
+//
+// The ONE thing the on-chain deposit basis omits is the ENTRY SWAP COST: the SOL
+// drag paid converting SOL→token-X BEFORE the deposit. We amortize it over the
+// total notional and subtract → honest end-to-end two-asset PnL matching the task's
+// (Y + X·price + fees − entry swap cost) intent, but with the leg marking done
+// on-chain instead of from a nominal Y leg.
+//
+// FAIL-SAFE (anti-pattern #2): no on-chain net (both pnl_pct_fee_inclusive AND
+// pnl_pct missing/non-finite) → uncomputable → HOLD (never fabricate a 0% that
+// looks flat/exit-worthy). Missing swap-cost/notional → 0 drag (the on-chain net
+// is still a REAL measurement, just without the small entry drag — never fabricated).
+// Pure: no I/O. Exported for unit tests.
+export function computeTwoSidedLivePnl(pos, positionData) {
+  const ts = pos?.two_sided_live || {};
+  const feeIncl = strictNum(positionData?.pnl_pct_fee_inclusive);
+  const reported = strictNum(positionData?.pnl_pct);
+  const base = feeIncl != null ? feeIncl : reported;
+  if (base == null) {
+    return { pnl_pct: null, uncomputable: true, reason: "missing_live_pnl" };
+  }
+  const swapCost = strictNum(ts.entry_swap_cost_sol);
+  const notional = strictNum(ts.notional_sol);
+  let dragPct = 0;
+  if (swapCost != null && swapCost > 0 && notional != null && notional > 0) {
+    dragPct = (swapCost / notional) * 100;
+  }
+  const pnlPct = Number((base - dragPct).toFixed(2));
+  return {
+    pnl_pct: pnlPct,
+    base_pnl_pct: base,
+    swap_drag_pct: Number(dragPct.toFixed(4)),
+    uncomputable: false,
+    reason: null,
+  };
+}
+
+// ─── Andromeda Track-C — LIVE two-sided exit evaluator ──────────────────────
+// Live mirror of paper-trades.js#evaluateTwoSidedPaperExit. Runs ONLY for live
+// two-sided positions (dispatched from updatePnlAndCheckExits when
+// pos.two_sided === true). Two distinct close reasons feed separate EV audit (Lyra):
+//   - TWO_SIDED_DOWN_CUT       (both legs bleeding — SL-equivalent + OOR-DOWN fast cut)
+//   - TWO_SIDED_UPSIDE_CAPTURE (token-X leg appreciated — bank the upside)
+// Precedence: DOWN-CUT first (a bleeding position cannot dodge the cut via an
+// upside target it will never reach), then UPSIDE-CAPTURE.
+//
+// DIRECTION: unlike paper (price-vs-entry proxy), LIVE reads the REAL active_bin vs
+// range via oorDirection() — UP = pumped above range (token-X leg working), DOWN =
+// dumped below range (both legs bleeding). Missing bins → UNKNOWN → only the PnL
+// floors fire (no OOR-timer arm), never a crash.
+//
+// CLOSE ROUTING: returns { action, reason } like single-side — the caller routes it
+// through the EXISTING executor close path (exitMap → close_position). NO direct
+// close here. Vega's close-side owns the two-asset withdrawal + token-X→SOL swap.
+//
+// Reuses the paper config keys (twoSidedDownCutPct / twoSidedUpsideCaptureTargetPct
+// / twoSidedOorDownCutMinutes / twoSidedUpsideCaptureOorMinutes) — semantically
+// identical thresholds, one source of truth for paper AND live.
+export function evaluateTwoSidedLiveExit(position_address, positionData, mgmtConfig) {
+  const mgmt = mgmtConfig || (config.management || {});
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return null;
+
+  const pnl = computeTwoSidedLivePnl(pos, positionData);
+  // FAIL-SAFE: uncomputable two-asset PnL → no exit this cycle (hold; identical
+  // to a missing-price single-side cycle — never fabricate a decision).
+  if (pnl.uncomputable || !Number.isFinite(pnl.pnl_pct)) return null;
+  const pnlPct = pnl.pnl_pct;
+
+  // Track peak (two-asset) for forensics / future trailing. Persist alongside the
+  // OOR-timer bookkeeping so both survive the cycle.
+  let changed = false;
+  if (pos.peak_pnl_pct == null || pnlPct > pos.peak_pnl_pct) {
+    pos.peak_pnl_pct = pnlPct;
+    changed = true;
+  }
+
+  // OOR-timer maintenance (mirror the single-side block; getMyPositions also
+  // maintains this via markOutOfRange/markInRange — the set is idempotent).
+  const inRange = positionData?.in_range;
+  if (inRange === false && !pos.out_of_range_since) {
+    pos.out_of_range_since = new Date().toISOString();
+    changed = true;
+  } else if (inRange === true && pos.out_of_range_since) {
+    pos.out_of_range_since = null;
+    changed = true;
+  }
+  if (changed) save(state);
+
+  const direction = oorDirection(positionData); // real bins in live
+  const minutesOOR = pos.out_of_range_since
+    ? Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000)
+    : 0;
+
+  // ── DOWN-CUT (both legs bleeding) — HIGHEST PRECEDENCE / SL-equivalent floor ──
+  //   (a) net two-asset PnL <= twoSidedDownCutPct (falls back to stopLossPct), OR
+  //   (b) OOR-DOWN sustained >= twoSidedOorDownCutMinutes (price left the range to
+  //       the downside → token-X leg underwater AND SOL-Y leg converting into a
+  //       depreciating token → cut fast, like a single-side OOR-DOWN).
+  const downCutPct = Number(mgmt.twoSidedDownCutPct ?? mgmt.stopLossPct ?? -8);
+  if (Number.isFinite(downCutPct) && pnlPct <= downCutPct) {
+    return {
+      action: "TWO_SIDED_DOWN_CUT",
+      reason: `two_sided_down_cut: net two-asset PnL ${pnlPct.toFixed(2)}% <= ${downCutPct}% — both legs bleeding, cutting`,
+      current_pnl_pct: pnlPct,
+    };
+  }
+  if (direction === "DOWN") {
+    const downMin = Number(mgmt.twoSidedOorDownCutMinutes ?? 8);
+    if (Number.isFinite(downMin) && minutesOOR >= downMin) {
+      return {
+        action: "TWO_SIDED_DOWN_CUT",
+        reason: `two_sided_down_cut: OOR-DOWN ${minutesOOR}m >= ${downMin}m — price below range, both legs bleeding`,
+        current_pnl_pct: pnlPct,
+        minutes_out_of_range: minutesOOR,
+      };
+    }
+  }
+
+  // ── UPSIDE CAPTURE (token-X leg worked — bank it) ───────────────────────────
+  // OPPOSITE of single-side fast-OOR-up (idle SOL). The upper bins hold the TOKEN;
+  // as price climbs it appreciates and is sold into strength across the range.
+  //   (a) net PnL >= twoSidedUpsideCaptureTargetPct → let-it-run target hit, bank.
+  //   (b) OOR-UP in profit sustained >= twoSidedUpsideCaptureOorMinutes → the token
+  //       leg has been converted toward SOL out the top of the range → capture.
+  const targetPct = Number(mgmt.twoSidedUpsideCaptureTargetPct ?? 8);
+  if (Number.isFinite(targetPct) && pnlPct >= targetPct) {
+    return {
+      action: "TWO_SIDED_UPSIDE_CAPTURE",
+      reason: `two_sided_upside_capture: net two-asset PnL ${pnlPct.toFixed(2)}% >= target ${targetPct}% — token-X leg appreciated, banking upside`,
+      current_pnl_pct: pnlPct,
+    };
+  }
+  if (direction === "UP" && pnlPct > 0) {
+    const upMin = Number(mgmt.twoSidedUpsideCaptureOorMinutes ?? 0);
+    if (Number.isFinite(upMin) && minutesOOR >= upMin) {
+      return {
+        action: "TWO_SIDED_UPSIDE_CAPTURE",
+        reason: `two_sided_upside_capture: OOR-UP ${minutesOOR}m >= ${upMin}m in profit (${pnlPct.toFixed(2)}%) — token-X leg worked into upper range, banking`,
+        current_pnl_pct: pnlPct,
+        minutes_out_of_range: minutesOOR,
+      };
+    }
+  }
+
+  return null;
+}
+
 /**
  * Check all exit conditions for a position (trailing TP, stop loss, OOR, low yield).
  * Updates peak_pnl_pct, trailing_active, and OOR state.
@@ -519,6 +719,19 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
+
+  // ── Andromeda Track-C — LIVE two-sided dispatch ────────────────────────
+  // A LIVE two-sided position (token-X leg + SOL-Y leg) has an INVERTED payoff
+  // vs single-side (price UP = token-X leg appreciates = capture; price DOWN =
+  // both legs bleed = cut), so it CANNOT reuse the single-side rule stack below.
+  // Gated STRICTLY on pos.two_sided === true → a single-side position skips this
+  // branch entirely and the entire block below is byte-for-byte unchanged.
+  // DORMANT until the two-sided flag flips: no live two-sided position can exist
+  // yet (Vega's belts refuse every live amount_x>0 deploy), so this never fires
+  // in production this phase — it is the machinery the live path will use.
+  if (pos.two_sided === true) {
+    return evaluateTwoSidedLiveExit(position_address, positionData, mgmtConfig);
+  }
 
   // ── Max-hold-time forced exit (Vega EXIT-3 #3, HIGHEST PRECEDENCE) ──────
   // Live mirror of paper-trades.js evaluatePaperExit's MAX_HOLD gate, now with

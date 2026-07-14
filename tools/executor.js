@@ -23,7 +23,7 @@ import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
-import { twoSidedGateDecision } from "./two-sided.js";
+import { twoSidedGateDecision, resolveTwoSidedNotionalCapSol } from "./two-sided.js";
 import { getRecentDecisions } from "../decision-log.js";
 import { recordDeployOutflow } from "../deploy-outflow-ledger.js";
 import { recordDeployGas, DEFAULT_DEPLOY_GAS_SOL } from "../deploy-gas-ledger.js";
@@ -1561,7 +1561,21 @@ async function runSafetyChecks(name, args) {
       if (process.env.DRY_RUN !== "true") {
         const balance = await getWalletBalances();
         const gasReserve = config.management.gasReserve;
-        const reject = solCoverageRejectReason(balance, amountY, gasReserve);
+        // ── Two-sided coverage (Vega — go-live seam fix) ──
+        // A single-side deploy spends only amountY (the Y-leg SOL). A TWO-SIDED
+        // deploy ALSO spends the X-leg: ~half the notional is swapped SOL→token-X
+        // before the deposit, so the true SOL leaving the wallet is the FULL
+        // two-leg notional, NOT just amountY. The executor has no price here to
+        // value the token leg, so we reserve the CONSERVATIVE upper bound = the
+        // effective total-notional cap (actual notional can only be ≤ this — the
+        // dlmm assertTwoSidedNotionalCap belt binds it). Without this, the coverage
+        // gate under-reserves two-sided by the X-leg and can eat into gasReserve.
+        // Single-side (deployAmountX<=0) → coverageAmount === amountY, byte-unchanged.
+        const coverageAmount =
+          Number.isFinite(deployAmountX) && deployAmountX > 0
+            ? resolveTwoSidedNotionalCapSol(config)
+            : amountY;
+        const reject = solCoverageRejectReason(balance, coverageAmount, gasReserve);
         if (reject) return { pass: false, reason: reject };
       }
 

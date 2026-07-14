@@ -71,10 +71,20 @@ export function resolveTwoSidedMode(cfg, dryRunEnv) {
  * Returns { allowed:boolean, mode:object, refuseReason:string|null }.
  *
  * Refusal precedence (all fail-CLOSED):
- *   - flag OFF                         → ORIGINAL single-side message (byte-unchanged)
- *   - flag ON + LIVE + paperOnly TRUE  → paper-only belt refusal
- *   - flag ON + LIVE + paperOnly FALSE → live-not-authorized refusal (still refused)
- *   - flag ON + DRY_RUN                → ALLOWED (paper two-sided)
+ *   - flag OFF                                          → ORIGINAL single-side message (byte-unchanged)
+ *   - flag ON + LIVE + paperOnly TRUE                   → paper-only belt refusal (belt 2)
+ *   - flag ON + LIVE + paperOnly FALSE + NOT authorized → live-not-authorized refusal (belt 3, still refused)
+ *   - flag ON + LIVE + paperOnly FALSE + AUTHORIZED     → ALLOWED (the 2-flag enable seam — belt 4)
+ *   - flag ON + DRY_RUN                                 → ALLOWED (paper two-sided)
+ *
+ * THE 2-FLAG ENABLE SEAM (Vega 2026-07-14 go-live prep): live two-sided opens ONLY
+ * when BOTH twoSidedPaperOnly===false AND twoSidedLiveAuthorized===true (checked via
+ * the single-source-of-truth predicate liveTwoSidedFullyAuthorized). With the shipped
+ * defaults (paperOnly TRUE, liveAuthorized FALSE) belt 2 fires and live stays refused;
+ * a partial flip (only one of the two) is caught by belt 3. This gate is the SINGLE
+ * authority consulted by BOTH the executor pre-check AND the dlmm money-path, so the
+ * two open together on the flip. executeTwoSidedLiveDeposit RE-checks the same predicate
+ * (belt 4, defense-in-depth) before any swap.
  */
 export function twoSidedGateDecision(cfg, dryRunEnv) {
   const mode = resolveTwoSidedMode(cfg, dryRunEnv);
@@ -89,7 +99,7 @@ export function twoSidedGateDecision(cfg, dryRunEnv) {
     };
   }
 
-  // LIVE attempt with two-sided enabled — two INDEPENDENT belts refuse it.
+  // LIVE attempt with two-sided enabled — independent belts gate it.
   if (!mode.isDry) {
     // Belt 2 — twoSidedPaperOnly hard belt.
     if (mode.paperOnly) {
@@ -101,8 +111,14 @@ export function twoSidedGateDecision(cfg, dryRunEnv) {
           "Live two-sided is not authorized in this phase.",
       };
     }
-    // Belt 3 — even with the paper belt lowered, the LIVE two-sided path is not
-    // built/authorized. amount_x>0 remains paper-only for now. (Defence in depth.)
+    // Belt 4 — explicit final authorization. Only when the paper belt is lowered AND
+    // twoSidedLiveAuthorized===true is the LIVE two-sided path opened. This is the
+    // 2-flag enable seam; both flags default to the refusing value so this is FALSE
+    // until Bro's explicit go. executeTwoSidedLiveDeposit re-checks the same predicate.
+    if (liveTwoSidedFullyAuthorized(cfg, dryRunEnv)) {
+      return { allowed: true, mode, refuseReason: null };
+    }
+    // Belt 3 — paper belt lowered but NOT fully authorized (partial flip). Refuse.
     return {
       allowed: false,
       mode,
@@ -158,8 +174,14 @@ export function computeTwoSidedNotionalSol({ amountYSol, amountXTokens, priceSol
  * config/LLM value can tighten below this but can NEVER exceed it (anti-pattern #7).
  * This is a TOTAL-notional cap (both legs), NOT a per-leg cap: the token leg CANNOT
  * escape the ceiling by being denominated in tokens.
+ *
+ * 2026-07-14 (Bro go-live decision): raised 0.10 → 0.20 for the FIRST-EVER live
+ * two-sided on the MAIN live burner (DgA9, ~0.69 SOL). Still WELL below the
+ * single-side per-position hard cap MAX_LIVE_POSITION_SOL (0.5) — the single-side
+ * belt continues to backstop any classification slip. The total-notional (Y + X-in-SOL)
+ * still binds here, so the token leg cannot escape 0.20.
  */
-export const MAX_TWO_SIDED_NOTIONAL_SOL = 0.1;
+export const MAX_TWO_SIDED_NOTIONAL_SOL = 0.2;
 
 /** The canonical wSOL mint (the ONLY quote leg a SOL deposit is valid against). */
 export const WSOL_MINT = "So11111111111111111111111111111111111111112";

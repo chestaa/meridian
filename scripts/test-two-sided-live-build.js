@@ -56,15 +56,15 @@ function cfg(strategy = {}) {
 }
 
 // ── constants ────────────────────────────────────────────────────────────────
-check("MAX_TWO_SIDED_NOTIONAL_SOL === 0.10", MAX_TWO_SIDED_NOTIONAL_SOL === 0.1, `got ${MAX_TWO_SIDED_NOTIONAL_SOL}`);
+check("MAX_TWO_SIDED_NOTIONAL_SOL === 0.20 (go-live)", MAX_TWO_SIDED_NOTIONAL_SOL === 0.2, `got ${MAX_TWO_SIDED_NOTIONAL_SOL}`);
 check("WSOL_MINT correct", WSOL_MINT === "So11111111111111111111111111111111111111112");
 
 // ── resolveTwoSidedNotionalCapSol (config tightens, never loosens) ─────────────
-check("cap: unset → code ceiling 0.10", resolveTwoSidedNotionalCapSol(cfg()) === 0.1);
+check("cap: unset → code ceiling 0.20", resolveTwoSidedNotionalCapSol(cfg()) === 0.2);
 check("cap: config 0.05 tightens", resolveTwoSidedNotionalCapSol(cfg({ twoSidedNotionalCapSol: 0.05 })) === 0.05);
-check("cap: config 0.5 CANNOT exceed ceiling", resolveTwoSidedNotionalCapSol(cfg({ twoSidedNotionalCapSol: 0.5 })) === 0.1);
-check("cap: config 0 → code ceiling (fail-closed)", resolveTwoSidedNotionalCapSol(cfg({ twoSidedNotionalCapSol: 0 })) === 0.1);
-check("cap: config null → code ceiling", resolveTwoSidedNotionalCapSol(cfg({ twoSidedNotionalCapSol: null })) === 0.1);
+check("cap: config 0.5 CANNOT exceed ceiling", resolveTwoSidedNotionalCapSol(cfg({ twoSidedNotionalCapSol: 0.5 })) === 0.2);
+check("cap: config 0 → code ceiling (fail-closed)", resolveTwoSidedNotionalCapSol(cfg({ twoSidedNotionalCapSol: 0 })) === 0.2);
+check("cap: config null → code ceiling", resolveTwoSidedNotionalCapSol(cfg({ twoSidedNotionalCapSol: null })) === 0.2);
 
 // ── liveTwoSidedFullyAuthorized (belt 4 — default OFF) ─────────────────────────
 check("belt4: default → false", liveTwoSidedFullyAuthorized(cfg(), "false") === false);
