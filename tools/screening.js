@@ -1168,6 +1168,42 @@ export function bluechipWsolQuoteRejectReason(pool) {
 // with real price divergence.
 const LST_SOL_BASE_MINTS = new Set([JITOSOL_MINT, MSOL_MINT, BSOL_MINT, JUPSOL_MINT]);
 
+// ─── Curated LST mint/freeze-authority EXEMPT set (Cassiopeia — Bro decision Option A) ──
+//
+// A stake-pool LST retains a LIVE on-chain mint authority BY DESIGN: it must mint new
+// LST 1:1 whenever a user deposits SOL. So Jupiter's audit reports
+// `mintAuthorityDisabled=false` → the memecoin-calibrated `mint_authority_not_renounced`
+// gate flags it. For a stake-pool LST this is a FALSE POSITIVE, NOT a rug vector: the
+// mint authority is an OFF-CURVE Program Derived Address (a program, no private key) that
+// can only mint against deposited SOL — no human can arbitrarily inflate supply.
+//
+// Draco's on-chain probe (2026-07-14) CONFIRMED for JitoSOL / mSOL / jupSOL: mint
+// authority = off-curve stake-pool PDA (no private key), mints 1:1 vs SOL, freeze
+// authority already renounced. Only these three probe-confirmed mints are exempted here.
+// bSOL stays in LST_SOL_BASE_MINTS (surfacing/ranking) but is DELIBERATELY NOT exempted —
+// it was not in Draco's confirmed set, so fail-closed it still trips mint/freeze until
+// verified (add one line here once probed). Stables (USDC/USDT) are NOT LSTs and NOT
+// exempted — their issuer freeze authority is a genuine live control, a heavier call
+// left out of scope.
+//
+// SCOPE OF THE EXEMPTION (narrow, per Bro Option A): ONLY the two authority checks
+// (mint + freeze), ONLY on a curated-LST base leg, ONLY when the two-sided PAPER lane is
+// active. Rug-flag (liquidity removal), bundler, bot-holders, top10, dev_sold_all all
+// STAY fail-closed enforced. NOT a global requireMintRenounced disable — the memecoin
+// single-side funnel (BONK/WIF etc.) still rejects any live mint authority.
+const LST_MINT_FREEZE_EXEMPT_MINTS = new Set([JITOSOL_MINT, MSOL_MINT, JUPSOL_MINT]);
+
+/**
+ * Is this base mint a curated, on-chain-verified stake-pool LST whose LIVE mint/freeze
+ * authority is a protocol PDA (not a rug vector)? PURE + unit-tested. Used ONLY to
+ * exempt the two mint/freeze authority checks in the two-sided PAPER lane. FAIL-CLOSED:
+ * missing mint or non-curated mint → false (enforce mint/freeze as normal).
+ */
+export function isLstMintFreezeExempt(baseMint) {
+  if (!baseMint) return false;
+  return LST_MINT_FREEZE_EXEMPT_MINTS.has(baseMint);
+}
+
 /**
  * Is the paper two-sided lane active? PURE. True only when the master flag is on AND
  * we are in DRY_RUN. Reuses Vega's resolveTwoSidedMode so screening and the money-path
@@ -1210,9 +1246,18 @@ export function isTwoSidedPaperCandidate(pool, cfg, dryRunEnv) {
  * Two-sided base-leg SAFETY gate — the "safety matters MORE" enforcement. PURE +
  * unit-tested + FAIL-CLOSED. Because a two-sided position HOLDS the token-X (base) leg,
  * its rug/mint/freeze/bundler/top10 safety is enforced on the base mint EXACTLY as for
- * a memecoin — NOT exempted like the bluechip income lane. Composes the SAME decision
- * authorities the memecoin path uses (rugGateRejectReason / devSoldAllShouldReject) plus
- * the bot/top10 concentration caps, so there is one source of truth per gate.
+ * a memecoin. Composes the SAME decision authorities the memecoin path uses
+ * (rugGateRejectReason / devSoldAllShouldReject) plus the bot/top10 concentration caps,
+ * so there is one source of truth per gate.
+ *
+ * ONE NARROW EXEMPTION (Bro decision Option A, 2026-07-14): for a curated,
+ * on-chain-probe-confirmed stake-pool LST base leg (isLstMintFreezeExempt →
+ * JitoSOL/mSOL/jupSOL) AND only while the two-sided PAPER lane is active, the two
+ * AUTHORITY checks (mint + freeze) are skipped — a stake-pool LST retains a live mint
+ * authority by design (PDA that mints 1:1 vs deposited SOL, no private key = not a rug
+ * vector). This is NOT a global disable: rug-flag (liquidity removal), bundler, bot,
+ * top10, dev_sold_all stay fail-closed; the exemption never fires in live / flag-off
+ * (lane inactive) nor on non-curated mints (stables, memecoins, bSOL).
  *
  * Returns a reject reason string, or null if the base leg clears every ACTIVE safety
  * gate. FAIL-CLOSED (anti-pattern #2): a configured gate with missing audit data →
@@ -1223,8 +1268,21 @@ export function isTwoSidedPaperCandidate(pool, cfg, dryRunEnv) {
  * @returns {string|null}
  */
 export function twoSidedBaseLegGateReason(pool, s) {
+  // NARROW mint/freeze exemption (Bro Option A) — ONLY when ALL hold:
+  //   (a) the two-sided PAPER lane is active (twoSidedEnabled + DRY_RUN) — so in
+  //       live / flag-off this is ALWAYS false and the exemption can never fire, and
+  //   (b) the HELD base leg is a curated, probe-confirmed stake-pool LST.
+  // When exempt we clear ONLY requireMintRenounced + requireFreezeRenounced for the rug
+  // call — rejectRugpullFlag (liquidity removal) stays ON, and the bundler / bot / top10
+  // / dev_sold_all gates below are UNTOUCHED. Everything else remains fail-closed.
+  const { base } = poolLegMints(pool);
+  const mintFreezeExempt =
+    twoSidedPaperLaneActive(config, process.env.DRY_RUN) && isLstMintFreezeExempt(base);
+  const rugParams = mintFreezeExempt
+    ? { ...s, requireMintRenounced: false, requireFreezeRenounced: false }
+    : s;
   // rug / mint-authority / freeze-authority / liquidity-removal on the HELD base leg.
-  const rug = rugGateRejectReason(pool, s);
+  const rug = rugGateRejectReason(pool, rugParams);
   if (rug) return rug;
   // dev_sold_all (compound / legacy per config) on the held base leg.
   if (devSoldAllShouldReject(pool, s)) {
@@ -1246,6 +1304,83 @@ export function twoSidedBaseLegGateReason(pool, s) {
     if (top10 == null) return "top10_data_unavailable";
     if (top10 > maxTop10) return "top10_pct_above_cap";
   }
+  return null;
+}
+
+/**
+ * Two-sided PAPER-lane bluechip SURFACING gate (Cassiopeia — Track-A final unblock).
+ * PURE + unit-tested + FAIL-CLOSED. Returns a reject reason string, or null if the pool
+ * clears the paper-lane surfacing bar.
+ *
+ * WHY A SEPARATE GATE (the exact blocker this fixes): the two-sided paper candidates
+ * (deep LST-SOL / bluechip pairs, surfaced via the tvl:desc supplement) were ALL rejected
+ * by `bluechipPoolGateRejectReason` — instrumented culprits were the INCOME-ENGINE floors
+ * `bluechipMinVolume` (50k/24h) and `bluechipMinFeeTvlRatio` (0.03 ≈ 11% APR). Those bars
+ * exist for the SINGLE-SIDE income lane (deploy SOL into a deep pool, must clear a yield
+ * bar or the IL isn't worth it). They do NOT apply to a SYMMETRIC two-sided pair we are
+ * merely PAPER-validating: a JitoSOL-SOL pool at $2.44M TVL / ~1% APR has near-zero IL
+ * (both legs track SOL) and low fee/TVL is EXPECTED, not a risk — it is exactly the kind
+ * of low-directional-risk pair the paper soak exists to measure. (Draco's `maxTvl`
+ * hypothesis was wrong: there is NO maxTvl in the bluechip gate — deep TVL PASSES the
+ * floor; the fee-yield + volume income bars were the blockers.)
+ *
+ * WHAT IT KEEPS (a strict SUPERSET of the income gate on the relaxed dims — never looser
+ * on structure/stability):
+ *   - DEEP-TVL floor (`bluechipMinTvl`) — a two-sided bluechip position wants depth; a
+ *     thin fake-bluechip pool is still rejected. Deep LST-SOL pools pass trivially.
+ *   - Large-cap mcap floor (`bluechipMinMcap`) — confirms a genuine large-cap base leg.
+ *   - VOLATILITY CEILING (`bluechipMaxVolatility`) — a wild reading = de-peg / thin book,
+ *     NOT a stable pair; still capped out. Low/zero vol tolerated (the GOOD state).
+ * WHAT IT DROPS (income-engine bounds that wrongly exclude legit symmetric pairs):
+ *   - `bluechipMinVolume` (consistent-flow income bar) — a low-churn LST-SOL pool is a
+ *     valid paper candidate; a dead-pool paper deploy just yields "no fees" data, which
+ *     is itself informative and carries ZERO money risk (DRY_RUN-only lane).
+ *   - `bluechipMinFeeTvlRatio` (yield income bar) — low fee/TVL is the EXPECTED profile
+ *     of a stable symmetric pair; gating on it is the exact inversion trap.
+ *
+ * SAFETY IS NOT RELAXED: base-leg rug/mint/freeze/bundler/top10 on the HELD token-X leg
+ * is enforced SEPARATELY and downstream by `twoSidedBaseLegGateReason` (fail-closed). This
+ * gate only governs SURFACING/sizing bounds — a bad base leg is still rejected there.
+ *
+ * FAIL-CLOSED (anti-pattern #2): TVL/mcap are strictNumeric-checked; missing → reject
+ * with a `two_sided_paper_*_unknown` reason, never default to a passing value.
+ *
+ * Caller must only invoke this on isTwoSidedPaperCandidate() === true pools (which is
+ * ALWAYS false in live / flag-off → this fn never runs on the live single-side funnel).
+ *
+ * @param {object} pool - raw or condensed pool
+ * @param {object} s - effective screening thresholds (reuses bluechip* keys)
+ * @returns {string|null}
+ */
+export function twoSidedPaperBluechipGateReason(pool, s) {
+  const tvl = strictNumeric(pool?.tvl ?? pool?.active_tvl);
+  const mcap = strictNumeric(pool?.token_x?.market_cap ?? pool?.mcap ?? pool?.market_cap);
+  const volatility = strictNumeric(pool?.volatility);
+
+  const minTvl = numeric(s?.bluechipMinTvl);
+  const minMcap = numeric(s?.bluechipMinMcap);
+  const maxVola = numeric(s?.bluechipMaxVolatility);
+
+  // DEEP-liquidity floor (structure) — KEPT. Deep pools pass; thin ones rejected.
+  if (minTvl != null && minTvl > 0) {
+    if (tvl == null) return "two_sided_paper_tvl_unknown";
+    if (tvl < minTvl) return `two_sided_paper tvl ${tvl} below bluechipMinTvl ${minTvl}`;
+  }
+  // Large-cap confirmation (structure) — KEPT.
+  if (minMcap != null && minMcap > 0) {
+    if (mcap == null) return "two_sided_paper_mcap_unknown";
+    if (mcap < minMcap) return `two_sided_paper mcap ${mcap} below bluechipMinMcap ${minMcap}`;
+  }
+  // VOLATILITY CEILING (stability) — KEPT. Missing/low vol tolerated (GOOD state);
+  // only a wild reading (de-peg / thin book) is rejected.
+  if (maxVola != null && maxVola > 0) {
+    if (volatility != null && volatility > maxVola) {
+      return `two_sided_paper volatility ${volatility} above bluechipMaxVolatility ${maxVola}`;
+    }
+  }
+  // DROPPED for the paper lane: bluechipMinVolume + bluechipMinFeeTvlRatio (income-engine
+  // yield bars — irrelevant to a symmetric-payoff pair with near-zero IL that we are only
+  // PAPER-validating). Base-leg safety is enforced downstream (twoSidedBaseLegGateReason).
   return null;
 }
 
@@ -2462,9 +2597,21 @@ export async function discoverPools({
       filteredExamples.push({ name: pool.name || pool.pool_address || "unknown pool", reason: "non_bluechip_filtered_bluechip_only_mode" });
       return false;
     }
-    const reason = (isBc || isTsp)
-      ? bluechipPoolGateRejectReason(pool, s)
-      : getRawPoolScreeningRejectReason(pool, s);
+    // Gate routing (isTsp FIRST — paper lane takes precedence over the income lane so a
+    // pool that is BOTH bluechip-income and a paper candidate is validated under the
+    // RELAXED paper gate, then base-leg-safety-enforced downstream):
+    //   - isTsp  → twoSidedPaperBluechipGateReason: KEEPS deep-TVL / large-cap / vol-
+    //     ceiling structure+stability, DROPS the income-engine volume + fee/TVL yield
+    //     bars that were rejecting all surfaced LST-SOL pairs. Safety (rug/mint/freeze/
+    //     bot/top10) is NOT here — it is enforced on the held base leg downstream by
+    //     twoSidedBaseLegGateReason. INERT in live/flag-off (isTsp always false there).
+    //   - isBc   → bluechipPoolGateRejectReason: the single-side income lane (full floors).
+    //   - else   → getRawPoolScreeningRejectReason: the memecoin gate (byte-unchanged).
+    const reason = isTsp
+      ? twoSidedPaperBluechipGateReason(pool, s)
+      : isBc
+        ? bluechipPoolGateRejectReason(pool, s)
+        : getRawPoolScreeningRejectReason(pool, s);
     if (!reason) return true;
     filteredExamples.push({ name: pool.name || pool.pool_address || "unknown pool", reason });
     if (pool.discord_signal) log("screening", `Discord signal filtered: ${pool.name || pool.pool_address} — ${reason}`);
@@ -2780,6 +2927,12 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     const requireWsolLeg = eff.requireBluechipWsolLeg !== false; // default true (Opsi B)
     const kept = eligible.filter((p) => {
       if (!isBluechipPool(p, eff)) return true; // memecoin pool — untouched here
+      // Two-sided PAPER candidate: it was surfaced/validated under the RELAXED paper gate
+      // (twoSidedPaperBluechipGateReason) at discovery — do NOT re-apply the income-engine
+      // volume/fee-TVL floors here (that would undo the Track-A fix when bluechipModeEnabled
+      // is ALSO on). Base-leg safety for it is enforced downstream by twoSidedBaseLegGateReason.
+      // INERT in live/flag-off (isTwoSidedPaperCandidate always false there).
+      if (isTwoSidedPaperCandidate(p, config, process.env.DRY_RUN)) return true;
       const reason = bluechipPoolGateRejectReason(p, eff);
       if (reason) {
         log("screening", `Bluechip gate: dropped ${p.name} — ${reason}`);
