@@ -62,6 +62,22 @@ function numberOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+// STRICT numeric coercion for TELEMETRY (entry_features) reads ONLY. Distinct from
+// numberOrNull above (which the deploy-math path relies on and stays UNCHANGED to
+// respect scope). The naive numberOrNull FABRICATES 0 for a genuinely-missing value
+// because `Number(null)===0` / `Number('')===0` are finite — that is precisely how a
+// null regime/flow/mcap became a fake flat 0 in the 42-record dataset. Mirrors
+// screening.js strictNumeric + classifyRegime discipline: only a real finite number
+// (or non-empty numeric string) survives; null/undefined/''/boolean/object → null.
+function efNumeric(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
 /**
  * Deterministic bins_below from volatility.
  * Mirrors the formula the SCREENER LLM was previously instructed to compute
@@ -242,25 +258,32 @@ export async function deployFromOrionVerdict(orionVerdict, candidate, context = 
   //   - token price change / flow / mcap: taken off the enriched candidate + pool.
   // Absent inputs pass through as null (dlmm.buildEntryFeatures + state.js coerce).
   const ti = candidate?.ti || {};
-  let solRegime24hPct = numberOrNull(context.solRegime24hPct);
+  // Cassiopeia's in-cycle capture (screening.js buildEntryFeatures) rides on the
+  // candidate as `pool.entry_features` — the authoritative snapshot read with the
+  // correct condensed field names AT screen time. Prefer it so real values flow
+  // through even if the direct pool/ti field paths drift; fall back to the raw
+  // fields otherwise. All reads use efNumeric → genuinely-missing stays null, NEVER 0.
+  const ef = (pool.entry_features && typeof pool.entry_features === "object") ? pool.entry_features : {};
+  let solRegime24hPct = efNumeric(context.solRegime24hPct);
+  if (solRegime24hPct == null) solRegime24hPct = efNumeric(ef.sol_24h_change_pct);
   if (solRegime24hPct == null) {
     try {
       const regime = await _detectMarketRegime({ s: config.screening });
-      solRegime24hPct = numberOrNull(regime?.sol24hChangePct);
+      solRegime24hPct = efNumeric(regime?.sol24hChangePct);
     } catch (e) {
       log("agent", `[VEGA_DETERMINISTIC] regime read failed (entry_features): ${e.message}`);
       solRegime24hPct = null;
     }
   }
-  const tokenPriceChange1h = numberOrNull(
-    ti?.stats_1h?.price_change ?? pool.price_change_1h ?? pool.price_change_pct,
+  const tokenPriceChange1h = efNumeric(
+    ti?.stats_1h?.price_change ?? pool.price_change_1h ?? ef.price_change_pct ?? pool.price_change_pct,
   );
-  const tokenPriceChange24h = numberOrNull(
+  const tokenPriceChange24h = efNumeric(
     ti?.stats_24h?.price_change ?? pool.price_change_24h,
   );
-  const buyVol = numberOrNull(pool.buy_vol ?? pool.buy_vol_usd);
-  const sellVol = numberOrNull(pool.sell_vol ?? pool.sell_vol_usd);
-  const mcap = numberOrNull(pool.mcap ?? pool.market_cap);
+  const buyVol = efNumeric(pool.buy_vol ?? ef.buy_vol ?? pool.buy_vol_usd);
+  const sellVol = efNumeric(pool.sell_vol ?? ef.sell_vol ?? pool.sell_vol_usd);
+  const mcap = efNumeric(pool.mcap ?? ef.mcap ?? pool.market_cap);
 
   const args = {
     pool_address: poolAddress,

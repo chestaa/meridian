@@ -34,9 +34,17 @@ function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
 // to a finite number or null — NEVER fabricated. buy_sell_flow_ratio is threaded
 // pre-computed by the deploy path (dlmm.buildEntryFeatures); here we only coerce.
 function normalizeEntryFeatures(ef) {
+  // STRICT numeric coercion (anti-pattern #2). `Number.isFinite(Number(v))` FABRICATES
+  // 0 for null/''/false/[] because `Number(null)===0` is finite — turning an honest
+  // "data missing" into a fake flat measurement (the 42-record all-zeros defect). Only
+  // a real finite number (or non-empty numeric string) survives; everything else → null.
   const num = (v) => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
+    if (typeof v === "number") return Number.isFinite(v) ? v : null;
+    if (typeof v === "string" && v.trim() !== "") {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
   };
   const src = ef && typeof ef === "object" ? ef : {};
   return {

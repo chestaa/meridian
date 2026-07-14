@@ -897,7 +897,11 @@ export function directionGateRejectReason(candidate, s) {
  * @returns {object} entry_features payload
  */
 export function buildEntryFeatures(candidate, regime, capturedAt = Date.now()) {
-  const numOrNull = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  // STRICT numeric coercion (anti-pattern #2). The old `Number.isFinite(Number(v))`
+  // FABRICATED 0 for genuinely-missing fields (`Number(null)===0`), poisoning the
+  // direction-gate dataset with flat zeros instead of honest nulls. Reuse the module
+  // `strictNumeric`: only a real finite number / numeric string survives → else null.
+  const numOrNull = strictNumeric;
   const c = candidate || {};
   return {
     regime: regime?.regime ?? null,

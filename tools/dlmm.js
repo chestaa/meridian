@@ -663,9 +663,20 @@ export function buildEntryFeatures({
   sell_vol,
   mcap,
 } = {}) {
+  // STRICT numeric coercion (anti-pattern #2). The naive `Number.isFinite(Number(v))`
+  // pattern FABRICATES 0 for genuinely-missing inputs because `Number(null)===0`,
+  // `Number('')===0`, `Number(false)===0` are all finite. That is exactly how the
+  // 42-record entry_features dataset was poisoned with flat zeros. Mirror
+  // screening.js `strictNumeric` / classifyRegime discipline: only a real finite
+  // number (or a non-empty numeric string) survives — null/undefined/''/boolean/
+  // object → null (honest gap), NEVER 0.
   const num = (v) => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
+    if (typeof v === "number") return Number.isFinite(v) ? v : null;
+    if (typeof v === "string" && v.trim() !== "") {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
   };
   const buy = num(buy_vol);
   const sell = num(sell_vol);
