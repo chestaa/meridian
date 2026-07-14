@@ -114,6 +114,22 @@ function finiteOrNull(value) {
 }
 
 /**
+ * STRICT coercion (Vega 2026-07-14, [[vega-entry-features-null-not-zero]] discipline):
+ * unlike finiteOrNull, this does NOT fall into the `Number(null)===0` /
+ * `Number('')===0` trap — a genuinely-missing value stays null instead of being
+ * fabricated as a finite 0. Used by the two-sided realized-SOL accounting where a
+ * missing leg (null) MUST be distinguished from an empty-but-real leg (0): a null
+ * proceeds = STRANDED/unverifiable → honest null; a 0 proceeds = empty bag = valid.
+ */
+function strictFiniteOrNull(value) {
+  if (value == null) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  if (typeof value === "boolean") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
  * Compute realized SOL delta for a LIVE close.
  *
  * Two paths, in priority order:
@@ -316,6 +332,117 @@ export function computePaperRealizedSolDelta({
     method: "paper_sim",
     estimate: true,
     sol_deployed: deployed,
+  };
+}
+
+/**
+ * Compute realized SOL delta for a LIVE TWO-SIDED close (Vega 2026-07-14).
+ *
+ * A two-sided position holds a FULL token-X leg (a real bag, NOT the small
+ * base-FEE remainder a single-side close produces). At close the SDK withdraws
+ * both legs to the wallet; the token-X bag is then swapped → SOL. This function
+ * computes the HONEST wallet-to-wallet economic delta of the whole round trip.
+ *
+ * GROUND TRUTH (denominated in SOL, mirrors the single-side `received + fees −
+ * deployed − gas`, extended to two legs on each side):
+ *
+ *   solIn  = entryYLegSol + entryXLegSol        (total SOL OUT of wallet at entry)
+ *   solOut = yLegExitSol + tokenXSwapOutSol + feesClaimedSol   (total SOL back)
+ *   realized_sol_delta = solOut − solIn − closeGas
+ *
+ * WHY the entry-swap-cost AND close-swap-cost are NOT subtracted as separate
+ * terms (avoiding a DOUBLE-COUNT):
+ *   - `entryXLegSol` is the PRE-SWAP SOL BUDGET actually spent acquiring the
+ *     token-X leg (= notional.total − y_leg = SOL that left the wallet). The SOL
+ *     lost to ENTRY-swap slippage is therefore already inside solIn, and it
+ *     re-surfaces as a lower `tokenXSwapOutSol` at close — subtracting an entry
+ *     swap cost again would double-count it.
+ *   - `tokenXSwapOutSol` is the ACTUAL post-slippage SOL proceeds of the CLOSE
+ *     swap (task: "Token-X valued at ACTUAL swap-out proceeds, NOT a mark"), so
+ *     the close-swap cost is likewise already embedded.
+ *   `entrySwapCostSol` is accepted only as a DIAGNOSTIC field (reconciles with
+ *   Andromeda's live monitor drag, state.computeTwoSidedLivePnl) — reported,
+ *   never re-subtracted.
+ *
+ * FAIL-CLOSED (anti-pattern #2 — never fabricate, never mark):
+ *   - basis (entryYLegSol/entryXLegSol) missing/negative or solIn<=0 → null.
+ *   - yLegExitSol missing → null (two_sided_unverifiable_y_leg).
+ *   - tokenXSwapOutSol === null (swap failed / STRANDED bag) → null
+ *     (two_sided_unverifiable_x_leg). We NEVER value a stranded bag at a mark;
+ *     an un-liquidated leg is an honest gap, not a number.
+ *
+ * Pure. No I/O. The wallet read + swap that produce these actuals live in the
+ * caller (dlmm.js executeTwoSidedCloseSwapAndAccount).
+ *
+ * @returns {{ realized_sol_delta:number|null, realized_sol_delta_pct:number|null,
+ *             method:string, estimate:boolean, sol_deployed:number|null, ... }}
+ */
+export function computeTwoSidedRealizedSolDelta({
+  entryYLegSol,
+  entryXLegSol,
+  yLegExitSol,
+  tokenXSwapOutSol,
+  feesClaimedSol,
+  gasSpentSol,
+  entrySwapCostSol,
+} = {}) {
+  const yIn = strictFiniteOrNull(entryYLegSol);
+  const xIn = strictFiniteOrNull(entryXLegSol);
+  if (yIn == null || xIn == null || yIn < 0 || xIn < 0) {
+    return {
+      realized_sol_delta: null,
+      realized_sol_delta_pct: null,
+      method: "two_sided_unverifiable_basis",
+      estimate: true,
+      sol_deployed: null,
+      two_sided: true,
+    };
+  }
+  const solIn = yIn + xIn;
+  if (solIn <= 0) {
+    return {
+      realized_sol_delta: null,
+      realized_sol_delta_pct: null,
+      method: "two_sided_unverifiable_basis",
+      estimate: true,
+      sol_deployed: round8(solIn),
+      two_sided: true,
+    };
+  }
+
+  const yOut = strictFiniteOrNull(yLegExitSol);
+  // tokenXSwapOutSol === null means the close swap failed / the bag is STRANDED:
+  // an un-liquidated leg cannot be honestly valued → null (never a mark). A
+  // genuine 0 (no token-X bag — fully converted in-pool, already in yLegExitSol)
+  // is a VALID number and passes (strictFiniteOrNull keeps 0 as 0, null as null).
+  const xOut = strictFiniteOrNull(tokenXSwapOutSol);
+  if (yOut == null || xOut == null) {
+    return {
+      realized_sol_delta: null,
+      realized_sol_delta_pct: null,
+      method: yOut == null ? "two_sided_unverifiable_y_leg" : "two_sided_unverifiable_x_leg",
+      estimate: true,
+      sol_deployed: round8(solIn),
+      two_sided: true,
+    };
+  }
+
+  const fees = strictFiniteOrNull(feesClaimedSol) ?? 0;
+  const gas = strictFiniteOrNull(gasSpentSol) ?? DEFAULT_CLOSE_GAS_SOL;
+  const solOut = yOut + xOut + fees;
+  const delta = round8(solOut - solIn - gas);
+  return {
+    realized_sol_delta: delta,
+    realized_sol_delta_pct: round2((delta / solIn) * 100),
+    method: "two_sided_formula",
+    estimate: true,
+    sol_deployed: round8(solIn),
+    // diagnostics (embedded in the actuals above — reported, not re-subtracted)
+    y_leg_exit_sol: round8(yOut),
+    token_x_swap_out_sol: round8(xOut),
+    fees_claimed_sol: round8(fees),
+    entry_swap_cost_sol: strictFiniteOrNull(entrySwapCostSol),
+    two_sided: true,
   };
 }
 

@@ -25,7 +25,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { recordRealizedLoss } from "../account-circuit-breaker.js";
-import { computeLiveRealizedSolDelta, sumCloseGasSolFromFees } from "../realized-sol.js";
+import { computeLiveRealizedSolDelta, computeTwoSidedRealizedSolDelta, sumCloseGasSolFromFees } from "../realized-sol.js";
 import { getSigningWallet } from "../wallet-loader.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { isBluechipMintPair, isLstMintFreezeExempt } from "./screening.js";
@@ -54,7 +54,7 @@ export const MAX_LIVE_POSITION_SOL = 0.5;
 
 // Wrapped-SOL mint — the ONLY mint a single-side SOL deploy may deposit into.
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
-import { normalizeMint, resolveSwapMaxSlippageBps, swapToken } from "./wallet.js";
+import { getWalletBalances, normalizeMint, resolveSwapMaxSlippageBps, swapToken } from "./wallet.js";
 import {
   twoSidedGateDecision,
   computeTwoSidedNotionalSol,
@@ -174,9 +174,10 @@ const _testHooks = {
   sendAndConfirmTransaction: null,
   lookupPoolForPosition: null,
   // LIVE two-sided machinery (Vega — dead path until belts drop; mockable for tests)
-  swapToken: null, // SOL→token entry swap (wallet.swapToken)
+  swapToken: null, // SOL→token entry swap AND token-X→SOL close swap (wallet.swapToken)
   depositTwoSidedSdk: null, // performs the SDK two-sided liquidity deposit
   notifyStranded: null, // operator alert for a stranded token-X bag
+  getWalletBalances: null, // wallet balance read for the two-sided close-swap (post-withdraw token-X bag)
 };
 
 export function __setForTests(overrides = {}) {
@@ -1536,7 +1537,21 @@ export async function executeTwoSidedLiveDeposit(ctx = {}) {
       active_bin: activeBin.binId,
       initial_value_usd,
       entry_features: entryFeatures,
+      // Andromeda Track-C — LIVE two-sided leg geometry for the two-asset MTM.
+      // entry_price is the deploy SOL-per-token; notional is the capped two-leg
+      // exposure { y_leg_sol, x_leg_sol, total_notional_sol }. entry_swap_cost_sol
+      // is the SOL drag of the SOL→token-X entry swap: the SOL spent (x_leg_sol)
+      // minus the SOL-value of the tokens actually received at the pool price.
+      // Clamped to >= 0 (a favorable fill is not a negative cost). This drag is
+      // NOT in the on-chain deposit basis, so state.js subtracts it from the
+      // on-chain net → honest end-to-end two-asset PnL.
       two_sided: true,
+      entry_price: activePrice,
+      notional: capCheck.notional,
+      entry_swap_cost_sol: Math.max(
+        0,
+        Number(capCheck.notional?.x_leg_sol ?? 0) - Number(tokenXReceived) * Number(activePrice),
+      ),
     });
   }
   return {
@@ -1590,6 +1605,148 @@ async function _defaultStrandedNotify(message) {
   } catch {
     /* best-effort — logging above is the guaranteed record */
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Vega 🔥 — LIVE two-sided CLOSE swap + honest two-asset accounting (BUILT, DORMANT).
+//
+// The final money-path piece of the two-sided lifecycle. A single-side close's
+// post-close auto-swap only ever liquidated the small base-FEE remainder; a
+// TWO-SIDED close withdraws a FULL token-X leg (a real bag) that must be swapped
+// → SOL and accounted honestly. Andromeda flagged this gap.
+//
+// Called from closePosition's direct path ONLY when tracked.two_sided === true.
+// DORMANT: a live two-sided position cannot exist until the two-sided belts drop
+// (executor + dlmm deploy gate refuse every live amount_x>0), so this never runs
+// in production this phase. Single-side close never reaches it (branch-gated).
+//
+// SAFETY MODEL:
+//   - The WITHDRAWAL already completed on-chain upstream (removeLiquidity +
+//     close). This function NEVER blocks or gates that — it only liquidates the
+//     withdrawn token-X bag and books the economics.
+//   - Swap is slippage-capped (wallet.swapToken enforces the shipped 2%/5% guard).
+//   - If the swap FAILS or is SKIPPED by the slippage guard → STRANDED-SAFE:
+//     the position is already closed, the token-X bag sits in the wallet, an
+//     operator alert fires, there is NO auto-retry (anti-pattern #4 — a blind
+//     retry into a thin book just eats another bad fill), and the realized X-leg
+//     is booked as an HONEST NULL (never a mark, never fabricated — anti-pattern #2).
+//   - A genuinely EMPTY bag (token-X fully converted to SOL inside the pool and
+//     already returned as part of yLegExitSol) is NOT stranded → xOut = 0.
+//
+// All external effects (wallet read, swap, stranded alert) are injectable via
+// _testHooks so the whole orchestration is unit-testable with zero chain/RPC.
+//
+// @returns {{ tokenXBalance:number, tokenXSwapOutSol:number|null, stranded:boolean,
+//             alert:string|null, swapSucceeded:boolean, closeRsd:object|null,
+//             autoSwapNote:string|null, swap_tx:string|null }}
+export async function executeTwoSidedCloseSwapAndAccount(ctx = {}) {
+  const { tracked, baseMint, withdrawnSol, feesSol, measuredCloseGasSol } = ctx;
+  const ts = tracked?.two_sided_live || {};
+
+  const swapFn = _testHooks.swapToken || swapToken;
+  const balancesFn = _testHooks.getWalletBalances || getWalletBalances;
+  const notifyStrandedFn = _testHooks.notifyStranded || _defaultStrandedNotify;
+
+  let tokenXBalance = 0;
+  let tokenXSwapOutSol = null; // null = UNVERIFIABLE (stranded); 0 = no bag (fully in-pool converted)
+  let stranded = false;
+  let alert = null;
+  let swapSucceeded = false;
+  let autoSwapNote = null;
+  let swapTx = null;
+
+  // Read the ACTUAL token-X bag now sitting in the wallet post-withdraw. Fail-safe:
+  // a read error → treat as 0-bag (do NOT fabricate a swap); accounting will book
+  // the X leg as null (unverifiable) below if we truly cannot value it.
+  try {
+    const balances = await balancesFn({});
+    const token = (balances?.tokens || []).find((t) => t.mint === baseMint);
+    tokenXBalance = token && Number.isFinite(Number(token.balance)) ? Number(token.balance) : 0;
+  } catch (e) {
+    log("close_warn", `Two-sided close: wallet balance read failed: ${e.message}`);
+    tokenXBalance = 0;
+  }
+
+  if (tokenXBalance > 0) {
+    let swapRes;
+    try {
+      swapRes = await swapFn({ input_mint: baseMint, output_mint: "SOL", amount: tokenXBalance });
+    } catch (e) {
+      swapRes = { success: false, error: e.message };
+    }
+    if (swapRes?.success === true) {
+      swapSucceeded = true;
+      swapTx = swapRes.tx || null;
+      // swapToken returns amount_out in the OUTPUT mint's smallest unit; SOL out
+      // is lamports → convert to SOL. Fail-safe: unreadable → null (unverifiable),
+      // NEVER a fabricated proceeds figure.
+      const rawOut = Number(swapRes.amount_out);
+      tokenXSwapOutSol = Number.isFinite(rawOut) ? Number((rawOut / 1e9).toFixed(9)) : null;
+      autoSwapNote =
+        `Two-sided close: token-X bag (${tokenXBalance}) swapped → SOL. Do NOT call swap_token again.`;
+    } else {
+      // STRANDED-SAFE — position already closed on-chain; token-X remains in wallet.
+      stranded = true;
+      const skipped = swapRes?.skipped === true;
+      const detail = swapRes?.detail || swapRes?.error || swapRes?.reason || "unknown";
+      alert =
+        `STRANDED two-sided CLOSE: position closed on-chain, but the token-X → SOL swap ` +
+        `${skipped ? "was SKIPPED by the slippage guard" : "FAILED"} (${detail}). ${tokenXBalance} ` +
+        `token-X (${baseMint}) sits in the wallet. NO auto-retry — manual on-chain disposition ` +
+        `required. Realized SOL for the X leg is UNVERIFIABLE (booked honest null, never a mark).`;
+      await Promise.resolve(notifyStrandedFn(alert)).catch(() => {});
+      log("stranded_alert", alert);
+      autoSwapNote = alert;
+    }
+  } else {
+    // No token-X bag in the wallet: the token-X leg was fully converted to SOL
+    // inside the pool (OOR-up round trip) and already returned via yLegExitSol.
+    // Nothing to swap, nothing stranded, X-leg proceeds = 0 (a real number).
+    tokenXSwapOutSol = 0;
+    autoSwapNote = "Two-sided close: no token-X bag in wallet (fully converted in-pool). No swap needed.";
+  }
+
+  // Honest two-asset realized-SOL. entryXLegSol = total notional − Y leg = the
+  // pre-swap SOL budget that acquired the X leg (entry swap cost embedded). Token-X
+  // valued at ACTUAL swap-out proceeds. Fail-closed on any unverifiable leg.
+  // strictNum: null/undefined/'' → null (NOT the Number(null)===0 trap that would
+  // fabricate a 0 SOL basis and mis-book realized). Mirrors two-sided.js discipline.
+  const sNum = (v) => {
+    if (v == null) return null;
+    if (typeof v === "string" && v.trim() === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const entryYLegSol = sNum(ts.y_leg_sol);
+  const notionalSol = sNum(ts.notional_sol);
+  let entryXLegSol = null;
+  if (notionalSol != null && entryYLegSol != null) {
+    // Primary basis: total notional − Y leg = pre-swap SOL budget for the X leg.
+    entryXLegSol = notionalSol - entryYLegSol;
+  } else {
+    // Fallback basis: tokens × entry price (mark) + the entry-swap drag = SOL spent.
+    const xTok = sNum(ts.x_leg_tokens);
+    const px = sNum(ts.entry_price);
+    const swapCost = sNum(ts.entry_swap_cost_sol);
+    if (xTok != null && px != null && swapCost != null) {
+      entryXLegSol = xTok * px + swapCost;
+    }
+  }
+
+  const closeRsd =
+    config.internalAgents?.realizedSolAccounting !== false
+      ? computeTwoSidedRealizedSolDelta({
+          entryYLegSol,
+          entryXLegSol,
+          yLegExitSol: Number.isFinite(withdrawnSol) ? withdrawnSol : null,
+          tokenXSwapOutSol,
+          feesClaimedSol: Number.isFinite(feesSol) ? feesSol : null,
+          gasSpentSol: Number.isFinite(measuredCloseGasSol) ? measuredCloseGasSol : undefined,
+          entrySwapCostSol: ts.entry_swap_cost_sol ?? null,
+        })
+      : null;
+
+  return { tokenXBalance, tokenXSwapOutSol, stranded, alert, swapSucceeded, closeRsd, autoSwapNote, swap_tx: swapTx };
 }
 
 const POSITIONS_CACHE_TTL = 5 * 60_000; // 5 minutes
@@ -2706,7 +2863,29 @@ export async function closePosition({ position_address, reason }) {
       // FAIL-SAFE: measureCloseGasSol → null on any read failure → formula falls
       // back to the conservative flat estimate (never under-counts gas).
       const measuredCloseGasSol = await measureCloseGasSol(txHashes);
-      const closeRsd = config.internalAgents?.realizedSolAccounting !== false
+
+      // ── Vega 2026-07-14 — TWO-SIDED close: swap the full token-X bag → SOL +
+      // honest two-asset realized-SOL. DORMANT: fires ONLY for a LIVE two-sided
+      // position (tracked.two_sided===true), which cannot exist until the
+      // two-sided belts drop. Single-side (two_sided falsy) skips this entirely →
+      // the closeRsd computation below is BYTE-FOR-BYTE the original single-side
+      // expression (twoSidedCloseInfo stays null → the ternary's else branch runs
+      // verbatim). The withdrawal already completed on-chain; the swap-fail path is
+      // stranded-safe (bag + alert, no retry) and never blocks the close.
+      let twoSidedCloseInfo = null;
+      if (tracked.two_sided === true) {
+        twoSidedCloseInfo = await executeTwoSidedCloseSwapAndAccount({
+          tracked,
+          baseMint: pool.lbPair.tokenXMint.toString(),
+          withdrawnSol,
+          feesSol,
+          measuredCloseGasSol,
+        });
+      }
+
+      const closeRsd = twoSidedCloseInfo
+        ? twoSidedCloseInfo.closeRsd
+        : config.internalAgents?.realizedSolAccounting !== false
         ? computeLiveRealizedSolDelta({
             solDeployed: tracked.amount_sol ?? null,
             solReceivedOnClose: Number.isFinite(withdrawnSol) ? withdrawnSol : null,
@@ -2805,6 +2984,21 @@ export async function closePosition({ position_address, reason }) {
         ledger_realized_sol_delta_pct: closeRsd?.realized_sol_delta_pct ?? null,
         ledger_realized_sol_method: closeRsd?.method ?? null,
         ledger_realized_sol_estimate: closeRsd?.estimate ?? null,
+        // Vega 2026-07-14 — two-sided close flags (ADDITIVE; absent for single-side
+        // so the object is byte-for-byte unchanged when twoSidedCloseInfo is null).
+        // `two_sided:true` signals the executor to SKIP its single-side post-close
+        // auto-swap (dlmm already liquidated the token-X bag + booked accounting).
+        ...(twoSidedCloseInfo
+          ? {
+              two_sided: true,
+              auto_swapped: twoSidedCloseInfo.swapSucceeded,
+              auto_swap_note: twoSidedCloseInfo.autoSwapNote,
+              stranded: twoSidedCloseInfo.stranded || undefined,
+              token_x_stranded: twoSidedCloseInfo.stranded ? twoSidedCloseInfo.tokenXBalance : undefined,
+              token_x_swap_out_sol: twoSidedCloseInfo.tokenXSwapOutSol,
+              two_sided_swap_tx: twoSidedCloseInfo.swap_tx,
+            }
+          : {}),
       };
     }
 

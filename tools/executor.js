@@ -1187,8 +1187,13 @@ export async function executeTool(name, args) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
-        // Auto-swap base token back to SOL unless user said to hold
-        if (!args.skip_swap && result.base_mint) {
+        // Auto-swap base token back to SOL unless user said to hold.
+        // Vega 2026-07-14 — TWO-SIDED close SKIPS this single-side dust-swap:
+        // dlmm.closePosition already liquidated the FULL token-X bag → SOL and
+        // booked the honest two-asset realized-SOL (result.two_sided). Re-swapping
+        // here would double-swap / mis-account. Single-side (result.two_sided
+        // falsy) is byte-for-byte unchanged.
+        if (!args.skip_swap && result.base_mint && !result.two_sided) {
           try {
             const balances = await getWalletBalances({});
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
