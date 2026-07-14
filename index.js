@@ -987,6 +987,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
               entry_bot_pct: ti.audit?.bot_holders_pct ?? null,
               entry_bundle_pct: pool.bundle_pct ?? null,
               entry_sniper_pct: pool.sniper_pct ?? null,
+              // Andromeda Track-A — propagate Vega's two-sided paper record
+              // (null for single-side) so the trade takes the two-asset exit path.
+              two_sided: outcome.result.would_deploy.two_sided === true,
+              two_sided_paper: outcome.result.two_sided_paper ?? null,
             });
           }
           break;
@@ -1253,6 +1257,10 @@ ${andromedaOn ? terseReportSteps : legacyReportSteps}
                 entry_bot_pct: ti.audit?.bot_holders_pct ?? null,
                 entry_bundle_pct: pool.bundle_pct ?? null,
                 entry_sniper_pct: pool.sniper_pct ?? null,
+                // Andromeda Track-A — propagate Vega's two-sided paper record
+                // (null for single-side) so the trade takes the two-asset exit path.
+                two_sided: result.would_deploy.two_sided === true,
+                two_sided_paper: result.two_sided_paper ?? null,
               });
             }
           }

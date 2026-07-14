@@ -9,6 +9,7 @@ import { fetchSolscanTrending } from "./sources/solscan-trending.js";
 import { fetchPumpfunGraduated } from "./sources/pumpfun-graduated.js";
 import { fetchDiscordMeteoraIdnRanked } from "./sources/discord-meteoraidn.js";
 import { getTokenHolderCount } from "./token.js";
+import { resolveTwoSidedMode } from "./two-sided.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -301,7 +302,8 @@ export function scoreCandidate(pool, cfg) {
   const feeTvlBonus = feeTvlHighBonus(pool, cfg);
   const ageBonus = tokenAgeSweetSpotBonus(pool, cfg);
   return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100
-    + multiSourceBonus + symmetryBonus + feeTvlBonus + ageBonus;
+    + multiSourceBonus + symmetryBonus + feeTvlBonus + ageBonus
+    + twoSidedPaperRankBonus(pool);
 }
 
 /**
@@ -1138,6 +1140,132 @@ export function bluechipWsolQuoteRejectReason(pool) {
   // Deployable ONLY when wSOL is the QUOTE (tokenY) leg. wSOL-as-base (SOL-USDC) → reject.
   if (quote !== WSOL_MINT) return "bluechip_wsol_not_quote_side";
   return null;
+}
+
+// ─── Two-sided PAPER candidate lane (Cassiopeia — Track-A paper-soak) ─────────
+//
+// PURPOSE: surface LST-SOL / bluechip pools into Vega's flag-gated two-sided PAPER
+// path (twoSidedEnabled + DRY_RUN). Two-sided means the bot HOLDS the token-X (base)
+// leg — directional exposure — so a SYMMETRIC-payoff LST-SOL pair (token leg tracks
+// SOL) is the lowest-risk first paper candidate. REUSES the bluechip machinery
+// (BLUECHIP_INCOME_MINTS / isBluechipMintPair / bluechipWsolQuoteRejectReason) for
+// SURFACING (the LST-SOL inverted profile — low-vol, large-cap, deep-TVL — must skip
+// the memecoin mcap band + vol FLOOR that would wrongly reject it). But UNLIKE the
+// bluechip income lane it does NOT exempt the base-leg rug/mint/freeze/bot/top10
+// gates: you are HOLDING the token, so its safety matters MORE, not less
+// (twoSidedBaseLegGateReason enforces them on the base mint).
+//
+// ISOLATION GUARANTEE: every predicate here is gated on paperTwoSidedAllowed =
+// twoSidedEnabled(default FALSE) AND DRY_RUN==="true" (Vega's resolveTwoSidedMode —
+// single source of truth). So in LIVE (DRY_RUN!=="true") OR flag-off,
+// isTwoSidedPaperCandidate() is ALWAYS false → the live single-side funnel is
+// byte-for-byte unchanged.
+
+// LST-SOL symmetric-payoff BASE mints: the token leg is a SOL staking derivative that
+// tracks SOL price, so holding it in a two-sided position carries the LOWEST
+// directional risk (near-symmetric with the wSOL quote leg). These rank FIRST in the
+// paper lane — validate the mechanism on the least-directional pairs before anything
+// with real price divergence.
+const LST_SOL_BASE_MINTS = new Set([JITOSOL_MINT, MSOL_MINT, BSOL_MINT, JUPSOL_MINT]);
+
+/**
+ * Is the paper two-sided lane active? PURE. True only when the master flag is on AND
+ * we are in DRY_RUN. Reuses Vega's resolveTwoSidedMode so screening and the money-path
+ * never drift on the lane semantics. NEVER true in live.
+ */
+export function twoSidedPaperLaneActive(cfg, dryRunEnv) {
+  return resolveTwoSidedMode(cfg, dryRunEnv).paperTwoSidedAllowed === true;
+}
+
+/**
+ * Symmetric-payoff LST-SOL pair? PURE + unit-tested. quote leg = wSOL AND base leg =
+ * a SOL staking derivative (JitoSOL/mSOL/bSOL/jupSOL). Used to RANK the paper lane —
+ * these are the lowest-directional-risk first candidates. FAIL-SAFE: missing leg → false.
+ */
+export function isLstSolPair(baseMint, quoteMint) {
+  if (!baseMint || !quoteMint) return false;
+  return quoteMint === WSOL_MINT && LST_SOL_BASE_MINTS.has(baseMint);
+}
+
+/**
+ * Is THIS pool a two-sided PAPER candidate? PURE + unit-tested. True only when ALL of:
+ *   1. the paper lane is active (twoSidedEnabled + DRY_RUN) — else ALWAYS false, so the
+ *      live / flag-off single-side funnel is byte-for-byte untouched;
+ *   2. BOTH legs are curated bluechip income mints (rug-immune whitelist) — a pool with
+ *      a random memecoin leg is NOT eligible (holding it = uncapped directional downside);
+ *   3. wSOL is the QUOTE (tokenY) leg — the SOL seed side (reuses the Opsi-B
+ *      deployability guard; two-sided seeds SOL then holds the base leg).
+ * FAIL-CLOSED (anti-pattern #2): unknown legs → isBluechipMintPair false → not a
+ * candidate; wSOL not confirmed on the quote side → not a candidate.
+ */
+export function isTwoSidedPaperCandidate(pool, cfg, dryRunEnv) {
+  if (!twoSidedPaperLaneActive(cfg, dryRunEnv)) return false;
+  const { base, quote } = poolLegMints(pool);
+  if (!isBluechipMintPair(base, quote)) return false;
+  if (bluechipWsolQuoteRejectReason(pool) !== null) return false;
+  return true;
+}
+
+/**
+ * Two-sided base-leg SAFETY gate — the "safety matters MORE" enforcement. PURE +
+ * unit-tested + FAIL-CLOSED. Because a two-sided position HOLDS the token-X (base) leg,
+ * its rug/mint/freeze/bundler/top10 safety is enforced on the base mint EXACTLY as for
+ * a memecoin — NOT exempted like the bluechip income lane. Composes the SAME decision
+ * authorities the memecoin path uses (rugGateRejectReason / devSoldAllShouldReject) plus
+ * the bot/top10 concentration caps, so there is one source of truth per gate.
+ *
+ * Returns a reject reason string, or null if the base leg clears every ACTIVE safety
+ * gate. FAIL-CLOSED (anti-pattern #2): a configured gate with missing audit data →
+ * reject (*_data_unavailable / *_not_renounced), never default to safe.
+ *
+ * @param {object} pool - enriched condensed pool (expects pool.audit + pool.is_rugpull)
+ * @param {object} s - effective screening thresholds
+ * @returns {string|null}
+ */
+export function twoSidedBaseLegGateReason(pool, s) {
+  // rug / mint-authority / freeze-authority / liquidity-removal on the HELD base leg.
+  const rug = rugGateRejectReason(pool, s);
+  if (rug) return rug;
+  // dev_sold_all (compound / legacy per config) on the held base leg.
+  if (devSoldAllShouldReject(pool, s)) {
+    return s?.devSoldAllRequiresHighConcentration === false
+      ? "dev_sold_all"
+      : "dev_sold_all_high_concentration";
+  }
+  // bundler / bot-holder concentration cap.
+  const maxBot = numeric(s?.maxBotHoldersPct);
+  if (maxBot != null && maxBot > 0) {
+    const botPct = numeric(pool?.audit?.bot_holders_pct);
+    if (botPct == null) return "bot_holders_data_unavailable";
+    if (botPct > maxBot) return "bot_holders_pct_above_cap";
+  }
+  // top-10 supply concentration cap.
+  const maxTop10 = numeric(s?.maxTop10Pct);
+  if (maxTop10 != null && maxTop10 > 0) {
+    const top10 = numeric(pool?.audit?.top_holders_pct);
+    if (top10 == null) return "top10_data_unavailable";
+    if (top10 > maxTop10) return "top10_pct_above_cap";
+  }
+  return null;
+}
+
+/**
+ * Paper-lane PREFERENCE bonus — floats symmetric-payoff pairs to the front of the
+ * cost-slice pre-rank so they actually reach the judge (task point 3). PURE-ish (reads
+ * module config + DRY_RUN for the lane guard, like the other lane predicates here).
+ *
+ * ISOLATION: guarded on twoSidedPaperLaneActive → returns 0 in live / flag-off, so the
+ * scoreCandidate ranking on the LIVE path is byte-for-byte unchanged. When the paper
+ * lane is active, LST-SOL (lowest directional risk) ranks FIRST, other bluechip
+ * two-sided pairs SECOND, so the paper-soak validates the safest pairs before anything
+ * with real price divergence. NEVER a gate — a 0 bonus does not reject anything.
+ */
+export function twoSidedPaperRankBonus(pool) {
+  if (!twoSidedPaperLaneActive(config, process.env.DRY_RUN)) return 0;
+  const { base, quote } = poolLegMints(pool);
+  if (isLstSolPair(base, quote)) return 100000;        // symmetric LST-SOL — validate first
+  if (isBluechipMintPair(base, quote)) return 50000;   // other bluechip two-sided — second
+  return 0;
 }
 
 export function quoteOrganicGateRejectReason(pool, s) {
@@ -2193,6 +2321,15 @@ export async function discoverPools({
     // its OWN inverted gate (vol-CEILING not floor, no rug/mcap-band/vol-floor) and
     // SKIPS the memecoin gate entirely; a memecoin pool is untouched.
     const isBc = isBluechipPool(pool, s);
+    // Two-sided PAPER lane (Cassiopeia — Track-A). A two-sided paper candidate
+    // (LST-SOL / bluechip pair, paper lane active) takes the INVERTED bluechip gate
+    // for SURFACING — its low-vol / large-cap / deep-TVL profile would be wrongly
+    // rejected by the memecoin mcap band + vol FLOOR. Base-leg rug/mint/freeze/
+    // bot/top10 safety is NOT skipped here — it is enforced downstream on the held
+    // base leg (twoSidedBaseLegGateReason). paperTwoSidedAllowed is false in live /
+    // flag-off → isTsp false → this branch is inert and the gate routing below is
+    // byte-for-byte the original `isBc ? … : …`.
+    const isTsp = isTwoSidedPaperCandidate(pool, config, process.env.DRY_RUN);
     // Bluechip-ONLY mode (Cassiopeia — Item C, paper-soak validation). When
     // bluechipModeEnabled AND bluechipOnlyMode are BOTH on, the funnel deploys ONLY
     // bluechips: a non-bluechip (memecoin) pool is dropped HERE so the paper-soak data
@@ -2206,7 +2343,7 @@ export async function discoverPools({
       filteredExamples.push({ name: pool.name || pool.pool_address || "unknown pool", reason: "non_bluechip_filtered_bluechip_only_mode" });
       return false;
     }
-    const reason = isBc
+    const reason = (isBc || isTsp)
       ? bluechipPoolGateRejectReason(pool, s)
       : getRawPoolScreeningRejectReason(pool, s);
     if (!reason) return true;
@@ -2345,7 +2482,12 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       // Its OWN gate (bluechipPoolGateRejectReason) runs in the dedicated block below.
       // The non-mode-specific guards (open position / cooldown) STILL apply to both.
       const isBluechip = isBluechipPool(p, eff);
-      if (!isBluechip) {
+      // Two-sided PAPER candidate (Cassiopeia — Track-A) shares the bluechip INVERTED
+      // profile → skip the memecoin-specific numeric gates (8h age floor, memecoin
+      // minTvl/maxTvl, memecoin fee/TVL floor, the vol-FLOOR). Base-leg SAFETY is NOT
+      // skipped — it runs downstream (twoSidedBaseLegGateReason). Inert in live/flag-off.
+      const isTspE = isTwoSidedPaperCandidate(p, config, process.env.DRY_RUN);
+      if (!isBluechip && !isTspE) {
         const tokenAgeHours = Number(p.token_age_hours ?? 0);
         if (Number.isFinite(tokenAgeHours) && tokenAgeHours > 0 && tokenAgeHours < 8) {
           pushFilteredReason(filteredOut, p, `token age ${tokenAgeHours}h below live safety floor 8h`);
@@ -2423,6 +2565,12 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     cycleRegime = regimeResult;
     const beforeRegime = eligible.length;
     const kept = eligible.filter((p) => {
+      // Two-sided PAPER candidate exempt (Cassiopeia — Track-A): an LST-SOL two-sided
+      // position has a SYMMETRIC payoff (both legs track SOL, fees pay both ways) so it
+      // is fine in a downtrend — the pause targets ASYMMETRIC single-side-SOL memecoin
+      // narrow positions. Mirrors the bluechip exempt inside marketRegimeGateRejectReason.
+      // Inert in live/flag-off (isTsp false).
+      if (isTwoSidedPaperCandidate(p, config, process.env.DRY_RUN)) return true;
       const reason = marketRegimeGateRejectReason(p, regimeResult, eff);
       if (reason) {
         log("screening", `Market-regime gate: paused ${p.name} — ${reason} (${regimeResult.reasoning})`);
@@ -2477,6 +2625,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       // Flag OFF → isBluechipPool false → memecoin pools hit the strict quote filter
       // unchanged.
       if (isBluechipPool(p, eff)) return true;
+      // Two-sided PAPER candidate (Cassiopeia — Track-A) is deployability-verified by
+      // construction (isTwoSidedPaperCandidate requires wSOL===tokenY via
+      // bluechipWsolQuoteRejectReason), so defer to that guard. Inert in live/flag-off.
+      if (isTwoSidedPaperCandidate(p, config, process.env.DRY_RUN)) return true;
       const reason = solQuoteRejectReason(p, eff);
       if (reason) {
         log("screening", `Deployability: dropped ${p.name} — ${reason} (quote=${p.quote?.symbol || p.quote?.mint || "unknown"})`);
@@ -2812,6 +2964,31 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       });
       eligible.splice(0, eligible.length, ...kept);
       if (eligible.length < beforeDsa) log("screening", `dev_sold_all gate removed ${beforeDsa - eligible.length} pool(s)`);
+    }
+
+    // Two-sided PAPER lane — base-leg SAFETY enforcement (Cassiopeia — Track-A).
+    // A two-sided position HOLDS the token-X (base) leg, so its rug/mint/freeze/
+    // bundler/top10 safety matters MORE, not less. The generic base gates above
+    // already run on non-bluechip pools; this block GUARANTEES the same enforcement
+    // for every two-sided paper candidate in ALL configs — including the edge case
+    // where bluechipModeEnabled is ALSO on (which would otherwise EXEMPT the pool as a
+    // bluechip and skip rug/mint/freeze/bot/top10). Runs AFTER Jupiter-audit + OKX
+    // enrichment so p.audit / p.is_rugpull are populated. FAIL-CLOSED. INERT in
+    // live/flag-off (isTsp false) → the live single-side funnel is untouched.
+    {
+      const beforeTs = eligible.length;
+      const kept = eligible.filter((p) => {
+        if (!isTwoSidedPaperCandidate(p, config, process.env.DRY_RUN)) return true;
+        const reason = twoSidedBaseLegGateReason(p, eff);
+        if (reason) {
+          log("screening", `Two-sided base-leg gate: dropped ${p.name} — ${reason} (holding base leg → safety enforced)`);
+          pushFilteredReason(filteredOut, p, reason);
+          return false;
+        }
+        return true;
+      });
+      eligible.splice(0, eligible.length, ...kept);
+      if (eligible.length < beforeTs) log("screening", `Two-sided base-leg gate removed ${beforeTs - eligible.length} pool(s)`);
     }
 
     // Item 2 (yunus screen) — TVL/MC ratio gate. LIVE-ONLY (DRY_RUN=false).

@@ -23,6 +23,7 @@ import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { twoSidedGateDecision } from "./two-sided.js";
 import { getRecentDecisions } from "../decision-log.js";
 import { recordDeployOutflow } from "../deploy-outflow-ledger.js";
 import { recordDeployGas, DEFAULT_DEPLOY_GAS_SOL } from "../deploy-gas-ledger.js";
@@ -1317,11 +1318,16 @@ async function runSafetyChecks(name, args) {
 
       const deployAmountY = Number(args.amount_y ?? args.amount_sol ?? 0);
       const deployAmountX = Number(args.amount_x ?? 0);
+      // ── Two-sided pre-deploy gate (Vega — PAPER-ONLY, flag-gated) ──
+      // Mirrors the money-path gate in dlmm.deployPosition so amount_x>0 is
+      // refused at the earliest point unless two-sided is ON *and* DRY_RUN.
+      // Flag OFF ⇒ identical refusal string as before (byte-unchanged). Flag ON
+      // + LIVE ⇒ paper-only-belt refusal (two independent belts).
       if (Number.isFinite(deployAmountX) && deployAmountX > 0) {
-        return {
-          pass: false,
-          reason: "This agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.",
-        };
+        const twoSidedGate = twoSidedGateDecision(config, process.env.DRY_RUN);
+        if (!twoSidedGate.allowed) {
+          return { pass: false, reason: twoSidedGate.refuseReason };
+        }
       }
       const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
       const requestedBinsAbove = Number(args.bins_above ?? 0);

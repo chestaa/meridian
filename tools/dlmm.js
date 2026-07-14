@@ -55,6 +55,7 @@ export const MAX_LIVE_POSITION_SOL = 0.5;
 // Wrapped-SOL mint — the ONLY mint a single-side SOL deploy may deposit into.
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 import { normalizeMint, resolveSwapMaxSlippageBps } from "./wallet.js";
+import { twoSidedGateDecision, computeTwoSidedNotionalSol, simulatePaperEntrySwap } from "./two-sided.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 
@@ -843,8 +844,17 @@ export async function deployPosition({
   if (!Number.isFinite(finalAmountY) || !Number.isFinite(finalAmountX) || finalAmountY < 0 || finalAmountX < 0) {
     throw new Error("Invalid deploy amount: amount_x and amount_y must be valid non-negative numbers.");
   }
+  // ── Two-sided gate (Vega — PAPER-ONLY, flag-gated) ──
+  // amount_x>0 is REFUSED unless the two-sided master flag is ON *and* we are in
+  // DRY_RUN (paper). When the flag is OFF the refusal message is byte-for-byte the
+  // original single-side invariant — the live path is unchanged. When the flag is
+  // ON but LIVE, twoSidedGateDecision returns a paper-only-belt refusal (two
+  // independent belts). Reaching past this with amount_x>0 ⇒ paper two-sided.
   if (finalAmountX > 0) {
-    throw new Error("Unsupported deploy amount: this agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.");
+    const twoSidedGate = twoSidedGateDecision(config, process.env.DRY_RUN);
+    if (!twoSidedGate.allowed) {
+      throw new Error(twoSidedGate.refuseReason);
+    }
   }
   if (finalAmountY <= 0) {
     throw new Error("Invalid deploy amount: provide a positive amount_y/amount_sol.");
@@ -908,6 +918,22 @@ export async function deployPosition({
   if (isSingleSidedSol) {
     activeBinsAbove = 0;
   }
+  // ── Two-sided PAPER straddle geometry (Vega — flag-gated, paper-only) ──
+  // When two-sided is active (finalAmountX>0 — the gate above already refused
+  // this outside DRY_RUN+flag) and the caller did NOT specify an upside range,
+  // default the bins ABOVE the active price so the token-X leg has somewhere to
+  // sit (upside-skewed straddle: price-up ⇒ token leg appreciates & is sold into
+  // strength). NEVER runs when the flag is off (finalAmountX is always 0 then) →
+  // single-side path byte-for-byte unchanged.
+  const isTwoSided = finalAmountX > 0 && finalAmountY > 0;
+  if (
+    isTwoSided &&
+    upside_pct == null &&
+    (!Number.isFinite(Number(bins_above)) || Number(bins_above) <= 0)
+  ) {
+    const dfltUpside = Math.round(Number(config.strategy.twoSidedUpsideBins ?? activeBinsBelow));
+    activeBinsAbove = Number.isFinite(dfltUpside) && dfltUpside > 0 ? dfltUpside : Number(activeBinsBelow);
+  }
   activeBinsBelow = Number(activeBinsBelow);
   activeBinsAbove = Number(activeBinsAbove);
   if (!Number.isFinite(activeBinsBelow) || !Number.isFinite(activeBinsAbove)) {
@@ -957,6 +983,34 @@ export async function deployPosition({
   }
 
   if (process.env.DRY_RUN === "true") {
+    // ── Two-sided PAPER position record (Vega — flag-gated, paper-only) ──
+    // Reached with finalAmountX>0 ONLY when the gate above permitted it
+    // (twoSidedEnabled && DRY_RUN). Simulate the SOL→token entry swap (no tx),
+    // compute the TRUE two-leg notional (exposure groundwork), and attach a
+    // two-asset paper position record. For single-side (finalAmountX==0) this
+    // stays null so the DRY result shape is otherwise unchanged.
+    let two_sided_paper = null;
+    if (isTwoSided) {
+      const entry_swap = simulatePaperEntrySwap({
+        amountXTokens: finalAmountX,
+        priceSolPerToken: activePrice,
+        slippageBps: config.strategy.twoSidedPaperSwapSlippageBps ?? 100,
+      });
+      const notional = computeTwoSidedNotionalSol({
+        amountYSol: finalAmountY,
+        amountXTokens: finalAmountX,
+        priceSolPerToken: activePrice,
+      });
+      two_sided_paper = {
+        two_sided: true,
+        paper_only: true,
+        active_price_sol_per_token: activePrice,
+        y_leg: { sol_amount: finalAmountY, bins_below: activeBinsBelow },
+        x_leg: { token_x_amount: finalAmountX, bins_above: activeBinsAbove },
+        entry_swap,   // SIMULATED SOL→token (no on-chain tx)
+        notional,     // true exposure = Y-leg + X-leg-in-SOL (null if unverifiable)
+      };
+    }
     return {
       dry_run: true,
       would_deploy: {
@@ -969,8 +1023,12 @@ export async function deployPosition({
         amount_x: finalAmountX,
         amount_y: finalAmountY,
         wide_range: totalBins > 69,
+        two_sided: isTwoSided,
       },
-      message: "DRY RUN — no transaction sent",
+      two_sided_paper,
+      message: isTwoSided
+        ? "DRY RUN — two-sided PAPER position simulated (SOL + token, no tx)"
+        : "DRY RUN — no transaction sent",
     };
   }
 

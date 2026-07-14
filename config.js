@@ -658,6 +658,31 @@ export const config = {
     // complaint. Tiers (realized SOL): NOISE < 0.005, MARGINAL 0.005-0.02,
     // REAL >= 0.02, MEANINGFUL >= 0.05. Reloadable. ~$0.75 at 150 SOL/USD.
     minMeaningfulProfitSol: u.minMeaningfulProfitSol ?? 0.005,
+    // ─── Andromeda Track-A — TWO-SIDED paper exit thresholds (PAPER-ONLY) ──
+    // These govern the exit of a TWO-SIDED paper position (a trade carrying
+    // two_sided===true, only created when strategy.twoSidedEnabled && DRY_RUN).
+    // A two-sided position FLIPS the payoff: the token-X leg sits in the UPPER
+    // bins and APPRECIATES on a price-up (the upside single-side can't capture),
+    // while a price-DOWN bleeds BOTH legs. So the exit logic is INVERTED vs
+    // single-side:
+    //   - UPSIDE CAPTURE: as price climbs (token-X leg working), BANK it — a
+    //     profit target (twoSidedUpsideCaptureTargetPct) OR an OOR-UP-in-profit
+    //     capture (the token leg has been sold into strength across the upper
+    //     range). This is the OPPOSITE of single-side fast-OOR-up, which harvested
+    //     IDLE SOL; here the upper bins hold an appreciating TOKEN — let it run
+    //     then bank. This is where the $1-2/trade comes from.
+    //   - DOWN-CUT: a price-DOWN OOR bleeds both legs → cut like a single-side SL
+    //     (net two-asset PnL <= twoSidedDownCutPct, OR OOR-DOWN sustained past
+    //     twoSidedOorDownCutMinutes).
+    // Single-side trades (two_sided !== true) NEVER enter this path — their exit
+    // logic is byte-for-byte unchanged. FAIL-SAFE: an uncomputable two-asset PnL
+    // (missing legs / implausible price ratio) → NO exit that cycle (hold, never
+    // fabricate). All PAPER-scoped: the two-sided deploy path is DRY_RUN-only.
+    twoSidedUpsideCaptureTargetPct: u.twoSidedUpsideCaptureTargetPct ?? 8,   // net two-asset PnL% that banks the token-X leg
+    twoSidedUpsideCaptureOorMinutes: u.twoSidedUpsideCaptureOorMinutes ?? 0, // OOR-UP-in-profit minutes before capture (0 = immediate)
+    twoSidedDownCutPct:             u.twoSidedDownCutPct             ?? -8,  // net two-asset PnL% floor → cut (both legs bleeding)
+    twoSidedOorDownCutMinutes:      u.twoSidedOorDownCutMinutes      ?? 8,   // OOR-DOWN minutes before cut
+    twoSidedOorBandPct:             u.twoSidedOorBandPct             ?? 25,  // price-vs-entry band (%) that defines OOR-UP/DOWN direction
   },
 
   // ─── DAMM v2 Idle-Reserve Parking (item 8, BRAND NEW — flag OFF) ──
@@ -725,6 +750,28 @@ export const config = {
     fastBidAskBonusEnabled:  u.fastBidAskBonusEnabled  ?? false,
     fastBidAskMaxAgeHours:   u.fastBidAskMaxAgeHours   ?? 24,
     fastBidAskMinVolatility: u.fastBidAskMinVolatility ?? 3,
+    // ── Two-sided LP path (Vega — PAPER-ONLY foundation, Track-A) ──
+    // Enables two-sided (SOL + token) deposits that capture UPSIDE (the token
+    // leg appreciates on price-up) via an upside-skewed/straddle range. This is
+    // the foundation for the $1-2/trade instrument — built SAFE, GATED, PAPER-ONLY.
+    //
+    //   twoSidedEnabled   (default FALSE) — master flag. OFF ⇒ single-side SOL
+    //     path is BYTE-FOR-BYTE unchanged (amount_x>0 refused with the original
+    //     message; no upside bins; no swap sim). Bro Dikta flips ON only for a
+    //     DRY_RUN paper-soak.
+    //   twoSidedPaperOnly (default TRUE)  — HARD safety belt. Even with
+    //     twoSidedEnabled ON, a LIVE (DRY_RUN=false) two-sided deploy is REFUSED
+    //     unless this is EXPLICITLY false. We do NOT set it false this phase, so
+    //     live two-sided is unconditionally refused (two independent belts).
+    //   twoSidedUpsideBins — default bins ABOVE the active price that hold the
+    //     token-X leg when the caller doesn't specify bins_above/upside_pct
+    //     (paper straddle geometry). Falls back to bins_below when unusable.
+    //   twoSidedPaperSwapSlippageBps — estimated swap cost (bps) applied to the
+    //     SIMULATED SOL→token entry swap in the paper path (reporting only).
+    twoSidedEnabled:              u.twoSidedEnabled              ?? false,
+    twoSidedPaperOnly:            u.twoSidedPaperOnly            ?? true,
+    twoSidedUpsideBins:           numericConfig(u.twoSidedUpsideBins) ?? 35,
+    twoSidedPaperSwapSlippageBps: numericConfig(u.twoSidedPaperSwapSlippageBps) ?? 100,
   },
 
   // ─── Scheduling ─────────────────────────

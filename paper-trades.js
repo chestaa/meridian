@@ -140,6 +140,172 @@ function hoursOpen(trade) {
   return (Date.now() - opened) / 3_600_000;
 }
 
+// ─── Andromeda Track-A — TWO-SIDED (two-asset) paper mark-to-market ──────────
+// A two-sided paper position holds a SOL-Y leg (nominal SOL, lower bins) AND a
+// token-X leg (appreciating asset, upper bins). Net PnL is the two-asset sum:
+//
+//   entry_basis = y_leg_sol + (token_x * entry_price) + entry_swap_cost
+//   current_val = y_leg_sol + (token_x * current_price) + fees_earned
+//   pnl_pct     = (current_val − entry_basis) / entry_basis * 100
+//
+// KEY PROPERTY (the whole point of two-sided): price UP → token_x*current_price
+// grows → POSITIVE PnL (upside capture the single-side SOL leg can't touch);
+// price DOWN → token leg bleeds → NEGATIVE PnL (both-legs-bleed → down-cut).
+//
+// MODEL HONESTY: the SOL-Y leg is marked NOMINAL (its SOL value is constant in
+// paper). Real DLMM bin mechanics convert the SOL-Y leg INTO the depreciating
+// token as price falls through the lower bins (a further drag) — that live-path
+// conversion is NOT modeled here; it is flagged for Vega's live two-asset path.
+// The down-cut still fires because the token-X leg bleed alone drags net PnL
+// negative and the OOR-DOWN direction triggers the cut.
+//
+// FAIL-CLOSED (anti-pattern #2): any missing/non-finite/negative leg field, a
+// non-positive basis, or an implausible price ratio (unit-mismatch guard, reuses
+// the single-side PROXY_SANE band) → { pnl_pct:null, uncomputable:true }. Never
+// fabricates a 0% (which would look like a flat, exit-worthy position).
+export function computeTwoSidedPaperPnl(trade, currentPrice) {
+  const ts = trade?.two_sided_paper || {};
+  const entryPx = num(trade?.entry_price ?? ts.active_price_sol_per_token);
+  const curPx = num(currentPrice);
+  const tokenX = num(ts.x_leg?.token_x_amount);
+  const yLegSol = num(ts.y_leg?.sol_amount);
+  const swapCost = num(ts.entry_swap?.est_swap_cost_sol) ?? 0;
+  const fees = num(trade?.fees_claimed_sol) ?? 0;
+  if (
+    entryPx == null || entryPx <= 0 ||
+    curPx == null || curPx <= 0 ||
+    tokenX == null || tokenX < 0 ||
+    yLegSol == null || yLegSol < 0
+  ) {
+    return { pnl_pct: null, uncomputable: true, reason: "missing_two_sided_fields" };
+  }
+  const ratio = curPx / entryPx;
+  if (ratio > PROXY_SANE_RATIO_MAX || ratio < PROXY_SANE_RATIO_MIN) {
+    return {
+      pnl_pct: null,
+      uncomputable: true,
+      reason: `implausible_price_ratio ${ratio.toFixed(2)} (entry=${entryPx}, current=${curPx}) — likely unit mismatch/stale`,
+    };
+  }
+  const xLegEntrySol = tokenX * entryPx;
+  const xLegNowSol = tokenX * curPx;
+  const entryBasis = yLegSol + xLegEntrySol + (swapCost >= 0 ? swapCost : 0);
+  if (!(entryBasis > 0)) {
+    return { pnl_pct: null, uncomputable: true, reason: "nonpositive_basis" };
+  }
+  const currentValue = yLegSol + xLegNowSol + fees;
+  const pnlSol = currentValue - entryBasis;
+  return {
+    pnl_pct: Number(((pnlSol / entryBasis) * 100).toFixed(2)),
+    pnl_sol: Number(pnlSol.toFixed(9)),
+    x_leg_entry_sol: Number(xLegEntrySol.toFixed(9)),
+    x_leg_now_sol: Number(xLegNowSol.toFixed(9)),
+    y_leg_sol: yLegSol,
+    entry_basis_sol: Number(entryBasis.toFixed(9)),
+    fees_sol: fees,
+    uncomputable: false,
+    reason: null,
+  };
+}
+
+// ─── Andromeda Track-A — TWO-SIDED paper exit evaluator ─────────────────────
+// Runs ONLY for two-sided trades (dispatched from evaluatePaperExit). Distinct
+// from the single-side evaluator because the payoff is INVERTED (see above).
+// Returns { action, reason, pnl_pct } or null. Two distinct close reasons feed
+// separate EV audit (Lyra): two_sided_upside_capture, two_sided_down_cut.
+//
+// Precedence: DOWN-CUT first (safety — a bleeding position cannot dodge the cut
+// via an upside target it will never reach), then UPSIDE-CAPTURE.
+export function evaluateTwoSidedPaperExit(trade, snapshot, mgmtConfigOverride = null) {
+  if (!trade || trade.status !== "open" || !snapshot) return null;
+  if (trade.two_sided !== true) return null; // guard — two-sided trades only
+  const mgmt = mgmtConfigOverride || config.management || {};
+
+  const currentPrice = Number(snapshot.price);
+  const pnl = computeTwoSidedPaperPnl(trade, currentPrice);
+  // FAIL-SAFE: uncomputable two-asset PnL → no exit this cycle (hold; identical
+  // to a missing-price single-side cycle — never fabricate a decision).
+  if (pnl.uncomputable || !Number.isFinite(pnl.pnl_pct)) return null;
+  const pnlPct = pnl.pnl_pct;
+
+  // Track peak (two-asset) for forensics / future trailing.
+  if (trade.peak_pnl_pct == null || pnlPct > trade.peak_pnl_pct) trade.peak_pnl_pct = pnlPct;
+
+  // Direction proxy: price vs entry. UP = token-X leg appreciating (upper bins
+  // working); DOWN = both legs bleeding. No live active_bin in paper, so the
+  // signed price deviation IS the direction (mirrors the single-side proxy).
+  const entry = Number(trade.entry_price);
+  const band = Number(mgmt.twoSidedOorBandPct ?? 25);
+  let signedDevPct = null;
+  if (Number.isFinite(entry) && entry > 0 && Number.isFinite(currentPrice) && currentPrice > 0) {
+    signedDevPct = ((currentPrice - entry) / entry) * 100;
+  }
+  const oorUp = signedDevPct != null && Number.isFinite(band) && signedDevPct > band;
+  const oorDown = signedDevPct != null && Number.isFinite(band) && signedDevPct < -band;
+
+  // OOR timer bookkeeping (shared out_of_range_since field).
+  if (oorUp || oorDown) {
+    if (!trade.out_of_range_since) trade.out_of_range_since = new Date().toISOString();
+  } else {
+    trade.out_of_range_since = null;
+  }
+  const minutesOOR = trade.out_of_range_since
+    ? Math.floor((Date.now() - new Date(trade.out_of_range_since).getTime()) / 60000)
+    : 0;
+
+  // ── DOWN-CUT (both legs bleeding) — HIGHEST PRECEDENCE ──────────────────────
+  //   (a) net two-asset PnL <= twoSidedDownCutPct (hard floor / SL-equivalent), OR
+  //   (b) OOR-DOWN sustained >= twoSidedOorDownCutMinutes (price left the range to
+  //       the downside → token-X leg underwater AND SOL-Y leg converting into a
+  //       depreciating token → cut fast, like a single-side OOR-DOWN).
+  const downCutPct = Number(mgmt.twoSidedDownCutPct ?? mgmt.stopLossPct ?? -8);
+  if (Number.isFinite(downCutPct) && pnlPct <= downCutPct) {
+    return {
+      action: "TWO_SIDED_DOWN_CUT",
+      pnl_pct: pnlPct,
+      reason: `two_sided_down_cut: net two-asset PnL ${pnlPct.toFixed(2)}% <= ${downCutPct}% — both legs bleeding, cutting`,
+    };
+  }
+  if (oorDown) {
+    const downMin = Number(mgmt.twoSidedOorDownCutMinutes ?? 8);
+    if (Number.isFinite(downMin) && minutesOOR >= downMin) {
+      return {
+        action: "TWO_SIDED_DOWN_CUT",
+        pnl_pct: pnlPct,
+        reason: `two_sided_down_cut: OOR-DOWN ${minutesOOR}m >= ${downMin}m (dev ${signedDevPct.toFixed(1)}%) — price below range, both legs bleeding`,
+      };
+    }
+  }
+
+  // ── UPSIDE CAPTURE (token-X leg worked — bank it) ───────────────────────────
+  // OPPOSITE of single-side fast-OOR-up (idle SOL). The upper bins hold the TOKEN;
+  // as price climbs it appreciates, then is sold into strength across the range.
+  //   (a) net PnL >= twoSidedUpsideCaptureTargetPct → let-it-run target hit, bank.
+  //   (b) OOR-UP in profit sustained >= twoSidedUpsideCaptureOorMinutes → the token
+  //       leg has been converted toward SOL out the top of the range → capture the
+  //       realized upside (do NOT park it like single-side idle SOL).
+  const targetPct = Number(mgmt.twoSidedUpsideCaptureTargetPct ?? 8);
+  if (Number.isFinite(targetPct) && pnlPct >= targetPct) {
+    return {
+      action: "TWO_SIDED_UPSIDE_CAPTURE",
+      pnl_pct: pnlPct,
+      reason: `two_sided_upside_capture: net two-asset PnL ${pnlPct.toFixed(2)}% >= target ${targetPct}% — token-X leg appreciated, banking upside`,
+    };
+  }
+  if (oorUp && pnlPct > 0) {
+    const upMin = Number(mgmt.twoSidedUpsideCaptureOorMinutes ?? 0);
+    if (Number.isFinite(upMin) && minutesOOR >= upMin) {
+      return {
+        action: "TWO_SIDED_UPSIDE_CAPTURE",
+        pnl_pct: pnlPct,
+        reason: `two_sided_upside_capture: OOR-UP ${minutesOOR}m >= ${upMin}m in profit (${pnlPct.toFixed(2)}%, dev ${signedDevPct.toFixed(1)}%) — token-X leg worked into upper range, banking`,
+      };
+    }
+  }
+
+  return null;
+}
+
 function maybeEscalateCooldown(trade) {
   const currentPnl = trade.latest_snapshot?.price_proxy_pnl_pct;
   if (!Number.isFinite(currentPnl)) return false;
@@ -221,7 +387,18 @@ export function recordPaperDeploy(entry) {
     // trade open) instead of closing — mirroring the live re-center keeping fee
     // exposure. Once the cap is hit, OOR closes as today. Default flag OFF.
     rebalance_count: 0,
-    notes: ["price_proxy_only"],
+    // Andromeda Track-A — TWO-SIDED paper position (Vega two_sided_paper record).
+    // two_sided flags the trade for the INVERTED two-asset exit path
+    // (evaluateTwoSidedPaperExit). two_sided_paper carries the leg geometry the
+    // mark-to-market needs: x_leg.token_x_amount (appreciating token leg),
+    // y_leg.sol_amount (nominal SOL leg), entry_swap.est_swap_cost_sol (sim entry
+    // drag), active_price_sol_per_token (deploy price). For single-side deploys
+    // both stay falsy/null → the trade takes the UNCHANGED single-side exit path.
+    two_sided: entry.two_sided === true || entry.two_sided_paper?.two_sided === true,
+    two_sided_paper: entry.two_sided_paper || null,
+    notes: entry.two_sided === true || entry.two_sided_paper?.two_sided === true
+      ? ["price_proxy_only", "two_sided_paper"]
+      : ["price_proxy_only"],
   };
   data.trades.push(trade);
   data.trades = data.trades.slice(-MAX_TRADES);
@@ -277,6 +454,15 @@ async function buildSnapshot(trade) {
 // Returns { action, reason } or null.
 export function evaluatePaperExit(trade, snapshot, mgmtConfigOverride = null) {
   if (!trade || trade.status !== "open" || !snapshot) return null;
+  // Andromeda Track-A — TWO-SIDED trades take the INVERTED two-asset exit path.
+  // A two-sided position's token-X leg APPRECIATES on price-up (upside capture)
+  // and BOTH legs bleed on price-down (down-cut) — the OPPOSITE of single-side
+  // fast-OOR-up (idle SOL) — so it CANNOT reuse the single-side logic below.
+  // Single-side trades (two_sided !== true) skip this branch entirely and hit
+  // the UNCHANGED single-side path — byte-for-byte, no behavioral drift.
+  if (trade.two_sided === true) {
+    return evaluateTwoSidedPaperExit(trade, snapshot, mgmtConfigOverride);
+  }
   const mgmt = mgmtConfigOverride || config.management || {};
 
   // Andromeda X2 + Vega EXIT-3 #3 — Max-hold-time forced exit (HIGHEST PRECEDENCE).
@@ -707,8 +893,22 @@ export async function closePaperTrade(trade, exit, snapshot) {
   trade.closed_at = new Date().toISOString();
   trade.close_reason = exit.reason;
   trade.close_action = exit.action;
-  trade.final_pnl_pct = snapshot?.price_proxy_pnl_pct ?? null;
-  trade.final_fee_inclusive_pnl_pct = snapshot?.fee_inclusive_pnl_pct ?? null;
+  // Andromeda Track-A — a two-sided trade's economic outcome is the TWO-ASSET
+  // PnL (SOL-Y leg + token-X leg + fees − entry swap), NOT the single-asset
+  // price proxy. Prefer the exit's carried two-asset pnl_pct; else recompute from
+  // the snapshot price; fall back to the price proxy only if uncomputable.
+  if (trade.two_sided === true) {
+    const twoAsset =
+      Number.isFinite(Number(exit?.pnl_pct))
+        ? Number(exit.pnl_pct)
+        : computeTwoSidedPaperPnl(trade, snapshot?.price).pnl_pct;
+    trade.final_pnl_pct = twoAsset ?? snapshot?.price_proxy_pnl_pct ?? null;
+    trade.final_fee_inclusive_pnl_pct = trade.final_pnl_pct; // two-asset PnL already includes fees
+    trade.final_two_sided_pnl_pct = twoAsset ?? null;
+  } else {
+    trade.final_pnl_pct = snapshot?.price_proxy_pnl_pct ?? null;
+    trade.final_fee_inclusive_pnl_pct = snapshot?.fee_inclusive_pnl_pct ?? null;
+  }
   trade.notes = Array.isArray(trade.notes) ? trade.notes : [];
   trade.notes.push(`paper_close: ${exit.action} — ${exit.reason}`);
   const opened = Date.parse(trade.opened_at);
