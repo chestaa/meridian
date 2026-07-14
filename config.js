@@ -772,6 +772,22 @@ export const config = {
     twoSidedPaperOnly:            u.twoSidedPaperOnly            ?? true,
     twoSidedUpsideBins:           numericConfig(u.twoSidedUpsideBins) ?? 35,
     twoSidedPaperSwapSlippageBps: numericConfig(u.twoSidedPaperSwapSlippageBps) ?? 100,
+    // ── LIVE two-sided machinery (Vega — BUILT, NOT ENABLED) ──
+    //   twoSidedLiveAuthorized (default FALSE) — belt 4, the INNERMOST "explicit
+    //     final go" gate. Even with twoSidedPaperOnly lowered to false, a LIVE
+    //     two-sided deposit is refused unless this is ALSO explicitly true. We set
+    //     NEITHER this phase → live two-sided is unconditionally refused. This flag
+    //     flips ONLY on Bro's explicit go AFTER Andromeda live monitoring + burner
+    //     setup are confirmed. Do NOT set true.
+    //   twoSidedNotionalCapSol (default 0.10) — config tunable for the TOTAL
+    //     two-sided notional (Y-leg + X-leg-in-SOL). Bounded by the code-pinned
+    //     MAX_TWO_SIDED_NOTIONAL_SOL ceiling: it can TIGHTEN below 0.10 but can
+    //     NEVER exceed it (anti-pattern #7).
+    //   twoSidedXSharePct (default 0.5) — fraction of the total notional routed to
+    //     the token-X leg via the entry swap (the rest stays as the SOL Y leg).
+    twoSidedLiveAuthorized:       u.twoSidedLiveAuthorized       ?? false,
+    twoSidedNotionalCapSol:       numericConfig(u.twoSidedNotionalCapSol) ?? 0.1,
+    twoSidedXSharePct:            numericConfig(u.twoSidedXSharePct) ?? 0.5,
   },
 
   // ─── Scheduling ─────────────────────────

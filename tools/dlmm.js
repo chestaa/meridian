@@ -28,7 +28,7 @@ import { recordRealizedLoss } from "../account-circuit-breaker.js";
 import { computeLiveRealizedSolDelta, sumCloseGasSolFromFees } from "../realized-sol.js";
 import { getSigningWallet } from "../wallet-loader.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { isBluechipMintPair } from "./screening.js";
+import { isBluechipMintPair, isLstMintFreezeExempt } from "./screening.js";
 
 // ── Bluechip income-engine hard-locked belt (Vega — Opsi B) ──
 // Hardcoded ceiling on per-position bluechip SOL, INDEPENDENT of memecoin
@@ -54,8 +54,17 @@ export const MAX_LIVE_POSITION_SOL = 0.5;
 
 // Wrapped-SOL mint — the ONLY mint a single-side SOL deploy may deposit into.
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
-import { normalizeMint, resolveSwapMaxSlippageBps } from "./wallet.js";
-import { twoSidedGateDecision, computeTwoSidedNotionalSol, simulatePaperEntrySwap } from "./two-sided.js";
+import { normalizeMint, resolveSwapMaxSlippageBps, swapToken } from "./wallet.js";
+import {
+  twoSidedGateDecision,
+  computeTwoSidedNotionalSol,
+  simulatePaperEntrySwap,
+  liveTwoSidedFullyAuthorized,
+  resolveTwoSidedNotionalCapSol,
+  assertTwoSidedNotionalCap,
+  assertTwoSidedChainLegs,
+  detectStrandedAsset,
+} from "./two-sided.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 
@@ -164,6 +173,10 @@ const _testHooks = {
   getMyPositions: null,
   sendAndConfirmTransaction: null,
   lookupPoolForPosition: null,
+  // LIVE two-sided machinery (Vega — dead path until belts drop; mockable for tests)
+  swapToken: null, // SOL→token entry swap (wallet.swapToken)
+  depositTwoSidedSdk: null, // performs the SDK two-sided liquidity deposit
+  notifyStranded: null, // operator alert for a stranded token-X bag
 };
 
 export function __setForTests(overrides = {}) {
@@ -1032,6 +1045,39 @@ export async function deployPosition({
     };
   }
 
+  // ── LIVE two-sided deposit branch (Vega — BUILT, NOT ENABLED) ──
+  // Reached ONLY when finalAmountX>0 in LIVE. The outer twoSidedGateDecision belt
+  // (above, line ~854) ALREADY throws for every finalAmountX>0 in live this phase,
+  // so this branch is UNREACHABLE in production until the paperOnly belt is lowered.
+  // Even then, the INNER liveTwoSidedFullyAuthorized belt (belt 4, default false)
+  // refuses inside executeTwoSidedLiveDeposit. Single-side (finalAmountX==0 →
+  // isTwoSided false) NEVER enters here → the single-side live path below is
+  // byte-for-byte unchanged.
+  if (isTwoSided) {
+    return await executeTwoSidedLiveDeposit({
+      pool,
+      pool_address,
+      pool_name,
+      baseMint,
+      quoteMint,
+      activeBin,
+      activePrice,
+      actualBinStep,
+      activeStrategy,
+      strategyType,
+      finalAmountX,
+      finalAmountY,
+      activeBinsBelow,
+      activeBinsAbove,
+      bin_step,
+      normalizedVolatility,
+      fee_tvl_ratio,
+      organic_score,
+      initial_value_usd,
+      entryFeatures,
+    });
+  }
+
   const isWideRange = totalBins > 69;
   const minBinId = activeBin.binId - activeBinsBelow;
   const maxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
@@ -1327,6 +1373,222 @@ export async function deployPosition({
   } catch (error) {
     log("deploy_error", error.message);
     return { success: false, error: error.message };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LIVE two-sided deposit orchestration (Vega 🔥 — BUILT, NOT ENABLED).
+//
+// This is the machinery the LIVE two-sided path will use once Bro gives the
+// explicit final go. It is UNREACHABLE in production this phase (outer gate refuses
+// every live amount_x>0; inner liveTwoSidedFullyAuthorized belt defaults false).
+// All external effects (swap, deposit, stranded alert) are injectable via _testHooks
+// so the full flow is unit-testable without touching chain/network.
+// ─────────────────────────────────────────────────────────────────────────────
+export async function executeTwoSidedLiveDeposit(ctx = {}) {
+  const {
+    pool,
+    pool_address,
+    pool_name,
+    baseMint,
+    quoteMint,
+    activeBin,
+    activePrice,
+    actualBinStep,
+    activeStrategy,
+    strategyType,
+    finalAmountX,
+    finalAmountY,
+    activeBinsBelow,
+    activeBinsAbove,
+    bin_step,
+    normalizedVolatility,
+    fee_tvl_ratio,
+    organic_score,
+    initial_value_usd,
+    entryFeatures,
+  } = ctx;
+
+  // ── Belt 4 — innermost explicit-authorization gate (default OFF) ──
+  // Additional to (never replaces) the outer twoSidedGateDecision belts. Requires
+  // twoSidedEnabled && LIVE && paperOnly===false && twoSidedLiveAuthorized===true.
+  if (!liveTwoSidedFullyAuthorized(config, process.env.DRY_RUN)) {
+    throw new Error(
+      "Two-sided LIVE deposit REFUSED: not fully authorized (belt 4). Requires " +
+        "twoSidedPaperOnly=false AND twoSidedLiveAuthorized=true AND Bro's explicit go.",
+    );
+  }
+
+  // ── Chain-leg assertion (authoritative on-chain mints) — fail-closed ──
+  // tokenY (quote) MUST be wSOL AND tokenX (base) MUST be a curated LST. Reads the
+  // live pool mints so a mislabelled candidate cannot fool it.
+  const legCheck = assertTwoSidedChainLegs({
+    quoteMint,
+    baseMint,
+    wsolMint: WSOL_MINT,
+    isBaseAllowed: isLstMintFreezeExempt,
+  });
+  if (!legCheck.ok) {
+    throw new Error(`Two-sided LIVE deposit REFUSED (chain legs): ${legCheck.reason}`);
+  }
+
+  // ── Total-notional HARD cap — binds BEFORE any real swap/deposit, fail-closed ──
+  // exposure = Y-leg SOL + (X-leg tokens valued in SOL). The token leg CANNOT escape
+  // the ceiling because it is priced into the total (anti-pattern #7).
+  const capSol = resolveTwoSidedNotionalCapSol(config);
+  const capCheck = assertTwoSidedNotionalCap({
+    amountYSol: finalAmountY,
+    amountXTokens: finalAmountX,
+    priceSolPerToken: activePrice,
+    capSol,
+  });
+  if (!capCheck.ok) {
+    throw new Error(`Two-sided LIVE deposit REFUSED (notional cap): ${capCheck.reason}`);
+  }
+
+  const minBinId = activeBin.binId - activeBinsBelow;
+  const maxBinId = activeBin.binId + activeBinsAbove;
+  if (minBinId > maxBinId) {
+    throw new Error(`Invalid two-sided bin range: ${minBinId} -> ${maxBinId}`);
+  }
+
+  const swapFn = _testHooks.swapToken || swapToken;
+  const depositFn = _testHooks.depositTwoSidedSdk || _performTwoSidedSdkDeposit;
+  const notifyStrandedFn = _testHooks.notifyStranded || _defaultStrandedNotify;
+
+  // ── ATOMIC-vs-STRANDED decision ──
+  // PREFERRED atomic path is the relay zap-in (swap+addLiquidity bundled server-side
+  // → no stranded window). That path is DEFERRED to enable-time (needs live relay
+  // creds + its own soak). What is BUILT + TESTED here is the NON-ATOMIC fallback:
+  // swap SOL→token, THEN deposit — guarded by explicit stranded-asset detection +
+  // operator alert + NO auto-retry (anti-pattern #4). A non-atomic path is only ever
+  // taken with that safety net attached.
+
+  // Step 1 — REAL SOL→token entry swap for the X leg (Jupiter, slippage-capped in
+  // wallet.swapToken). We swap the X-leg SOL value from the (capped) notional.
+  const swapRes = await swapFn({
+    input_mint: WSOL_MINT,
+    output_mint: baseMint,
+    amount: capCheck.notional.x_leg_sol,
+  });
+  const swapSucceeded = swapRes?.success === true;
+  const tokenXReceived = swapSucceeded ? Number(swapRes.amount_out ?? finalAmountX) : null;
+  if (!swapSucceeded) {
+    // Swap never filled → nothing acquired, nothing stranded, NO deposit attempted,
+    // NO retry. State is clean (no on-chain effect beyond a possible reverted tx).
+    const reason = swapRes?.error || swapRes?.reason || "unknown";
+    log("deploy_error", `Two-sided entry swap failed (no fill): ${reason}`);
+    return { success: false, error: `Two-sided entry swap failed: ${reason}`, stranded: false };
+  }
+
+  // Step 2 — deposit BOTH legs. NON-ATOMIC: a failure here strands the token bag.
+  let depositRes;
+  try {
+    depositRes = await depositFn({
+      pool,
+      minBinId,
+      maxBinId,
+      strategyType,
+      amountYSol: finalAmountY,
+      tokenXReceived,
+      baseMint,
+    });
+  } catch (e) {
+    depositRes = { success: false, error: e.message };
+  }
+  const depositSucceeded = depositRes?.success === true;
+
+  // Step 3 — STRANDED-ASSET detection (swap filled + deposit failed).
+  const stranded = detectStrandedAsset({ swapSucceeded, tokenXReceived, depositSucceeded });
+  if (stranded.stranded) {
+    await Promise.resolve(notifyStrandedFn(stranded.alert)).catch(() => {});
+    log("deploy_error", stranded.alert);
+    return {
+      success: false,
+      error: stranded.alert,
+      stranded: true,
+      retry: false, // NEVER auto-retry — manual on-chain disposition required
+      token_x_stranded: stranded.tokenXAmount,
+      swap_tx: swapRes.tx || null,
+    };
+  }
+
+  if (!depositSucceeded) {
+    return { success: false, error: depositRes?.error || "two-sided deposit failed", stranded: false };
+  }
+
+  // ── Success — verify + track (anti-pattern #3 handled inside depositFn) ──
+  const positionAddress = depositRes.position || null;
+  if (positionAddress) {
+    _positionsCacheAt = 0;
+    trackPosition({
+      position: positionAddress,
+      pool: pool_address,
+      pool_name,
+      strategy: activeStrategy,
+      bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
+      bin_step,
+      volatility: normalizedVolatility,
+      fee_tvl_ratio,
+      organic_score,
+      amount_sol: finalAmountY,
+      amount_x: tokenXReceived,
+      active_bin: activeBin.binId,
+      initial_value_usd,
+      entry_features: entryFeatures,
+      two_sided: true,
+    });
+  }
+  return {
+    success: true,
+    two_sided: true,
+    position: positionAddress,
+    pool: pool_address,
+    pool_name,
+    bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
+    bin_step: actualBinStep,
+    strategy: activeStrategy,
+    amount_x: tokenXReceived,
+    amount_y: finalAmountY,
+    notional: capCheck.notional,
+    swap_tx: swapRes.tx || null,
+    txs: depositRes.txs || [],
+  };
+}
+
+/**
+ * Production SDK two-sided deposit (dead path this phase — belts off). Deposits both
+ * legs in a single initializePositionAndAddLiquidityByStrategy tx, confirms it, and
+ * VERIFIES the position exists on-chain before reporting success (anti-pattern #3).
+ */
+async function _performTwoSidedSdkDeposit({ pool, minBinId, maxBinId, strategyType, amountYSol, tokenXReceived, baseMint }) {
+  const wallet = (_testHooks.getWallet || getWallet)();
+  const newPosition = Keypair.generate();
+  const totalYLamports = new BN(Math.floor(amountYSol * 1e9));
+  const mintInfo = await getConnection().getParsedAccountInfo(new PublicKey(baseMint));
+  const decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
+  const totalXLamports = new BN(Math.floor(tokenXReceived * Math.pow(10, decimals)));
+  const tx = await pool.initializePositionAndAddLiquidityByStrategy({
+    positionPubKey: newPosition.publicKey,
+    user: wallet.publicKey,
+    totalXAmount: totalXLamports,
+    totalYAmount: totalYLamports,
+    strategy: { maxBinId, minBinId, strategyType },
+    slippage: 1000,
+  });
+  const sendTx = _testHooks.sendAndConfirmTransaction || sendAndConfirmTransaction;
+  const txHash = await sendTx(getConnection(), tx, [wallet, newPosition]);
+  return { success: true, position: newPosition.publicKey.toString(), txs: [txHash] };
+}
+
+/** Best-effort operator alert for a stranded token-X bag (dead path this phase). */
+async function _defaultStrandedNotify(message) {
+  log("stranded_alert", message);
+  try {
+    const { notifyDeployFailure } = await import("../telegram.js");
+    await notifyDeployFailure({ pool: "two-sided-stranded", error: message });
+  } catch {
+    /* best-effort — logging above is the guaranteed record */
   }
 }
 

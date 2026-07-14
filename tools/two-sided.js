@@ -142,6 +142,191 @@ export function computeTwoSidedNotionalSol({ amountYSol, amountXTokens, priceSol
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// LIVE two-sided MACHINERY (Vega 🔥 — BUILT, NOT ENABLED).
+//
+// Everything below is the safety machinery the LIVE two-sided path will use once
+// Bro gives the explicit final go. It is BUILT + UNIT-TESTED now, but the LIVE
+// path stays HARD-REFUSED by the existing twoSidedGateDecision belts (paperOnly
+// TRUE) PLUS the new inner belt liveTwoSidedFullyAuthorized (default FALSE).
+// BUILD ≠ ENABLE. None of these relax any existing belt.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * CODE-PINNED hard ceiling on TOTAL two-sided notional (Y-leg SOL + X-leg-in-SOL),
+ * denominated in SOL. Burner-tiny Phase-1 live cap. Lives in CODE, not JSON — a
+ * config/LLM value can tighten below this but can NEVER exceed it (anti-pattern #7).
+ * This is a TOTAL-notional cap (both legs), NOT a per-leg cap: the token leg CANNOT
+ * escape the ceiling by being denominated in tokens.
+ */
+export const MAX_TWO_SIDED_NOTIONAL_SOL = 0.1;
+
+/** The canonical wSOL mint (the ONLY quote leg a SOL deposit is valid against). */
+export const WSOL_MINT = "So11111111111111111111111111111111111111112";
+
+/**
+ * Resolve the effective total-notional cap: min(code-pinned ceiling, config tunable).
+ * FAIL-CLOSED: a missing / non-finite / non-positive config value falls back to the
+ * code ceiling; the config can only ever TIGHTEN (min), never loosen.
+ */
+export function resolveTwoSidedNotionalCapSol(cfg) {
+  const raw = strictNum(cfg?.strategy?.twoSidedNotionalCapSol);
+  if (raw == null || raw <= 0) return MAX_TWO_SIDED_NOTIONAL_SOL;
+  return Math.min(raw, MAX_TWO_SIDED_NOTIONAL_SOL);
+}
+
+/**
+ * The FOURTH, INNERMOST belt authorizing a LIVE two-sided deposit. This is the
+ * "explicit final go" gate — it is ADDITIONAL to (never replaces) the outer
+ * twoSidedGateDecision belts. Requires ALL of:
+ *   - twoSidedEnabled === true          (master flag)
+ *   - LIVE (dryRunEnv !== "true")        (not paper)
+ *   - twoSidedPaperOnly === false        (belt 2 explicitly lowered)
+ *   - twoSidedLiveAuthorized === true    (belt 4 — NEW explicit final go)
+ * Any missing/non-true value → false (fail-safe). We set NEITHER paperOnly=false
+ * NOR twoSidedLiveAuthorized=true this phase → always false in practice.
+ */
+export function liveTwoSidedFullyAuthorized(cfg, dryRunEnv) {
+  const enabled = cfg?.strategy?.twoSidedEnabled === true;
+  const isDry = dryRunEnv === "true";
+  const paperOnly = cfg?.strategy?.twoSidedPaperOnly !== false;
+  const liveAuthorized = cfg?.strategy?.twoSidedLiveAuthorized === true;
+  return enabled && !isDry && paperOnly === false && liveAuthorized === true;
+}
+
+/**
+ * HARD total-notional cap assertion. Binds the TRUE two-leg exposure
+ * (computeTwoSidedNotionalSol) against the effective cap BEFORE any real deposit.
+ * The token leg is valued in SOL so it can NEVER escape the ceiling (anti-pattern #7).
+ *
+ * FAIL-CLOSED (anti-pattern #2): if the notional cannot be computed (any leg / price
+ * missing or non-finite → computeTwoSidedNotionalSol returns null), we REFUSE with
+ * "cannot verify exposure", never treat unverifiable exposure as zero. A non-finite
+ * or non-positive cap also refuses.
+ *
+ * @returns {{ ok:boolean, reason:string|null, notional:object|null, capSol:number }}
+ */
+export function assertTwoSidedNotionalCap({ amountYSol, amountXTokens, priceSolPerToken, capSol } = {}) {
+  const cap = strictNum(capSol);
+  if (cap == null || cap <= 0) {
+    return { ok: false, reason: "two_sided_notional_cap_invalid", notional: null, capSol: cap };
+  }
+  const notional = computeTwoSidedNotionalSol({ amountYSol, amountXTokens, priceSolPerToken });
+  if (notional == null) {
+    return {
+      ok: false,
+      reason: "two_sided_notional_unverifiable_refuse",
+      notional: null,
+      capSol: cap,
+    };
+  }
+  if (notional.total_notional_sol > cap) {
+    return {
+      ok: false,
+      reason: `two_sided_total_notional_${notional.total_notional_sol}_exceeds_cap_${cap}`,
+      notional,
+      capSol: cap,
+    };
+  }
+  return { ok: true, reason: null, notional, capSol: cap };
+}
+
+/**
+ * CHAIN-LEG assertion for a LIVE two-sided deposit. Confirms, from AUTHORITATIVE
+ * on-chain mints (the caller reads pool.lbPair.token{X,Y}Mint), that:
+ *   1. tokenY (quote leg) === wSOL   → SOL can only be deposited into the wSOL leg.
+ *   2. baseMint (tokenX) is in the CURATED exempt set → only known-safe LST bases.
+ *
+ * The curated-base check is delegated to an injected predicate (`isBaseAllowed`,
+ * e.g. screening.isLstMintFreezeExempt) so the curated set has a SINGLE source of
+ * truth and this module stays dependency-free (no circular import).
+ *
+ * FAIL-CLOSED (anti-pattern #2): missing/empty mint, a non-function predicate, or a
+ * predicate that throws → REFUSE. Never assume a leg is safe when it can't be verified.
+ *
+ * @returns {{ ok:boolean, reason:string|null }}
+ */
+export function assertTwoSidedChainLegs({ quoteMint, baseMint, wsolMint = WSOL_MINT, isBaseAllowed } = {}) {
+  if (!quoteMint || typeof quoteMint !== "string") {
+    return { ok: false, reason: "two_sided_quote_mint_missing" };
+  }
+  if (quoteMint !== wsolMint) {
+    return { ok: false, reason: `two_sided_quote_not_wsol_${quoteMint}` };
+  }
+  if (!baseMint || typeof baseMint !== "string") {
+    return { ok: false, reason: "two_sided_base_mint_missing" };
+  }
+  if (typeof isBaseAllowed !== "function") {
+    return { ok: false, reason: "two_sided_base_predicate_missing" };
+  }
+  let allowed = false;
+  try {
+    allowed = isBaseAllowed(baseMint) === true;
+  } catch {
+    return { ok: false, reason: "two_sided_base_predicate_threw" };
+  }
+  if (!allowed) {
+    return { ok: false, reason: `two_sided_base_not_curated_lst_${baseMint}` };
+  }
+  return { ok: true, reason: null };
+}
+
+/**
+ * Split a TOTAL SOL budget into a two-sided entry plan: the SOL that stays as the
+ * Y leg, the SOL routed through the entry swap for the X leg, and the resulting
+ * token-X target. PURE — the caller feeds a total already <= the notional cap.
+ *
+ * FAIL-CLOSED: any bad input (non-finite total/price/share, share outside (0,1),
+ * non-positive price) → null. Never fabricates a fill.
+ *
+ * @returns {{ y_leg_sol:number, x_leg_sol:number, token_x_target:number, x_share:number }|null}
+ */
+export function computeTwoSidedEntryPlan({ totalNotionalSol, xSharePct, priceSolPerToken } = {}) {
+  const total = strictNum(totalNotionalSol);
+  const share = strictNum(xSharePct);
+  const px = strictNum(priceSolPerToken);
+  if (total == null || share == null || px == null) return null;
+  if (total < 0 || px <= 0) return null;
+  if (share <= 0 || share >= 1) return null; // must be genuinely two-sided
+  const xLegSol = total * share;
+  const yLegSol = total - xLegSol;
+  const tokenXTarget = xLegSol / px;
+  return {
+    y_leg_sol: parseFloat(yLegSol.toFixed(9)),
+    x_leg_sol: parseFloat(xLegSol.toFixed(9)),
+    token_x_target: parseFloat(tokenXTarget.toFixed(9)),
+    x_share: share,
+  };
+}
+
+/**
+ * STRANDED-ASSET detection for the NON-ATOMIC entry path (swap-then-deposit).
+ * When the SOL→token entry swap SUCCEEDS but the subsequent liquidity deposit
+ * FAILS, the wallet is left holding a token-X bag that was never deposited — a
+ * stranded position that MUST be surfaced to the operator and NEVER auto-retried
+ * (anti-pattern #4 — deposit state is unknown; a blind retry risks a double bag /
+ * double spend). This function decides whether that condition holds and what to do.
+ *
+ * @returns {{ stranded:boolean, retry:false, alert:string|null, tokenXAmount:number|null }}
+ */
+export function detectStrandedAsset({ swapSucceeded, tokenXReceived, depositSucceeded } = {}) {
+  const gotToken = strictNum(tokenXReceived);
+  const swapOk = swapSucceeded === true && gotToken != null && gotToken > 0;
+  const depositOk = depositSucceeded === true;
+  if (swapOk && !depositOk) {
+    return {
+      stranded: true,
+      retry: false, // NEVER auto-retry — deposit state unknown, manual verify required
+      alert:
+        `STRANDED two-sided entry: SOL→token swap FILLED (${gotToken} token-X held) but the ` +
+        `liquidity deposit FAILED. Token-X bag is stranded in the wallet. NO auto-retry — ` +
+        `manual on-chain review + disposition required.`,
+      tokenXAmount: gotToken,
+    };
+  }
+  return { stranded: false, retry: false, alert: null, tokenXAmount: gotToken };
+}
+
 /**
  * Simulate the SOL→token entry swap for the X leg (PAPER — no on-chain tx).
  * Given the desired token-X amount and the active price, compute the SOL that

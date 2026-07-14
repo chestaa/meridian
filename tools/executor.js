@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair, poolLegMints, peekDiscoveryDetailByAddress } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair, poolLegMints, peekDiscoveryDetailByAddress, twoSidedPaperLaneActive, isLstMintFreezeExempt } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -140,12 +140,50 @@ function bluechipBinStepSanityReject(binStep) {
   return null;
 }
 
+// ── Two-sided PAPER-lane curated-LST deploy exemption (Vega — money-path, paper-isolated) ──
+// The FINAL Track-A paper blocker: a deep-TVL curated LST-SOL income pair (JitoSOL/mSOL/
+// jupSOL-SOL) surfaces → passes the strict screening gate (via twoSidedPaperBluechipGateReason,
+// which DROPS the fee/TVL yield floor and NEVER checks binStep for the paper lane) → reaches
+// deploy_position — then the executor's MEMECOIN gates bite: maxTvl $150k (deep TVL is the POINT
+// of a two-sided LST income pair, not a risk), the fee/TVL yield floor (low fee/TVL is EXPECTED
+// at ~1% APR for a symmetric SOL-tracking pair), the vol>0 floor (a stable pair legitimately
+// reads ~0 vol), and the memecoin binStep [80,125] range (LST-SOL pools use a fine bin_step).
+// This predicate makes the executor MIRROR the screening paper-lane treatment so those gates are
+// re-targeted for the paper LST pair, exactly as they already are for the bluechip income lane.
+//
+// Fires ONLY when BOTH hold (HARD ISOLATION — task point 2):
+//   1. twoSidedPaperLaneActive(config, DRY_RUN) === true   → twoSidedEnabled && DRY_RUN==="true".
+//      This is NEVER true in live (DRY_RUN=false) or flag-off — the whole isolation guarantee.
+//   2. isLstMintFreezeExempt(base) === true                → a curated, on-chain-probe-confirmed
+//      stake-pool LST base leg (JitoSOL/mSOL/jupSOL). Stables / memecoins / bSOL are NOT exempt.
+// Base mint resolves from args metadata, else from the LIVE on-chain `detail` legs (poolLegMints).
+// FAIL-CLOSED (anti-pattern #2): lane inactive, non-curated base, or unresolvable base → NOT exempt
+// → the memecoin gates apply byte-for-byte. Live two-sided is still hard-refused upstream (the
+// twoSidedGateDecision belts) — this changes NOTHING about live behavior and never fires in live.
+function isTwoSidedPaperLstExempt(args, detail = null) {
+  if (!twoSidedPaperLaneActive(config, process.env.DRY_RUN)) return false;
+  const legs = detail ? poolLegMints(detail) : { base: null, quote: null };
+  const argBase = args?.base_mint ?? args?.base_address ?? null;
+  // The curated LST is ALWAYS the pool's BASE (token_x) leg (wSOL is the quote/token_y
+  // per isTwoSidedPaperCandidate). Accept the exemption if EITHER the args-supplied base
+  // OR the AUTHORITATIVE on-chain base leg is a curated LST, so no arg-shape variation can
+  // silently fail-close the flagship (the vega-bluechip-maxtvl-paper-stale lesson). Mirrors
+  // screening's twoSidedBaseLegGateReason, which keys the mint/freeze exemption purely on
+  // isLstMintFreezeExempt(base). FAIL-CLOSED: neither base resolvable / curated → not exempt.
+  if (argBase && isLstMintFreezeExempt(argBase)) return true;
+  if (legs.base && isLstMintFreezeExempt(legs.base)) return true;
+  return false;
+}
+
 // Test seams — exercise the pure binStep-exemption decision + sanity bound in isolation.
 export function __isBluechipBinStepExemptForTests(args, detail = null) {
   return isBluechipBinStepExempt(args, detail);
 }
 export function __bluechipBinStepSanityRejectForTests(binStep) {
   return bluechipBinStepSanityReject(binStep);
+}
+export function __isTwoSidedPaperLstExemptForTests(args, detail = null) {
+  return isTwoSidedPaperLstExempt(args, detail);
 }
 
 function poolDetailFeeActiveTvlRatio(pool) {
@@ -489,6 +527,16 @@ async function validateDeployPoolThresholds(args) {
   // (no maxTvl ceiling; bluechip fee/TVL floor; vol ceiling). Non-whitelist or flag
   // OFF → memecoin path below, byte-for-byte unchanged. FAIL-CLOSED throughout.
   const isBluechipExempt = isBluechipBinStepExempt(args, detail);
+  // Two-sided PAPER-lane curated-LST exemption (paper-isolated). See isTwoSidedPaperLstExempt:
+  // NEVER true in live / flag-off / non-LST. When true, the maxTvl ceiling (GATE 1), vol floor
+  // (GATE 3) and binStep range are re-targeted exactly like the bluechip lane; the fee/TVL floor
+  // (GATE 2) is DROPPED to mirror screening's twoSidedPaperBluechipGateReason (low fee/TVL is the
+  // EXPECTED profile of a ~1% APR symmetric LST-SOL pair — applying even bluechipMinFeeTvlRatio
+  // 0.03 would RE-BLOCK the exact pool this lane exists to paper-validate).
+  const isPaperLstExempt = isTwoSidedPaperLstExempt(args, detail);
+  // Deep-pool exemption drives the maxTvl ceiling skip, the vol floor→ceiling inversion and the
+  // binStep floor skip for EITHER the bluechip income lane OR the two-sided paper LST lane.
+  const isDeepExempt = isBluechipExempt || isPaperLstExempt;
 
   const tvl = poolDetailTvl(detail);
   const minTvl = numberOrNull(config.screening.minTvl);
@@ -506,8 +554,9 @@ async function validateDeployPoolThresholds(args) {
     };
   }
   // GATE 1 — maxTvl ceiling: EXEMPT for bluechip (a deep $245k SOL-USDC pool is the
-  // ideal income target, not a risk). Memecoin path keeps the ceiling unchanged.
-  if (!isBluechipExempt && maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
+  // ideal income target, not a risk) AND for the two-sided paper LST lane (a deep
+  // JitoSOL-SOL income pair is the POINT). Memecoin path keeps the ceiling unchanged.
+  if (!isDeepExempt && maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
     return {
       pass: false,
       reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.`,
@@ -520,13 +569,21 @@ async function validateDeployPoolThresholds(args) {
   const effectiveFeeTvlRatio = [feeActiveTvlRatio, feeTvlRatio, requestedFeeTvlRatio]
     .filter((value) => value != null)
     .reduce((best, value) => Math.max(best, value), -Infinity);
-  // GATE 2 — fee/TVL floor: bluechip uses the LOWER bluechipMinFeeTvlRatio floor
-  // (0.03, ~11% APR — bluechip IL is far smaller so a lower fee bar is fine) in
-  // place of the memecoin minFeeActiveTvlRatio (0.10). Still FAIL-CLOSED: a missing
-  // fee/TVL reading is rejected in both lanes (never default to passing).
-  const effectiveFeeFloor = isBluechipExempt
-    ? numberOrNull(config.screening.bluechipMinFeeTvlRatio)
-    : numberOrNull(config.screening.minFeeActiveTvlRatio);
+  // GATE 2 — fee/TVL floor, per-lane:
+  //   - two-sided paper LST lane → DROPPED (null, no floor). Mirrors screening's
+  //     twoSidedPaperBluechipGateReason: low fee/TVL is the EXPECTED profile of a ~1% APR
+  //     symmetric SOL-tracking pair with near-zero IL; the yield bar is the exact inversion
+  //     trap that would RE-BLOCK the pool. Paper lane is DRY_RUN-only → dropping a yield
+  //     bar carries ZERO money risk (base-leg rug/safety enforced upstream by Cassiopeia).
+  //   - bluechip income lane → LOWER bluechipMinFeeTvlRatio (0.03, ~11% APR).
+  //   - memecoin → full minFeeActiveTvlRatio (0.10).
+  // Still FAIL-CLOSED for the memecoin + bluechip lanes: a missing fee/TVL reading is rejected
+  // (never default to passing). The paper LST lane intentionally has no floor to reject against.
+  const effectiveFeeFloor = isPaperLstExempt
+    ? null
+    : isBluechipExempt
+      ? numberOrNull(config.screening.bluechipMinFeeTvlRatio)
+      : numberOrNull(config.screening.minFeeActiveTvlRatio);
   if (
     effectiveFeeFloor != null &&
     effectiveFeeFloor > 0 &&
@@ -576,8 +633,10 @@ async function validateDeployPoolThresholds(args) {
   // reading = refuse). For BLUECHIP it INVERTS to a CEILING — a stable pool legitimately
   // reads ~0 vol and that is GOOD (SOL-USDC vola ~0.1); a WILD reading means it isn't
   // behaving as a stable bluechip (de-peg / thin book) and IS rejected. Low/zero vol is
-  // tolerated for bluechip (mirrors screening bluechipPoolGateRejectReason).
-  if (isBluechipExempt) {
+  // tolerated for bluechip AND the two-sided paper LST lane (both mirror screening's
+  // bluechip / twoSidedPaperBluechipGateReason vol-ceiling semantics — low/zero vol is the
+  // GOOD stable state, only a WILD reading = de-peg/thin book is rejected).
+  if (isDeepExempt) {
     const maxVola = numberOrNull(config.screening.bluechipMaxVolatility);
     if (maxVola != null && maxVola > 0 && volatility != null && volatility > maxVola) {
       return {
@@ -595,11 +654,12 @@ async function validateDeployPoolThresholds(args) {
   const actualBinStep = poolDetailBinStep(detail);
   const minStep = numberOrNull(config.screening.minBinStep);
   const maxStep = numberOrNull(config.screening.maxBinStep);
-  // Bluechip deploy-side binStep exemption: a WHITELIST bluechip pair (flag ON) is
-  // exempt from the memecoin [minBinStep,maxBinStep] floor (SOL-USDC bin_step=1 is
-  // legitimate). A sane absolute bound still applies (fail-closed). Non-whitelist or
-  // flag OFF → memecoin floor below, byte-for-byte unchanged.
-  if (isBluechipBinStepExempt(args, detail)) {
+  // Bluechip / two-sided-paper-LST deploy-side binStep exemption: a WHITELIST bluechip
+  // pair (flag ON) OR a paper-lane curated LST-SOL pair is exempt from the memecoin
+  // [minBinStep,maxBinStep] floor (SOL-USDC bin_step=1 and LST-SOL fine bin_steps are
+  // legitimate — screening's paper lane never checks binStep either). A sane absolute
+  // bound still applies (fail-closed). Non-exempt → memecoin floor below, byte-unchanged.
+  if (isDeepExempt) {
     const sanity = bluechipBinStepSanityReject(actualBinStep);
     if (sanity) {
       return { pass: false, reason: sanity };
@@ -1318,7 +1378,7 @@ async function runSafetyChecks(name, args) {
       // memecoin range below, byte-for-byte unchanged. Whitelist is NON-NEGOTIABLE.
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
-      if (isBluechipBinStepExempt(args)) {
+      if (isBluechipBinStepExempt(args) || isTwoSidedPaperLstExempt(args)) {
         const sanity = bluechipBinStepSanityReject(
           args.bin_step != null ? Number(args.bin_step) : null,
         );
