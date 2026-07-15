@@ -15,6 +15,8 @@ import {
   escapeHtml,
   classifySignalSource,
   buildSignalSection,
+  buildBalanceSection,
+  sumOpenPositionsCapital,
 } from "./boss-report.js";
 
 let pass = 0;
@@ -320,6 +322,94 @@ console.log("\n[buildSignalSection]");
   // inbox waiting path
   const withWaiting = buildSignalSection(processed, rejected, { screener: 3, discord: 0, manual: 0, other: 0, total: 3 });
   assert("waiting>0 renders 'Menunggu diproses'", withWaiting.includes("Menunggu diproses: <b>3</b>"));
+}
+
+// ── Test: sumOpenPositionsCapital (recorded principal, sync, no RPC) ──
+console.log("\n[sumOpenPositionsCapital]");
+{
+  // Single-side positions sum amount_sol; two-sided uses notional_sol.
+  const state = {
+    positions: {
+      a: { amount_sol: 0.1, closed: false },
+      b: { amount_sol: 0.13, closed: false },
+      // two-sided: notional_sol (0.2) preferred over amount_sol y-leg (0.05)
+      c: { amount_sol: 0.05, two_sided: true, two_sided_live: { notional_sol: 0.2 }, closed: false },
+      // closed → excluded
+      d: { amount_sol: 5.0, closed: true },
+      // closed_at set (no `closed` flag) → excluded
+      e: { amount_sol: 5.0, closed_at: "2026-07-14T00:00:00Z" },
+    },
+  };
+  assert("sums open single-side + two-sided notional (0.1+0.13+0.2=0.43)", sumOpenPositionsCapital(state) === 0.43);
+
+  assert("null state → null (unreadable, never fabricate)", sumOpenPositionsCapital(null) === null);
+  assert("non-object state → null", sumOpenPositionsCapital("nope") === null);
+  assert("readable state, no positions map → 0 (flat, not null)", sumOpenPositionsCapital({}) === 0);
+  assert("all-closed positions → 0", sumOpenPositionsCapital({ positions: { d: { amount_sol: 1, closed: true } } }) === 0);
+
+  // strictNumeric fail-safe: a null/garbage amount contributes 0, never fabricates.
+  const junk = { positions: {
+    a: { amount_sol: null, closed: false },
+    b: { amount_sol: "not-a-number", closed: false },
+    c: { amount_sol: 0.15, closed: false },
+  } };
+  assert("null/garbage amount coerces to 0 (no fabrication), only real 0.15 counts", sumOpenPositionsCapital(junk) === 0.15);
+
+  // two-sided with stranded notional → falls back to amount_sol y-leg (conservative undercount)
+  const stranded = { positions: { c: { amount_sol: 0.05, two_sided: true, two_sided_live: { notional_sol: null }, closed: false } } };
+  assert("two-sided stranded notional → fallback amount_sol (0.05)", sumOpenPositionsCapital(stranded) === 0.05);
+}
+
+// ── Test: buildBalanceSection (phantom-drain DISPLAY fix) ───────────
+// The bug: a deployed-capital dip in LIQUID sol read as a scary drain to Bro.
+// Fix: show TOTAL account value = liquid + deployed, prominent, so intact-but-
+// working capital can't read as a drop.
+console.log("\n[buildBalanceSection]");
+{
+  const PUB = "AbCdEfGh1234567890zzzzWXYZ";
+
+  // ── Scenario 1: capital deployed (liquid 0.43, 0.23 in a position) ──
+  const deployed = buildBalanceSection(0.43, 150, PUB, 0.23);
+  assert("deployed: renders TOTAL 0.6600 (0.43+0.23), the intact figure", deployed.includes("0.6600 SOL total"));
+  assert("deployed: shows breakdown likuid 0.4300", deployed.includes("likuid 0.4300"));
+  assert("deployed: shows breakdown di posisi 0.2300", deployed.includes("di posisi 0.2300"));
+  assert("deployed: total appears BEFORE liquid (total is prominent)", deployed.indexOf("total") < deployed.indexOf("likuid"));
+  assert("deployed: NOT a bare headline 0.43 (no '0.4300 SOL</code>' as the total)", !deployed.includes("0.4300 SOL</code>"));
+  assert("deployed: USD is computed on the TOTAL (0.66×150=99.00)", deployed.includes("$99.00"));
+
+  // ── Scenario 2: flat wallet (0 open positions) → clean render ──
+  const flat = buildBalanceSection(0.43, 150, PUB, 0);
+  assert("flat: renders liquid cleanly", flat.includes("0.4300 SOL</code>"));
+  assert("flat: NO 'di posisi 0' clutter", !flat.includes("di posisi"));
+  assert("flat: NO misleading 'total' label when nothing deployed", !flat.includes("SOL total"));
+  assert("flat: USD on the liquid figure (0.43×150=64.50)", flat.includes("$64.50"));
+
+  // ── Scenario 3: deployed unreadable (state.json parse fail) → honest note ──
+  const unreadable = buildBalanceSection(0.43, 150, PUB, null);
+  assert("unreadable: shows liquid figure", unreadable.includes("0.4300 SOL"));
+  assert("unreadable: honest open-positions note", /posisi terbuka|cek \/positions/.test(unreadable));
+  assert("unreadable: does NOT fabricate a total", !unreadable.includes("SOL total"));
+
+  // ── Edge: liquid unreadable → 'tidak terbaca', no crash ──
+  assert("liquid null → 'tidak terbaca'", buildBalanceSection(null, 150, PUB, 0.23).includes("tidak terbaca"));
+  assert("liquid NaN → 'tidak terbaca' (no NaN string leak)", buildBalanceSection(NaN, 150, PUB, 0.23).includes("tidak terbaca"));
+
+  // ── Edge: USD price unavailable → honest USD note, still decomposes SOL ──
+  const noUsd = buildBalanceSection(0.43, null, PUB, 0.23);
+  assert("no USD price: still shows total SOL", noUsd.includes("0.6600 SOL total"));
+  assert("no USD price: 'nilai USD tidak tersedia' (never hardcoded)", noUsd.includes("nilai USD tidak tersedia"));
+
+  // ── Real state.json shape end-to-end (sumOpenPositionsCapital → buildBalanceSection) ──
+  const realState = {
+    positions: {
+      POS1: { amount_sol: 0.05, two_sided: true, two_sided_live: { notional_sol: 0.1 }, closed: false },
+      be1:  { amount_sol: 0.05, closed: false },
+    },
+  };
+  const cap = sumOpenPositionsCapital(realState); // 0.1 + 0.05 = 0.15
+  const e2e = buildBalanceSection(0.3, 150, PUB, cap);
+  assert("e2e: state→capital 0.15 flows into total 0.4500", cap === 0.15 && e2e.includes("0.4500 SOL total"));
+  assert("e2e: breakdown di posisi 0.1500", e2e.includes("di posisi 0.1500"));
 }
 
 // ── Summary ─────────────────────────────────────────────────────

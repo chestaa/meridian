@@ -258,20 +258,119 @@ async function sendTelegram(token, chatId, html) {
 // ─── Section generators (pure, exported) ─────────────────────────
 
 /**
- * Wallet balance section. USD only shown when a live price is supplied;
- * a null/invalid price renders "(nilai USD tidak tersedia)" instead of a
- * wrong hardcoded number. (BUG 1 fix — was hardcoded $135/SOL.)
- * @param {number|null} solBalance
- * @param {number|null} solUsd - live SOL/USD price, or null if unavailable
- * @param {string|null} pubkey
+ * STRICT numeric coercion (anti-pattern #2). Number(null)===0 is finite, so a
+ * naive Number()+isFinite would FABRICATE 0 for null/''/[]/false — turning
+ * "value unknown" into a fake 0. Only a real finite number (or non-empty numeric
+ * string) survives; everything else → null. Mirrors the money-guard's coercion
+ * in account-circuit-breaker.js so the display and the CB baseline agree.
+ * @param {*} v
+ * @returns {number|null}
  */
-export function buildBalanceSection(solBalance, solUsd, pubkey) {
-  if (solBalance == null) return `💳 Saldo wallet\n<i>tidak terbaca</i>`;
-  const addr = pubkey ? `\n<i>${pubkey.slice(0, 8)}...${pubkey.slice(-4)}</i>` : "";
-  const usd = Number.isFinite(solUsd) && solUsd > 0
-    ? ` (~$${(solBalance * solUsd).toFixed(2)} · SOL @ $${solUsd.toFixed(0)})`
+function strictNumeric(v) {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+/**
+ * Sum SOL PRINCIPAL committed to currently-open positions, read from an already-
+ * parsed state.json object (SYNC, NO RPC, NO mark-to-market → zero valuation-
+ * failure surface). Mirrors account-circuit-breaker.js's readOpenPositionsCapitalSol
+ * so the boss-report "di posisi" figure and the CB baseline seed use the SAME
+ * recorded principal.
+ *
+ * Committed principal = two_sided_live.notional_sol (two-sided total exposure) or
+ * amount_sol (single-side). A null/stranded two-sided notional falls back to
+ * amount_sol (undercount, errs conservative). strictNumeric avoids the
+ * Number(null)===0 fabrication trap.
+ *
+ * RETURN CONTRACT (drives the display fail-safe):
+ *   - null → state UNREADABLE (parsed object null/not-an-object). Caller must NOT
+ *            fabricate a total; show liquid + honest note.
+ *   - 0    → state readable, no open positions (or none with principal) → genuinely
+ *            flat → clean render.
+ *   - >0   → committed capital to decompose.
+ *
+ * @param {object|null} stateData - parsed state.json (or null on read failure)
+ * @returns {number|null}
+ */
+export function sumOpenPositionsCapital(stateData) {
+  if (!stateData || typeof stateData !== "object") return null; // unreadable
+  const positions = stateData.positions && typeof stateData.positions === "object"
+    ? Object.values(stateData.positions)
+    : []; // readable state, no positions map → flat (0), not unreadable
+  let sum = 0;
+  for (const p of positions) {
+    if (!p || p.closed || p.closed_at) continue; // OPEN only
+    const twoSided = p.two_sided === true && p.two_sided_live
+      ? strictNumeric(p.two_sided_live.notional_sol)
+      : null;
+    const single = strictNumeric(p.amount_sol);
+    const capital = twoSided != null ? twoSided : (single != null ? single : 0);
+    if (capital > 0) sum += capital;
+  }
+  return parseFloat(sum.toFixed(9));
+}
+
+// USD annotation for a SOL figure. Live price null/invalid → "tidak tersedia"
+// (never a wrong hardcoded number — BUG 1 fix, was hardcoded $135/SOL).
+function usdAnnotation(sol, solUsd) {
+  return Number.isFinite(solUsd) && solUsd > 0
+    ? ` (~$${(sol * solUsd).toFixed(2)} · SOL @ $${solUsd.toFixed(0)})`
     : ` <i>(nilai USD tidak tersedia)</i>`;
-  return `💳 Saldo wallet\n<code>${solBalance.toFixed(4)} SOL</code>${usd}${addr}`;
+}
+
+/**
+ * Wallet balance section — DECOMPOSED so a deployed-capital dip can't read as a
+ * drain (phantom-drain display fix, 2026-07-15). The number Bro panics on is
+ * this line: when capital is committed to open positions, LIQUID SOL dips
+ * (recoverable capital, NOT loss) and a liquid-only "Saldo" reads as a scary drop
+ * (0.69 → 0.43). We show TOTAL account value FIRST/prominent, with liquid +
+ * deployed as the breakdown, so intact-but-working capital is obvious.
+ *
+ *   Total account value = liquid + deployed (recorded open-position principal).
+ *   Rent is NOT added back (not tracked in state.json; estimating it risks
+ *   over-adding — mirrors Vega's CB baseline decision). Deployed principal is the
+ *   dominant recoverable term, so the phantom-drain read is fixed without it.
+ *
+ * Three render modes (driven by `deployedSol`, see sumOpenPositionsCapital):
+ *   deployed >  0    → "Saldo: <total> total (likuid X + di posisi Y)"
+ *   deployed == 0    → flat wallet → clean "Saldo: <liquid>" (no "di posisi 0" clutter)
+ *   deployed == null → UNREADABLE → liquid + honest "(+ posisi terbuka, cek /positions)"
+ *                      note. NEVER fabricate a total we can't back with data.
+ *
+ * @param {number|null} liquidSol   - liquid SOL balance (live RPC read)
+ * @param {number|null} solUsd      - live SOL/USD price, or null if unavailable
+ * @param {string|null} pubkey
+ * @param {number|null} deployedSol - committed open-position principal (sumOpenPositionsCapital)
+ */
+export function buildBalanceSection(liquidSol, solUsd, pubkey, deployedSol = null) {
+  const liquid = strictNumeric(liquidSol);
+  if (liquid == null) return `💳 Saldo wallet\n<i>tidak terbaca</i>`;
+  const addr = pubkey ? `\n<i>${pubkey.slice(0, 8)}...${pubkey.slice(-4)}</i>` : "";
+  const deployed = strictNumeric(deployedSol);
+
+  // Fail-safe: deployed capital unreadable (state.json parse failed) → show liquid
+  // + an HONEST note. Never fabricate a total we cannot back with recorded data.
+  if (deployed == null) {
+    return `💳 Saldo: <code>${liquid.toFixed(4)} SOL</code> likuid${usdAnnotation(liquid, solUsd)}` +
+      `\n<i>(+ ada posisi terbuka yang belum kebaca — cek /positions)</i>${addr}`;
+  }
+
+  // Flat wallet — nothing deployed → render clean (total == liquid), no confusing
+  // "di posisi 0" breakdown.
+  if (deployed <= 0) {
+    return `💳 Saldo: <code>${liquid.toFixed(4)} SOL</code>${usdAnnotation(liquid, solUsd)}${addr}`;
+  }
+
+  // Capital deployed — DECOMPOSE. Total FIRST/prominent (USD on the total = what
+  // Bro's capital is actually worth), liquid + deployed as the breakdown.
+  const total = parseFloat((liquid + deployed).toFixed(9));
+  return `💳 Saldo: <code>${total.toFixed(4)} SOL total</code>${usdAnnotation(total, solUsd)}` +
+    `\n<i>(likuid ${liquid.toFixed(4)} + di posisi ${deployed.toFixed(4)})</i>${addr}`;
 }
 
 /**
@@ -822,8 +921,14 @@ async function runBossReport() {
   const tradeArr = Array.isArray(tradesRaw?.trades) ? tradesRaw.trades : (Array.isArray(tradesRaw) ? tradesRaw : []);
 
   // ─── live open positions (real money) from state.json ───────────────────
-  const stateData = readJson("state.json") || {};
+  // Keep the RAW read (null on parse failure) so buildBalanceSection can tell
+  // "state unreadable" (→ honest note) apart from "flat wallet" (→ clean render).
+  const stateRaw = readJson("state.json");
+  const stateData = stateRaw || {};
   const openLiveCount = Object.values(stateData.positions || {}).filter(p => p && !p.closed).length;
+  // Committed open-position principal (SOL) — decomposes the balance line so a
+  // deployed-capital dip in liquid SOL can't read as a drain. Sync, no RPC.
+  const deployedSol = sumOpenPositionsCapital(stateRaw);
 
   // ─── signals ─────────────────────────────────────────────────────
   // Bucketed by ORIGIN source AND now counting signals/processed (the old
@@ -877,7 +982,7 @@ async function runBossReport() {
   const modeEmoji = DRY_RUN ? "🔵" : "🟢";
   const modeText  = DRY_RUN ? "Simulasi (aman, belum pakai real money)" : "LIVE — real money";
 
-  const balSection = buildBalanceSection(solBalance, solUsd, burnerPubkey);
+  const balSection = buildBalanceSection(solBalance, solUsd, burnerPubkey, deployedSol);
 
   const livePerf = Array.isArray(lessonsState?.performance) ? lessonsState.performance : [];
   // PIECE 2 — honest win bar from config (reloadable). Falls back to the default

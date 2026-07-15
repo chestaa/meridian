@@ -35,9 +35,15 @@ const {
   getCircuitStatus,
   manualReset,
   __setWalletFetchForTest,
+  __setOpenCapitalReaderForTest,
   CircuitBreakerError,
   DAILY_LOSS_CAP_SOL,
 } = cb;
+
+// This suite tests wallet-balance resilience on a FLAT account (no open
+// positions). Pin the open-capital reader to 0 so the seed = liquid balance
+// deterministically, independent of the ambient state.json on disk.
+__setOpenCapitalReaderForTest(() => 0);
 
 let pass = 0, fail = 0;
 function assert(cond, label) {
@@ -120,6 +126,7 @@ try {
 
 // Cleanup test hook
 __setWalletFetchForTest(null);
+__setOpenCapitalReaderForTest(null);
 manualReset("test teardown");
 
 console.log(`\n${pass}/${pass + fail} passed`);

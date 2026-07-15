@@ -6,6 +6,8 @@ import { log } from "./logger.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, "circuit-breaker-state.json");
 const TMP_FILE = STATE_FILE + ".tmp";
+// Position registry (state.js writes ./state.json at project root, same dir as this file).
+const POSITION_STATE_FILE = path.join(__dirname, "state.json");
 
 export const DAILY_LOSS_CAP_SOL = 0.10;
 export const DAILY_LOSS_CAP_PCT = 30.0;
@@ -71,6 +73,96 @@ function freshState(startingBalanceSol) {
   };
 }
 
+// ─── Baseline seed = TOTAL ACCOUNT VALUE (Vega money-path fix) ───────────────
+// The daily baseline (`starting_balance_sol`) is the DENOMINATOR of
+// realized_loss_pct and the reference the /circuit + briefing displays compare
+// against. It USED to be seeded from LIQUID SOL only. On a day-rollover whose
+// first deploy-check happens while a position is OPEN, liquid is depressed by
+// the deployed principal (recoverable capital, NOT loss) → baseline understated
+// (e.g. real 0.69 seeded as 0.43) → realized_loss_pct overstated → false
+// "drain / daily-loss" panic in the reports (2026-07-14 + 2026-07-15 recurrence).
+//
+// FIX: seed from TOTAL ACCOUNT VALUE = liquid + committed open-position capital.
+// We add back RECORDED committed PRINCIPAL (amount_sol single-side / notional_sol
+// two-sided), NOT a live mark-to-market — so this adds ZERO valuation-failure
+// surface to the money guard. The absolute SOL cap (DAILY_LOSS_CAP_SOL) is
+// baseline-INDEPENDENT and unchanged; a larger baseline only removes false
+// %-cap trips, it can never mask a genuine 0.10 SOL realized loss.
+
+// STRICT numeric coercion (anti-pattern #2). Number(null)===0 is finite, so a
+// naive Number()+isFinite would FABRICATE 0 for null/''/[]/false — turning
+// "capital unknown" into a fake 0. Only a real finite number (or non-empty
+// numeric string) survives; everything else → null.
+function strictNumeric(v) {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+/**
+ * Pure: day-start TOTAL ACCOUNT VALUE baseline from liquid SOL + open committed
+ * capital. Never inflates beyond provable committed capital: a null/unknown/
+ * non-positive openCapital contributes 0, so the fallback is exactly the old
+ * liquid-only value (CONSERVATIVE — a smaller baseline makes realized_loss_pct
+ * LARGER = over-halt bias, never under-halt). A null/non-finite liquid is passed
+ * through unchanged so the caller's existing fail-safe halt still fires.
+ * @param {number|null} liquidSol
+ * @param {number|null} openCapitalSol
+ * @returns {number|null}
+ */
+export function computeSeedBalance(liquidSol, openCapitalSol) {
+  if (liquidSol == null || !Number.isFinite(liquidSol)) return liquidSol;
+  const capital = Number.isFinite(openCapitalSol) && openCapitalSol > 0 ? openCapitalSol : 0;
+  return parseFloat((liquidSol + capital).toFixed(9));
+}
+
+/**
+ * Sum SOL PRINCIPAL committed to currently-open positions, read SYNCHRONOUSLY
+ * from state.json. NO RPC, NO market valuation → no valuation-failure surface.
+ * Committed principal = amount_sol (single-side) or two_sided_live.notional_sol
+ * (two-sided total exposure). Returns null on read/parse failure (caller then
+ * falls back to liquid-only = conservative). FAIL-SAFE: a missing/non-finite
+ * per-position amount coerces to 0 (understates → over-halt bias), never
+ * fabricates capital.
+ * @returns {number|null} committed open-position SOL, or null if unreadable
+ */
+function readOpenPositionsCapitalSol() {
+  try {
+    if (!fs.existsSync(POSITION_STATE_FILE)) return 0; // no registry = flat = no open capital
+    const parsed = JSON.parse(fs.readFileSync(POSITION_STATE_FILE, "utf8"));
+    const positions = parsed?.positions && typeof parsed.positions === "object"
+      ? Object.values(parsed.positions)
+      : [];
+    let sum = 0;
+    for (const p of positions) {
+      if (!p || p.closed || p.closed_at) continue; // OPEN only
+      // Two-sided: total exposure lives in notional_sol; a null/stranded notional
+      // falls back to amount_sol (y-leg) — undercount, errs conservative.
+      const twoSided = p.two_sided === true && p.two_sided_live
+        ? strictNumeric(p.two_sided_live.notional_sol)
+        : null;
+      const single = strictNumeric(p.amount_sol);
+      const capital = twoSided != null ? twoSided : (single != null ? single : 0);
+      if (capital > 0) sum += capital;
+    }
+    return parseFloat(sum.toFixed(9));
+  } catch (e) {
+    log("circuit_warn", `Open-position capital unreadable for baseline seed: ${e.message} — falling back to liquid-only (conservative)`);
+    return null;
+  }
+}
+
+// Test-only injection hook: lets the harness supply a deterministic open-capital
+// value instead of reading the ambient state.json. Production never sets this.
+let _openCapitalReaderOverride = null;
+export function __setOpenCapitalReaderForTest(fn) { _openCapitalReaderOverride = fn; }
+function getOpenPositionsCapitalSol() {
+  return _openCapitalReaderOverride ? _openCapitalReaderOverride() : readOpenPositionsCapitalSol();
+}
+
 // Returns current state, handling first-run and rollover.
 // walletBalanceSol required only on first call of the day.
 function getOrInitState(walletBalanceSol) {
@@ -85,9 +177,19 @@ function getOrInitState(walletBalanceSol) {
       log("circuit_warn", "Cannot init circuit breaker — wallet balance unreadable");
       return null; // fail-safe halt
     }
-    const state = freshState(walletBalanceSol);
+    // Seed from TOTAL ACCOUNT VALUE (liquid + committed open-position principal),
+    // NOT liquid-only, so a day-rollover seed taken mid-cycle (position open)
+    // cannot understate the baseline. See computeSeedBalance / the block comment
+    // above freshState. openCapital null (state unreadable) → liquid-only fallback.
+    const openCapital = getOpenPositionsCapitalSol();
+    const seedBalance = computeSeedBalance(walletBalanceSol, openCapital);
+    const state = freshState(seedBalance);
     persistState(state);
-    log("circuit", `Daily reset — new day ${today}, starting balance ${walletBalanceSol} SOL`);
+    log(
+      "circuit",
+      `Daily reset — new day ${today}, starting balance ${seedBalance} SOL ` +
+        `(liquid ${walletBalanceSol} + open-capital ${openCapital == null ? "unknown→0" : openCapital})`,
+    );
     return state;
   }
   return raw;

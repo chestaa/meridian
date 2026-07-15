@@ -49,6 +49,8 @@ const {
   getCircuitStatus,
   manualReset,
   __setWalletFetchForTest,
+  __setOpenCapitalReaderForTest,
+  computeSeedBalance,
   CircuitBreakerError,
   DAILY_LOSS_CAP_SOL,
 } = cb;
@@ -58,6 +60,11 @@ function assert(cond, label) {
   if (cond) { console.log(`PASS ${label}`); pass++; }
   else      { console.log(`FAIL ${label}`); fail++; }
 }
+
+// Default fixture: FLAT account (no open positions) so the day-start seed equals
+// the liquid balance for Cases 1-3, independent of the ambient state.json. New
+// Cases 4-6 override this to simulate mid-cycle open capital.
+__setOpenCapitalReaderForTest(() => 0);
 
 // Day-start balance BEFORE any position was opened (matches incident: 0.688894).
 const DAY_START = 0.688894;
@@ -139,8 +146,81 @@ assert(blockedOnCorrupt === true, "3a: corrupt CB state fails CLOSED (deploy blo
 assert(corruptErr instanceof CircuitBreakerError, "3b: fail-closed block is a CircuitBreakerError");
 assert(/unreadable/i.test(corruptErr?.message || ""), "3c: reason indicates state_unreadable");
 
+// ─── Case 4: THE BASELINE FIX — day-rollover seed WHILE a position is OPEN ────
+// This is the 2026-07-15 recurrence: the DAILY-RESET itself captured the baseline
+// mid-cycle while ~0.23 SOL was deployed, so starting_balance was seeded at the
+// dipped LIQUID 0.43 instead of the true ~0.69 total → realized_loss_pct inflated
+// → false "drain" in the reports. With the fix, the seed = liquid + committed
+// open capital = TOTAL ACCOUNT VALUE, so the baseline is honest.
+cleanState();
+__setWalletFetchForTest(null);
+const OPEN_CAPITAL = 0.23;          // committed principal in the open position
+const LIQUID_AT_ROLLOVER = 0.43;    // depressed liquid (capital is deployed)
+__setOpenCapitalReaderForTest(() => OPEN_CAPITAL);
+await assertCircuitOK(LIQUID_AT_ROLLOVER); // first deploy-check of the new day → seeds
+const seededMidCycle = getCircuitStatus();
+assert(
+  Math.abs(seededMidCycle.starting_balance_sol - (LIQUID_AT_ROLLOVER + OPEN_CAPITAL)) < 1e-9,
+  "4a: mid-cycle seed = liquid + open-capital (total value 0.66), NOT dipped liquid 0.43",
+);
+assert(seededMidCycle.starting_balance_sol > LIQUID_AT_ROLLOVER, "4b: baseline strictly above dipped liquid");
+assert(seededMidCycle.realized_loss_sol === 0, "4c: no realized loss at seed");
+assert(seededMidCycle.halted === false, "4d: not halted at seed");
+// A small REAL realized loss now reads as a small pct against the HONEST baseline,
+// not an inflated one — no phantom drain. (0.02 SOL loss / 0.66 = ~3.0%, not ~4.6%.)
+await recordRealizedLoss({ pnl_pct: -100, amount_sol: 0.02, pool: "p", pool_name: "X/SOL", reason: "sl" });
+const afterSmallLoss = getCircuitStatus();
+const honestPct = (0.02 / (LIQUID_AT_ROLLOVER + OPEN_CAPITAL)) * 100;
+assert(
+  Math.abs(afterSmallLoss.realized_loss_pct - honestPct) < 0.05,
+  "4e: realized_loss_pct computed against TOTAL-value baseline (honest ~3.0%, not inflated ~4.6%)",
+);
+assert(afterSmallLoss.halted === false, "4f: small real loss does NOT halt (well under 0.10 SOL cap)");
+
+// ─── Case 5: REAL HALT PRESERVED with the larger (correct) baseline ──────────
+// The absolute SOL cap is baseline-independent — a genuine loss ≥ 0.10 SOL still
+// halts even though the baseline is now larger (which only relaxes the % cap).
+cleanState();
+__setWalletFetchForTest(null);
+__setOpenCapitalReaderForTest(() => 0.23); // baseline padded by committed capital
+await assertCircuitOK(0.43);
+await recordRealizedLoss({
+  pnl_pct: -100,
+  amount_sol: DAILY_LOSS_CAP_SOL + 0.01, // genuine realized loss exceeds the 0.10 SOL cap
+  pool: "real_loss_pool",
+  pool_name: "LOSS/SOL",
+  reason: "stop_loss",
+});
+const haltedBig = getCircuitStatus();
+assert(haltedBig.halted === true, "5a: genuine loss ≥ 0.10 SOL cap STILL halts (larger baseline does not mask it)");
+let blocked5 = false, err5 = null;
+try { await assertCircuitOK(0.43); } catch (e) { blocked5 = true; err5 = e; }
+assert(blocked5 === true, "5b: halted breaker still blocks the deploy");
+assert(err5 instanceof CircuitBreakerError && /cap hit/i.test(err5?.message || ""), "5c: cites the realized-loss cap");
+
+// ─── Case 6: FAIL-CLOSED — open-capital unreadable falls back to liquid-only ──
+// If state.json can't be read, the reader returns null; the seed must NOT throw
+// and must NOT inflate — it falls back to the conservative liquid-only baseline
+// (smaller denominator = over-halt bias, never under-halt).
+cleanState();
+__setWalletFetchForTest(null);
+__setOpenCapitalReaderForTest(() => null); // simulate unreadable state.json
+let threw6 = false;
+try { await assertCircuitOK(0.43); } catch (e) { threw6 = true; }
+assert(threw6 === false, "6a: unreadable open-capital does NOT throw (graceful fallback)");
+const seededFallback = getCircuitStatus();
+assert(seededFallback.starting_balance_sol === 0.43, "6b: fallback baseline = liquid-only (conservative), no inflation");
+assert(seededFallback.halted === false, "6c: fallback still arms the breaker");
+
+// Pure-fn direct check of the conservative fallback contract.
+assert(computeSeedBalance(0.43, null) === 0.43, "6d: computeSeedBalance(liquid, null) = liquid (fallback)");
+assert(computeSeedBalance(0.43, 0.23) === 0.66, "6e: computeSeedBalance adds committed capital");
+assert(computeSeedBalance(0.43, -5) === 0.43, "6f: negative/garbage capital contributes 0 (never inflates)");
+assert(computeSeedBalance(null, 0.23) === null, "6g: null liquid passes through (caller fail-safe halt intact)");
+
 // Cleanup
 __setWalletFetchForTest(null);
+__setOpenCapitalReaderForTest(null);
 cleanState();
 manualReset("test teardown");
 
