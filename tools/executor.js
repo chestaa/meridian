@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair, poolLegMints, peekDiscoveryDetailByAddress, twoSidedPaperLaneActive, isLstMintFreezeExempt } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair, poolLegMints, peekDiscoveryDetailByAddress, peekCandidateEntryScalars, detectMarketRegime, twoSidedPaperLaneActive, isLstMintFreezeExempt } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -321,6 +321,77 @@ export function __setPeekDiscoveryDetailForTests(peekFn) {
 }
 export function __resetPeekDiscoveryDetailForTests() {
   _peekDiscoveryDetailImpl = (p, t) => peekDiscoveryDetailByAddress(p, t);
+}
+
+// ─── Vega P0 (2026-07-17) — entry_features enrichment for the LIVE deploy path ───
+// ROOT CAUSE of the 115/115 empty entry_features (Lyra forensic 2026-07-15): the
+// LIVE deploy path is agent.js → executeTool → deployPosition. The LLM's
+// deploy_position tool call carries ONLY schema params (pool_address/amount/bins/
+// strategy) — it CANNOT forward sol_regime_24h_pct / token_price_change / buy_vol /
+// sell_vol / mcap, so dlmm.buildEntryFeatures always received all-null and persisted
+// EMPTY features. The Jul-14 efNumeric fix only hardened the DETERMINISTIC vega.js
+// path (config.internalAgents.vegaDeterministicDeploy — OFF in live), so it never
+// touched this gap → "the fix never landed" in the actual journal.
+//
+// FIX: deterministically re-attach the REAL scalars (already computed THIS cycle by
+// screening) to the deploy args BEFORE dlmm.deployPosition threads them to
+// buildEntryFeatures. Sources, in priority order (NO new API call):
+//   1. screening candidate-scalars cache (COMPLETE: regime + entry-window price
+//      change + OKX buy/sell flow + mcap), keyed by pool_address.
+//   2. fallback — raw discovery peek detail (entry-window price change, mcap) +
+//      detectMarketRegime (SOL 24h regime, 10-min cached warm read). OKX buy/sell
+//      flow is enrichment-only (absent from raw detail) → stays null (honest gap).
+//
+// TELEMETRY-ONLY, fail-safe (anti-pattern #2): NEVER throws, NEVER blocks/alters a
+// deploy TX, NEVER fabricates (missing → null). If the deterministic vega path
+// already populated the scalars, they are LEFT UNTOUCHED (no clobber).
+const EF_SCALAR_KEYS = [
+  "sol_regime_24h_pct",
+  "token_price_change_1h",
+  "token_price_change_24h",
+  "buy_vol",
+  "sell_vol",
+  "mcap",
+];
+
+// Test seam: detectMarketRegime is a live network read (10-min cached). Route the
+// fallback regime read through a settable impl so tests never touch the network.
+let _detectMarketRegimeImpl = (opts) => detectMarketRegime(opts);
+export function __setDetectMarketRegimeForExecutorTests(fn) {
+  _detectMarketRegimeImpl = fn || ((opts) => detectMarketRegime(opts));
+}
+
+export async function enrichDeployEntryFeatures(args) {
+  try {
+    if (!args || typeof args !== "object" || !args.pool_address) return;
+    // Deterministic vega path already set these → do not overwrite.
+    if (EF_SCALAR_KEYS.some((k) => args[k] != null)) return;
+
+    // 1. Authoritative candidate-scalars cache (complete set incl. OKX flow).
+    const cached = peekCandidateEntryScalars(args.pool_address);
+    if (cached && EF_SCALAR_KEYS.some((k) => cached[k] != null)) {
+      for (const k of EF_SCALAR_KEYS) if (cached[k] != null) args[k] = cached[k];
+      return;
+    }
+
+    // 2. Fallback — raw discovery peek detail + market regime (NO new fetch).
+    // The two sources are INDEPENDENT: a peek-detail failure must not skip the
+    // regime read (and vice-versa), so each is isolated in its own guard.
+    try {
+      const detail = _peekDiscoveryDetailImpl(args.pool_address);
+      if (detail) {
+        const pc = numberOrNull(detail.pool_price_change_pct ?? detail.price_change_pct);
+        const mc = numberOrNull(detail.token_x?.market_cap ?? detail.mcap ?? detail.market_cap);
+        if (pc != null) args.token_price_change_1h = pc;
+        if (mc != null) args.mcap = mc;
+      }
+    } catch { /* peek best-effort; missing → null (honest gap) */ }
+    try {
+      const regime = await _detectMarketRegimeImpl({ s: config.screening });
+      const solPct = numberOrNull(regime?.sol24hChangePct);
+      if (solPct != null) args.sol_regime_24h_pct = solPct;
+    } catch { /* regime read best-effort; missing → null (honest gap) */ }
+  } catch { /* telemetry enrichment must NEVER escalate into the deploy path */ }
 }
 
 /**
@@ -1104,6 +1175,16 @@ export async function executeTool(name, args) {
   // snapshot → this trade's realized figure inflates, the fake "+55%"). The
   // notify now surfaces the per-trade-attributed LEDGER figure (see the close
   // handler below), so no pre-close wallet read is needed.
+
+  // ─── Vega P0 (2026-07-17) — entry_features enrichment (LIVE deploy path) ──────
+  // Deterministically attach the REAL entry-condition scalars to the deploy args so
+  // dlmm.buildEntryFeatures persists them (was 115/115 empty — the LLM tool call
+  // cannot forward them). Telemetry-only, fail-safe: never throws, never alters the
+  // deploy amount/gates/TX, missing → null. Runs for LIVE and paper alike (both
+  // benefit from an honest journal). See enrichDeployEntryFeatures.
+  if (name === "deploy_position") {
+    await enrichDeployEntryFeatures(args);
+  }
 
   // ─── Execute ──────────────────────────────
   try {

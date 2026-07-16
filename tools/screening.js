@@ -1697,6 +1697,39 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category,
 // cache: miss/expired → fresh fetch; a failed fetch is never cached; cloned on read.
 const _discoveryDetailCache = new Map(); // `${poolAddress}|${timeframe}` -> { detail, ts }
 
+// ── Candidate entry-scalars cache (Cassiopeia ↔ Vega, DATA-COLLECTION MODE) ──────
+// The enriched candidate carries the REAL entry-condition scalars (regime,
+// entry-window price change, OKX buy/sell flow, mcap) computed THIS cycle. BUT the
+// live deploy path is the LLM ReAct loop (agent.js → executeTool → deployPosition):
+// the LLM's deploy_position tool call CANNOT forward these scalars (not tool-schema
+// params, and entry_features is a nested object) → dlmm.buildEntryFeatures received
+// all-null → 115/115 live records had EMPTY entry_features (Lyra forensic 2026-07-15,
+// "the Jul-14 fix never landed"). The Jul-14 efNumeric fix hardened only the
+// DETERMINISTIC vega.js path (flag OFF, never runs live) — never this gap.
+// Stash the deploy-input scalar bundle here keyed by pool_address so Vega's executor
+// deploy path (enrichDeployEntryFeatures) can re-attach it deterministically — NO new
+// API call, identical in-hand values. TTL-bounded to the detail-cache window. STRICTLY
+// telemetry: never a gate, never blocks a deploy, missing → null (never fabricated).
+const _candidateEntryScalarsCache = new Map(); // pool_address -> { scalars, ts }
+
+/**
+ * Peek the deploy-input entry-feature scalars captured for a pool this cycle.
+ * Returns a shallow copy or null (miss/expired/no-key). Fail-safe, exported.
+ */
+export function peekCandidateEntryScalars(poolAddress) {
+  if (!poolAddress) return null;
+  const ttl = _discoveryDetailCacheTtlMs();
+  if (ttl <= 0) return null;
+  const hit = _candidateEntryScalarsCache.get(poolAddress);
+  if (!hit || Date.now() - hit.ts > ttl) return null;
+  return { ...hit.scalars };
+}
+
+/** Test seam — prime the candidate entry-scalars cache. Production never calls this. */
+export function __primeCandidateEntryScalarsForTests(poolAddress, scalars, ageMs = 0) {
+  _candidateEntryScalarsCache.set(poolAddress, { scalars, ts: Date.now() - ageMs });
+}
+
 function _discoveryDetailCacheTtlMs() {
   const min = numeric(config.screening?.broadDiscoveryDetailCacheTtlMin);
   if (min == null) return 5 * 60 * 1000; // 5 min — vol is time-sensitive
@@ -3469,6 +3502,28 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const capturedAt = Date.now();
   for (const c of eligible) {
     c.entry_features = buildEntryFeatures(c, cycleRegime, capturedAt);
+    // Also stash the deploy-input scalar bundle (dlmm.buildEntryFeatures input shape)
+    // so the LIVE (LLM ReAct) deploy path — which cannot forward the nested
+    // entry_features object through the tool-call boundary — can re-attach REAL
+    // values deterministically via Vega's enrichDeployEntryFeatures. Same in-hand
+    // values, NO new API call. FAIL-SAFE: each field strictNumeric-or-null (never the
+    // Number(null)===0 fabrication). token_price_change_1h = the entry-window pool
+    // price change (a REAL measurement over the configured timeframe, default 5m);
+    // token_price_change_24h stays null — the condensed candidate has no clean 24h
+    // source, and an honest null beats a mislabeled value in the training journal.
+    if (c.pool) {
+      _candidateEntryScalarsCache.set(c.pool, {
+        scalars: {
+          sol_regime_24h_pct: strictNumeric(cycleRegime?.sol24hChangePct),
+          token_price_change_1h: strictNumeric(c.price_change_pct),
+          token_price_change_24h: null,
+          buy_vol: strictNumeric(c.buy_vol),
+          sell_vol: strictNumeric(c.sell_vol),
+          mcap: strictNumeric(c.mcap),
+        },
+        ts: capturedAt,
+      });
+    }
   }
 
   return {

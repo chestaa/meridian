@@ -363,12 +363,14 @@ try {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Config defaults — flag OFF, down-timer present
+  // Live config — S4a: directional exit ACTIVATED (2026-07-17, staged on branch,
+  // Bro-gated for live). down-timer present. NOTE: code DEFAULT stays false
+  // (config.js) — this asserts the user-config VALUE is now the intended ON state.
   // ─────────────────────────────────────────────────────────────
-  console.log("\nConfig defaults");
+  console.log("\nLive config (S4a activation)");
   const { config } = await import("../config.js");
-  check("config.management.oorDirectionalExitEnabled default false", () =>
-    assert.equal(config.management.oorDirectionalExitEnabled, false));
+  check("config.management.oorDirectionalExitEnabled ON (S4a — separates OOR-up ride vs OOR-down fast-cut)", () =>
+    assert.equal(config.management.oorDirectionalExitEnabled, true));
   check("config.management.outOfRangeWaitMinutesDown present (<= normal)", () => {
     assert.ok(Number.isFinite(config.management.outOfRangeWaitMinutesDown));
     assert.ok(config.management.outOfRangeWaitMinutesDown <= config.management.outOfRangeWaitMinutes);
