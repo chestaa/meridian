@@ -300,10 +300,12 @@ export function scoreCandidate(pool, cfg) {
   const multiSourceBonus = Math.max(0, sourceCount - 1) * 500;
   const symmetryBonus = feeGenSymmetryBonus(pool, cfg);
   const feeTvlBonus = feeTvlHighBonus(pool, cfg);
+  const feeTvlBandBonus = feeTvlBandPreferenceBonus(pool, cfg); // S1 Lyra-inverted
+  const volHighBonus = volatilityHighBonus(pool, cfg);          // S1 +EV vol bias
   const ageBonus = tokenAgeSweetSpotBonus(pool, cfg);
   return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100
-    + multiSourceBonus + symmetryBonus + feeTvlBonus + ageBonus
-    + twoSidedPaperRankBonus(pool);
+    + multiSourceBonus + symmetryBonus + feeTvlBonus + feeTvlBandBonus
+    + volHighBonus + ageBonus + twoSidedPaperRankBonus(pool);
 }
 
 /**
@@ -390,6 +392,88 @@ export function feeTvlHighBonus(pool, cfg) {
   if (feeTvl >= target) return weight;           // king tier → full weight (capped)
   // Linear ramp between floor and target.
   return weight * ((feeTvl - floor) / (target - floor));
+}
+
+/**
+ * Strategy S1 — fee/TVL BAND-preference SCORE BONUS (Lyra-inverted, NEVER a gate).
+ *
+ * GROUND TRUTH (Lyra, 115 real closed trades, wallet-truth realized_sol_delta):
+ * EV by fee/TVL is INVERTED vs the yunus "high fee/TVL = king" thesis that
+ * feeTvlHighBonus encodes. The bucket [0.7,∞) is the SINGLE WORST performer
+ * (-0.1137 per trade, n=42) and only [0.4,0.7) is non-negative (+0.0002). The
+ * feeTvlHighBonus ramp was therefore ACTIVELY STEERING the cost-flat judge slice
+ * toward the losing tail. This bonus is the corrected replacement: award full weight
+ * INSIDE the [feeTvlBandLow, feeTvlBandHigh] sweet band (default 0.40-0.70) and ZERO
+ * outside — including the catastrophic high bucket, which loses its ranking credit.
+ *
+ * WHY A BONUS AND NOT A GATE (Cassiopeia discipline): Lyra found entry features do
+ * NOT cleanly separate winners from losers per-trade — only post-entry market
+ * direction does. A HARD fee/TVL reject on the high bucket would cut ~37% of the
+ * funnel (n=42/115) with no reliable per-trade edge → dormancy + false confidence.
+ * Ranking de-prioritization removes the harmful steer without starving deploys. The
+ * hard reject floor (minFeeActiveTvlRatio, IL-coverage) is unchanged and separate.
+ *
+ * FAIL-SAFE (anti-pattern #2): missing/non-finite/negative fee/TVL → 0 bonus
+ * (NEUTRAL — never penalize, never reject). Mirrors feeTvlHighBonus's fail-safe.
+ *
+ * @param {object} pool - reads pool.fee_active_tvl_ratio (present raw AND condensed).
+ * @param {object} cfg  - config.screening overlay.
+ * @returns {number} bonus points (>= 0). 0 when disabled / missing / outside band.
+ */
+export function feeTvlBandPreferenceBonus(pool, cfg) {
+  if (!cfg || cfg.feeTvlBandPreferenceEnabled !== true) return 0;
+  const weight = numeric(cfg.feeTvlBandPreferenceWeight);
+  if (weight == null || weight <= 0) return 0;
+  const low  = numeric(cfg.feeTvlBandLow);
+  const high = numeric(cfg.feeTvlBandHigh);
+  if (low == null || high == null || high <= low) return 0;
+
+  const feeTvl = numeric(pool?.fee_active_tvl_ratio);
+  // Fail-safe neutral: no usable fee/TVL → no band credit (never penalize).
+  if (feeTvl == null || feeTvl < 0) return 0;
+  if (feeTvl < low || feeTvl > high) return 0;  // outside sweet band → no credit
+  return weight;                                // inside [low, high] → flat full weight
+}
+
+/**
+ * Strategy S1 — volatility HIGH-preference SCORE BONUS (Lyra, NEVER a gate).
+ *
+ * GROUND TRUTH (Lyra, 115 trades): EV by volatility — ONLY the 4.5+ bucket is
+ * positive (+0.0021); the largest bucket [2.5,3.5) (n=47) is still negative
+ * (-0.0032). The minVolatility FLOOR stays 3.0: a hard 3.5 cut previously collapsed
+ * the full-gate page to 1 pool (near-dormancy — see the volatility-floor probe). So
+ * rather than raise the reject floor, we FLOAT the only +EV bucket to the top of the
+ * cost-flat judge slice via a ranking ramp: 0 credit at/below volatilityHighBonusFloor
+ * (3.5), full volatilityHighBonusWeight at/above volatilityHighBonusTarget (4.5),
+ * proportional between, capped above (Lyra found no upper bound — 4.5+ stays +EV).
+ *
+ * WHY A BONUS AND NOT A HARD CUT: anti-dormancy. A hard 4.5 floor would starve the
+ * funnel; ranking bias keeps the [3.0,4.5) tail deployable while preferring the
+ * proven +EV zone. RANKING-only, rejects NOTHING.
+ *
+ * FAIL-SAFE (anti-pattern #2): missing/non-finite/non-positive volatility → 0 bonus
+ * (NEUTRAL). The fail-closed minVolatility floor in getRawPoolScreeningRejectReason
+ * already rejects unknown/zero-vol pools; this bonus never rejects and never fabricates.
+ *
+ * @param {object} pool - reads pool.volatility (condensed) OR pool.volatilityScore.
+ * @param {object} cfg  - config.screening overlay.
+ * @returns {number} bonus points (>= 0). 0 when disabled / missing / at-or-below floor.
+ */
+export function volatilityHighBonus(pool, cfg) {
+  if (!cfg || cfg.volatilityHighBonusEnabled !== true) return 0;
+  const weight = numeric(cfg.volatilityHighBonusWeight);
+  if (weight == null || weight <= 0) return 0;
+  const floor  = numeric(cfg.volatilityHighBonusFloor);
+  const target = numeric(cfg.volatilityHighBonusTarget);
+  if (floor == null || target == null || target <= floor) return 0;
+
+  let vol = numeric(pool?.volatility);
+  if (vol == null) vol = numeric(pool?.volatilityScore);
+  // Fail-safe neutral: no usable / non-positive volatility → no credit (never penalize).
+  if (vol == null || vol <= 0) return 0;
+  if (vol <= floor) return 0;              // below the +EV zone → no preference credit
+  if (vol >= target) return weight;        // proven +EV bucket → full weight (capped)
+  return weight * ((vol - floor) / (target - floor));  // linear ramp toward 4.5+
 }
 
 /**
@@ -3367,6 +3451,8 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // after any enrichment-driven reorder. Pure re-order, never adds/removes a pool.
   const reRankEnabled = eff.feeGenSymmetryBonusEnabled === true
     || eff.feeTvlHighBonusEnabled === true
+    || eff.feeTvlBandPreferenceEnabled === true   // S1 Lyra-inverted fee/TVL band
+    || eff.volatilityHighBonusEnabled === true    // S1 +EV volatility bias
     || eff.tokenAgeSweetSpotBonusEnabled === true;
   if (eligible.length > 1 && reRankEnabled) {
     eligible.sort((a, b) => scoreCandidate(b, eff) - scoreCandidate(a, eff));

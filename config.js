@@ -350,10 +350,51 @@ export const config = {
     // RANKING bonus only (re-sort in getTopCandidates) — it rejects NOTHING and is
     // funnel-neutral, so turning it on cannot starve deploys. It floats fee-dense
     // pools (toward the 0.20 "king" line) to the top of the cost-flat judge slice.
-    feeTvlHighBonusEnabled: u.feeTvlHighBonusEnabled ?? true,
+    // Track-B B1 flipped this ON; Strategy S1 (Cassiopeia 2026-07-17) flips the
+    // DEFAULT back OFF. GROUND TRUTH (Lyra, 115 real closed trades, wallet-truth
+    // realized_sol_delta): EV by fee/TVL is INVERTED vs the yunus "high fee/TVL =
+    // king" thesis — bucket [0.7,∞) is the SINGLE WORST (-0.1137, n=42), and only
+    // [0.4,0.7) is non-negative (+0.0002). The high-ramp bonus was actively STEERING
+    // the judge slice toward the losing bucket. Killing the ramp is the fix; the
+    // Lyra-corrected replacement is feeTvlBandPreference* below. NOTE: live VPS
+    // user-config sets feeTvlHighBonusEnabled=true explicitly, so this default flip
+    // alone does NOT change live — Draco/Bro must set it false in VPS user-config.
+    feeTvlHighBonusEnabled: u.feeTvlHighBonusEnabled ?? false,
     feeTvlHighBonusWeight:  u.feeTvlHighBonusWeight  ?? 250,
     feeTvlHighBonusFloor:   u.feeTvlHighBonusFloor   ?? 0.10,
     feeTvlHighBonusTarget:  u.feeTvlHighBonusTarget  ?? 0.20,
+    // ─── Strategy S1 — fee/TVL BAND-preference score bonus (Lyra-inverted, NEVER a gate) ───
+    // The Lyra-corrected replacement for feeTvlHighBonus. 115-trade ground truth: the
+    // ONLY non-negative fee/TVL bucket is [0.4,0.7) (+0.0002); [0.7,∞) is catastrophic
+    // (-0.1137). So instead of ramping UP toward a "king" line (which lands squarely in
+    // the losing bucket), award full weight INSIDE the [feeTvlBandLow, feeTvlBandHigh]
+    // sweet band and ZERO outside — including the high bucket. This REMOVES the steer
+    // toward the losing tail WITHOUT gating it (entry features don't cleanly separate
+    // winners from losers per Lyra, so a hard fee/TVL reject would just cut ~37% of the
+    // funnel with no reliable edge → dormancy; ranking de-prioritization is the safe
+    // lever). RANKING-only, rejects NOTHING, funnel-neutral. FAIL-SAFE (anti-pattern
+    // #2): missing/non-finite/negative fee/TVL → 0 bonus (NEUTRAL, never penalize).
+    // Default OFF (opt-in — Bro enables after paper-soak). Reloadable.
+    feeTvlBandPreferenceEnabled: u.feeTvlBandPreferenceEnabled ?? false,
+    feeTvlBandPreferenceWeight:  u.feeTvlBandPreferenceWeight  ?? 400,
+    feeTvlBandLow:               u.feeTvlBandLow               ?? 0.40,
+    feeTvlBandHigh:              u.feeTvlBandHigh              ?? 0.70,
+    // ─── Strategy S1 — volatility HIGH-preference score bonus (Lyra, NEVER a gate) ───
+    // GROUND TRUTH (Lyra, 115 trades): EV by volatility — ONLY the 4.5+ bucket is
+    // positive (+0.0021); the largest bucket [2.5,3.5) (n=47) is still negative
+    // (-0.0032). The minVolatility FLOOR stays 3.0 (a hard 3.5 cut collapsed the funnel
+    // to 1 pool — see the volatility-floor probe / anti-dormancy). So we do NOT raise
+    // the floor; instead we FLOAT the only +EV bucket to the top of the cost-flat judge
+    // slice via a ranking ramp from volatilityHighBonusFloor (3.5, 0 credit) to
+    // volatilityHighBonusTarget (4.5, full weight), capped above (no over-reward, no
+    // upper bound in the data). RANKING-only, rejects NOTHING. FAIL-SAFE (anti-pattern
+    // #2): missing/non-finite/non-positive volatility → 0 bonus (NEUTRAL — the fail-
+    // closed minVolatility floor already rejects unknown-vol pools; this never rejects).
+    // Default OFF (opt-in). Reloadable.
+    volatilityHighBonusEnabled: u.volatilityHighBonusEnabled ?? false,
+    volatilityHighBonusWeight:  u.volatilityHighBonusWeight  ?? 300,
+    volatilityHighBonusFloor:   u.volatilityHighBonusFloor   ?? 3.5,
+    volatilityHighBonusTarget:  u.volatilityHighBonusTarget  ?? 4.5,
     // ─── Intel adoption — token-age SWEET-SPOT score bonus (NEVER a gate) ───
     // Community: token-age sweet spot ~12-48h. The literal advice = REPLACE our
     // 24-720h band with 12-48h. We REFUSE to slash maxTokenAgeHours to 48 (would
@@ -1165,6 +1206,14 @@ export function reloadScreeningThresholds() {
     if (fresh.feeTvlHighBonusWeight != null) s.feeTvlHighBonusWeight = fresh.feeTvlHighBonusWeight;
     if (fresh.feeTvlHighBonusFloor  != null) s.feeTvlHighBonusFloor  = fresh.feeTvlHighBonusFloor;
     if (fresh.feeTvlHighBonusTarget != null) s.feeTvlHighBonusTarget = fresh.feeTvlHighBonusTarget;
+    if (fresh.feeTvlBandPreferenceEnabled !== undefined) s.feeTvlBandPreferenceEnabled = fresh.feeTvlBandPreferenceEnabled;
+    if (fresh.feeTvlBandPreferenceWeight  != null) s.feeTvlBandPreferenceWeight  = fresh.feeTvlBandPreferenceWeight;
+    if (fresh.feeTvlBandLow               != null) s.feeTvlBandLow               = fresh.feeTvlBandLow;
+    if (fresh.feeTvlBandHigh              != null) s.feeTvlBandHigh              = fresh.feeTvlBandHigh;
+    if (fresh.volatilityHighBonusEnabled !== undefined) s.volatilityHighBonusEnabled = fresh.volatilityHighBonusEnabled;
+    if (fresh.volatilityHighBonusWeight  != null) s.volatilityHighBonusWeight  = fresh.volatilityHighBonusWeight;
+    if (fresh.volatilityHighBonusFloor   != null) s.volatilityHighBonusFloor   = fresh.volatilityHighBonusFloor;
+    if (fresh.volatilityHighBonusTarget  != null) s.volatilityHighBonusTarget  = fresh.volatilityHighBonusTarget;
     if (fresh.tokenAgeSweetSpotBonusEnabled !== undefined) s.tokenAgeSweetSpotBonusEnabled = fresh.tokenAgeSweetSpotBonusEnabled;
     if (fresh.tokenAgeSweetSpotWeight    != null) s.tokenAgeSweetSpotWeight    = fresh.tokenAgeSweetSpotWeight;
     if (fresh.tokenAgeSweetSpotLowHours  != null) s.tokenAgeSweetSpotLowHours  = fresh.tokenAgeSweetSpotLowHours;
