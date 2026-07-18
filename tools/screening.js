@@ -1288,6 +1288,64 @@ export function isLstMintFreezeExempt(baseMint) {
   return LST_MINT_FREEZE_EXEMPT_MINTS.has(baseMint);
 }
 
+// ─── Curated INSTITUTIONAL-ISSUER mint/freeze-authority EXEMPT set ────────────
+//     (Cassiopeia risk-gate consumer; Vega money-path; Bro decision Option (b), 2026-07-18)
+//
+// ⚠️ TRUST DECISION — this is FUNDAMENTALLY different from LST_MINT_FREEZE_EXEMPT_MINTS
+// above, and the sets are DELIBERATELY SEPARATE for exactly this reason. Do NOT collapse
+// them and do NOT hand-wave "bluechip = safe".
+//
+//   LST exemption  = MECHANISM guarantee. A stake-pool LST's mint authority is an
+//                    OFF-CURVE program PDA (no private key) that can only mint 1:1 vs
+//                    deposited SOL — no human can inflate supply. Mechanically not a rug.
+//
+//   THIS exemption = TRUST guarantee. Draco's on-chain probe (2026-07-18) CONFIRMED cbBTC
+//                    (Coinbase-wrapped BTC, mint cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij)
+//                    holds BOTH a LIVE mint authority (CTQE6PMesbH4szKR9Nk5moj9WWUr9MVGP734wYX9wy3p)
+//                    AND a LIVE freeze authority (DSFAkPhfrSR95J9oq9Sh8rUetbj5vgFmwiSuHw6rAVnz) —
+//                    two SEPARATE on-curve KEYPAIRS held by Coinbase. Coinbase CAN mint
+//                    arbitrary cbBTC and CAN freeze any account. That IS mechanically a rug
+//                    vector; we exempt it ONLY because we TRUST Coinbase (a regulated
+//                    custodian) not to abuse those keys.
+//
+// WORST-CASE, EXPLICIT (Bro approved 2026-07-18): Coinbase — or a compromised Coinbase hot
+// key — FREEZES the cbBTC token account held as the two-sided token-X leg. That leg then
+// STRANDS: it cannot be swapped back to SOL on close. Loss is BOUNDED to the token-X leg
+// notional (~0.1 SOL at the two-sided cap; MAX_TWO_SIDED_NOTIONAL_SOL binds the total, and
+// the X-leg is a fraction of it). The SOL Y-leg + rent are unaffected. No path exists to
+// lose more than the deposited token-X notional from this vector.
+//
+// SCOPE (narrow — mirrors the LST exemption's shape):
+//   - EXACTLY cbBTC, keyed by its EXACT mint address (typosquat / symbol-spoof guard: a
+//     token merely NAMED "cbBTC" with a different mint is NOT exempt — anti-pattern #2).
+//   - ONLY the two authority checks (mint + freeze), ONLY on the curated base leg, ONLY
+//     while the two-sided PAPER lane is active (twoSidedEnabled && DRY_RUN==="true").
+//   - Rug-flag (liquidity removal), bundler, bot-holders, top10, dev_sold_all all STAY
+//     fail-closed enforced. This is NOT a global requireMintRenounced disable.
+//   - LIVE is NOT covered: the exemption never fires in live (lane inactive), AND the live
+//     two-sided chain-leg allow-list (dlmm.executeTwoSidedLiveDeposit → isBaseAllowed:
+//     isLstMintFreezeExempt) is INTENTIONALLY left LST-only, so even a hypothetical flag
+//     flip cannot deposit cbBTC live. Promoting cbBTC to live is a SEPARATE Bro gate.
+const INSTITUTIONAL_ISSUER_MINT_FREEZE_EXEMPT_MINTS = new Set([CBBTC_MINT]);
+
+/**
+ * Is this base mint a curated INSTITUTIONAL-ISSUER wrapped asset (currently cbBTC only)
+ * whose LIVE mint/freeze authority is a TRUSTED regulated custodian (Coinbase), NOT an
+ * off-curve PDA? PURE + unit-tested. Used ONLY to exempt the two mint/freeze authority
+ * checks in the two-sided PAPER lane. This is a TRUST decision (see the set comment above);
+ * the worst case is a BOUNDED token-leg strand on a custodian freeze.
+ *
+ * FAIL-CLOSED (anti-pattern #2): missing mint, non-string, or any non-EXACT-match mint →
+ * false (enforce mint/freeze as normal). Matched by EXACT mint address ONLY — NEVER by
+ * symbol/name (typosquat guard). Kept SEPARATE from isLstMintFreezeExempt on purpose: the
+ * risk basis differs (mechanism-safe PDA vs trusted-custodian keypair), so promoting/removing
+ * one issuer must never silently touch the LST set.
+ */
+export function isInstitutionalIssuerMintFreezeExempt(baseMint) {
+  if (!baseMint || typeof baseMint !== "string") return false;
+  return INSTITUTIONAL_ISSUER_MINT_FREEZE_EXEMPT_MINTS.has(baseMint);
+}
+
 /**
  * Is the paper two-sided lane active? PURE. True only when the master flag is on AND
  * we are in DRY_RUN. Reuses Vega's resolveTwoSidedMode so screening and the money-path
@@ -1360,8 +1418,17 @@ export function twoSidedBaseLegGateReason(pool, s) {
   // call — rejectRugpullFlag (liquidity removal) stays ON, and the bundler / bot / top10
   // / dev_sold_all gates below are UNTOUCHED. Everything else remains fail-closed.
   const { base } = poolLegMints(pool);
+  // TWO SEPARATE exemption bases, SAME paper-lane gating, DIFFERENT risk rationale
+  // (see the two curated-set comments above — do NOT merge the sets):
+  //   - isLstMintFreezeExempt              → stake-pool LST; mint auth = off-curve PDA
+  //                                          (MECHANISM-safe, cannot inflate supply).
+  //   - isInstitutionalIssuerMintFreezeExempt → cbBTC; mint+freeze = TRUSTED Coinbase
+  //                                          keypairs (TRUST decision; bounded token-leg
+  //                                          strand worst case — Bro Option (b) 2026-07-18).
+  // Both fire ONLY while the two-sided PAPER lane is active → NEVER in live / flag-off.
   const mintFreezeExempt =
-    twoSidedPaperLaneActive(config, process.env.DRY_RUN) && isLstMintFreezeExempt(base);
+    twoSidedPaperLaneActive(config, process.env.DRY_RUN) &&
+    (isLstMintFreezeExempt(base) || isInstitutionalIssuerMintFreezeExempt(base));
   const rugParams = mintFreezeExempt
     ? { ...s, requireMintRenounced: false, requireFreezeRenounced: false }
     : s;

@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair, poolLegMints, peekDiscoveryDetailByAddress, peekCandidateEntryScalars, detectMarketRegime, twoSidedPaperLaneActive, isLstMintFreezeExempt } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, isBluechipMintPair, poolLegMints, peekDiscoveryDetailByAddress, peekCandidateEntryScalars, detectMarketRegime, twoSidedPaperLaneActive, isLstMintFreezeExempt, isInstitutionalIssuerMintFreezeExempt } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -175,6 +175,43 @@ function isTwoSidedPaperLstExempt(args, detail = null) {
   return false;
 }
 
+// ── Two-sided PAPER-lane curated INSTITUTIONAL-ISSUER deploy exemption ──────────
+//    (Vega — money-path, paper-isolated; Bro Option (b) 2026-07-18) ─────────────
+// SAME deploy-side POOL-STRUCTURE threshold treatment as the curated-LST exemption above
+// (maxTvl ceiling skip, vol floor→ceiling, binStep floor skip, fee/TVL floor dropped) for a
+// deep, low-fee/TVL institutional-wrapped pair (cbBTC-SOL). These four gates are about POOL
+// STRUCTURE (TVL / fee-yield / vol / bin_step) — they do NOT care about issuer trust: a deep
+// BTC pool carries the same benign TVL/fee/vol/binStep profile as an LST pair, so it needs the
+// same re-targeting. The issuer-TRUST risk (Coinbase active mint+freeze; bounded token-leg
+// strand worst case) is enforced SEPARATELY and upstream in the screening base-leg gate
+// (isInstitutionalIssuerMintFreezeExempt inside twoSidedBaseLegGateReason), NOT here.
+//
+// Fires ONLY when BOTH hold (HARD ISOLATION — mirrors isTwoSidedPaperLstExempt):
+//   1. twoSidedPaperLaneActive(config, DRY_RUN) === true → NEVER true in live / flag-off.
+//   2. base is EXACTLY cbBTC (isInstitutionalIssuerMintFreezeExempt) — EXACT mint match only.
+// Base resolves from args metadata OR the AUTHORITATIVE on-chain detail legs (poolLegMints).
+// FAIL-CLOSED (anti-pattern #2): lane inactive / non-curated / unresolvable base → NOT exempt.
+function isTwoSidedPaperInstitutionalExempt(args, detail = null) {
+  if (!twoSidedPaperLaneActive(config, process.env.DRY_RUN)) return false;
+  const legs = detail ? poolLegMints(detail) : { base: null, quote: null };
+  const argBase = args?.base_mint ?? args?.base_address ?? null;
+  if (argBase && isInstitutionalIssuerMintFreezeExempt(argBase)) return true;
+  if (legs.base && isInstitutionalIssuerMintFreezeExempt(legs.base)) return true;
+  return false;
+}
+
+// Combined two-sided PAPER-lane curated-base deploy exemption: curated LST OR curated
+// institutional issuer. Drives the deploy-side POOL-STRUCTURE threshold re-targeting (both
+// lanes share the deep / low-fee / stable pool profile). The per-lane RISK distinction lives
+// in the screening base-leg gate (mechanism-safe PDA vs trusted-custodian keypair), NOT here.
+// Fail-closed: false unless one of the two curated exemptions fires (each lane-gated + exact).
+function isTwoSidedPaperExempt(args, detail = null) {
+  return (
+    isTwoSidedPaperLstExempt(args, detail) ||
+    isTwoSidedPaperInstitutionalExempt(args, detail)
+  );
+}
+
 // Test seams — exercise the pure binStep-exemption decision + sanity bound in isolation.
 export function __isBluechipBinStepExemptForTests(args, detail = null) {
   return isBluechipBinStepExempt(args, detail);
@@ -184,6 +221,12 @@ export function __bluechipBinStepSanityRejectForTests(binStep) {
 }
 export function __isTwoSidedPaperLstExemptForTests(args, detail = null) {
   return isTwoSidedPaperLstExempt(args, detail);
+}
+export function __isTwoSidedPaperInstitutionalExemptForTests(args, detail = null) {
+  return isTwoSidedPaperInstitutionalExempt(args, detail);
+}
+export function __isTwoSidedPaperExemptForTests(args, detail = null) {
+  return isTwoSidedPaperExempt(args, detail);
 }
 
 function poolDetailFeeActiveTvlRatio(pool) {
@@ -598,16 +641,20 @@ async function validateDeployPoolThresholds(args) {
   // (no maxTvl ceiling; bluechip fee/TVL floor; vol ceiling). Non-whitelist or flag
   // OFF → memecoin path below, byte-for-byte unchanged. FAIL-CLOSED throughout.
   const isBluechipExempt = isBluechipBinStepExempt(args, detail);
-  // Two-sided PAPER-lane curated-LST exemption (paper-isolated). See isTwoSidedPaperLstExempt:
-  // NEVER true in live / flag-off / non-LST. When true, the maxTvl ceiling (GATE 1), vol floor
-  // (GATE 3) and binStep range are re-targeted exactly like the bluechip lane; the fee/TVL floor
-  // (GATE 2) is DROPPED to mirror screening's twoSidedPaperBluechipGateReason (low fee/TVL is the
-  // EXPECTED profile of a ~1% APR symmetric LST-SOL pair — applying even bluechipMinFeeTvlRatio
-  // 0.03 would RE-BLOCK the exact pool this lane exists to paper-validate).
-  const isPaperLstExempt = isTwoSidedPaperLstExempt(args, detail);
+  // Two-sided PAPER-lane curated-base exemption (paper-isolated). See isTwoSidedPaperExempt:
+  // NEVER true in live / flag-off / non-curated. Covers BOTH the curated LST lane
+  // (isTwoSidedPaperLstExempt) AND the curated institutional-issuer lane
+  // (isTwoSidedPaperInstitutionalExempt → cbBTC, Bro Option (b) 2026-07-18). When true, the
+  // maxTvl ceiling (GATE 1), vol floor (GATE 3) and binStep range are re-targeted exactly like
+  // the bluechip lane; the fee/TVL floor (GATE 2) is DROPPED to mirror screening's
+  // twoSidedPaperBluechipGateReason (low fee/TVL is the EXPECTED profile of a deep symmetric /
+  // institutional-wrapped pair — applying even bluechipMinFeeTvlRatio 0.03 would RE-BLOCK the
+  // exact pool this lane exists to paper-validate). This is a POOL-STRUCTURE re-target only; the
+  // issuer-TRUST risk for cbBTC is enforced upstream by screening's twoSidedBaseLegGateReason.
+  const isPaperExempt = isTwoSidedPaperExempt(args, detail);
   // Deep-pool exemption drives the maxTvl ceiling skip, the vol floor→ceiling inversion and the
-  // binStep floor skip for EITHER the bluechip income lane OR the two-sided paper LST lane.
-  const isDeepExempt = isBluechipExempt || isPaperLstExempt;
+  // binStep floor skip for EITHER the bluechip income lane OR the two-sided paper curated lane.
+  const isDeepExempt = isBluechipExempt || isPaperExempt;
 
   const tvl = poolDetailTvl(detail);
   const minTvl = numberOrNull(config.screening.minTvl);
@@ -641,16 +688,16 @@ async function validateDeployPoolThresholds(args) {
     .filter((value) => value != null)
     .reduce((best, value) => Math.max(best, value), -Infinity);
   // GATE 2 — fee/TVL floor, per-lane:
-  //   - two-sided paper LST lane → DROPPED (null, no floor). Mirrors screening's
-  //     twoSidedPaperBluechipGateReason: low fee/TVL is the EXPECTED profile of a ~1% APR
-  //     symmetric SOL-tracking pair with near-zero IL; the yield bar is the exact inversion
-  //     trap that would RE-BLOCK the pool. Paper lane is DRY_RUN-only → dropping a yield
-  //     bar carries ZERO money risk (base-leg rug/safety enforced upstream by Cassiopeia).
+  //   - two-sided paper curated lane (LST or institutional-issuer) → DROPPED (null, no floor).
+  //     Mirrors screening's twoSidedPaperBluechipGateReason: low fee/TVL is the EXPECTED profile
+  //     of a deep symmetric / institutional-wrapped pair with near-zero IL; the yield bar is the
+  //     exact inversion trap that would RE-BLOCK the pool. Paper lane is DRY_RUN-only → dropping
+  //     a yield bar carries ZERO money risk (base-leg rug/safety enforced upstream by Cassiopeia).
   //   - bluechip income lane → LOWER bluechipMinFeeTvlRatio (0.03, ~11% APR).
   //   - memecoin → full minFeeActiveTvlRatio (0.10).
   // Still FAIL-CLOSED for the memecoin + bluechip lanes: a missing fee/TVL reading is rejected
-  // (never default to passing). The paper LST lane intentionally has no floor to reject against.
-  const effectiveFeeFloor = isPaperLstExempt
+  // (never default to passing). The paper curated lane intentionally has no floor to reject against.
+  const effectiveFeeFloor = isPaperExempt
     ? null
     : isBluechipExempt
       ? numberOrNull(config.screening.bluechipMinFeeTvlRatio)
@@ -1464,7 +1511,7 @@ async function runSafetyChecks(name, args) {
       // memecoin range below, byte-for-byte unchanged. Whitelist is NON-NEGOTIABLE.
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
-      if (isBluechipBinStepExempt(args) || isTwoSidedPaperLstExempt(args)) {
+      if (isBluechipBinStepExempt(args) || isTwoSidedPaperExempt(args)) {
         const sanity = bluechipBinStepSanityReject(
           args.bin_step != null ? Number(args.bin_step) : null,
         );
