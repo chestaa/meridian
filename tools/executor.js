@@ -140,6 +140,54 @@ function bluechipBinStepSanityReject(binStep) {
   return null;
 }
 
+// ── Pre-deploy LLM-supplied bin_step gate (Vega — money-path, pure + testable) ──
+// The SECOND bin_step check (the first is the on-chain check inside
+// validateDeployPoolThresholds). This one validates the LLM/agent-SUPPLIED
+// `args.bin_step` against the lane verdict. `isDeepExempt` is the AUTHORITATIVE
+// lane decision (bluechip income lane OR two-sided paper curated lane) that
+// validateDeployPoolThresholds already resolved against the ON-CHAIN pool `detail`
+// legs — it MUST be threaded in here rather than re-derived from `args` alone,
+// which lacks the optional base_mint on most Orion→agent deploy calls (the exact
+// cbBTC-SOL 2026-07-18 false "[80-200]" block: args had bin_step 2 + no base_mint,
+// so the old inline args-only exemption fail-closed to the memecoin range even
+// though the sibling on-chain check passed the pool as deep-exempt).
+//   - deep-exempt lane → only the sane absolute bound (bluechipBinStepSanityReject):
+//     a fine bin_step (1,2,4…) passes; 0/negative/non-integer/over-ceiling refused.
+//   - memecoin lane     → the [minStep,maxStep] range applies (byte-for-byte unchanged).
+// FAIL-CLOSED (anti-pattern #2): isDeepExempt !== true → memecoin range, never a skip.
+// Returns a reject reason string, or null when the bin_step is acceptable.
+export function deployBinStepGateReason(args, isDeepExempt, minStep, maxStep) {
+  if (isDeepExempt === true) {
+    return bluechipBinStepSanityReject(args?.bin_step != null ? Number(args.bin_step) : null);
+  }
+  if (args?.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
+    return `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].`;
+  }
+  return null;
+}
+
+// ── Pre-deploy LLM-supplied volatility gate (Vega — money-path, pure + testable) ──
+// MEMECOIN: volatility is a >0 FLOOR (a stable/dead memecoin generates no fees = refuse).
+// DEEP-EXEMPT lane (bluechip income / two-sided paper curated): volatility is a CEILING
+// already enforced on-chain by validateDeployPoolThresholds GATE 3 — a deep stable pair
+// (cbBTC-SOL / SOL-USDC / LST-SOL) legitimately reads ~0 and that is the GOOD state — so
+// the deep lane refuses only a NEGATIVE or non-finite garbage reading, never a calm 0/low
+// value. `isDeepExempt` is the SAME authoritative verdict threaded into the binStep gate:
+// `args` alone cannot classify the lane, and a memecoin vol floor mis-applied to a deep
+// stable pair is the exact cbBTC-SOL 2026-07-18 false-block class. FAIL-CLOSED (anti-pattern
+// #2): verdict !== true → memecoin floor. Returns a reject reason string, or null if ok.
+export function deployVolatilityGateReason(args, isDeepExempt) {
+  if (args?.volatility == null) return null;
+  const v = Number(args.volatility);
+  const bad = isDeepExempt === true
+    ? (!Number.isFinite(v) || v < 0)
+    : (!Number.isFinite(v) || v <= 0);
+  if (bad) {
+    return `volatility ${args.volatility} is invalid. Refusing deploy because the volatility feed is unusable.`;
+  }
+  return null;
+}
+
 // ── Two-sided PAPER-lane curated-LST deploy exemption (Vega — money-path, paper-isolated) ──
 // The FINAL Track-A paper blocker: a deep-TVL curated LST-SOL income pair (JitoSOL/mSOL/
 // jupSOL-SOL) surfaces → passes the strict screening gate (via twoSidedPaperBluechipGateReason,
@@ -797,7 +845,12 @@ async function validateDeployPoolThresholds(args) {
     }
   }
 
-  return { pass: true };
+  // Return the AUTHORITATIVE deep-exempt verdict resolved HERE against the on-chain
+  // pool `detail` legs (poolLegMints), so the SECOND bin_step gate in runSafetyChecks
+  // reuses the SAME verdict via deployBinStepGateReason instead of re-deriving it from
+  // `args` alone (which lacks base_mint on most agent/judge deploy calls → the cbBTC-SOL
+  // 2026-07-18 false "[80-200]" block). SINGLE SOURCE OF TRUTH for the lane classification.
+  return { pass: true, isDeepExempt };
 }
 
 // Test seam: exercise the full pre-deploy threshold verify (incl. 429 ride-through
@@ -1503,26 +1556,24 @@ async function runSafetyChecks(name, args) {
         }
       }
 
-      // Reject pools with bin_step out of configured range.
-      // Bluechip deploy-side exemption (Vega — Opsi B, money-path): a WHITELIST
-      // bluechip pair (flag ON) is exempt from the memecoin [minBinStep,maxBinStep]
-      // range (SOL-USDC bin_step=1). A sane absolute bound still applies (fail-closed:
-      // 0/negative/non-integer/over-ceiling refused). Non-whitelist or flag OFF →
-      // memecoin range below, byte-for-byte unchanged. Whitelist is NON-NEGOTIABLE.
+      // Reject pools with an LLM-supplied bin_step out of the lane's allowed range.
+      // Bluechip deploy-side exemption (Vega — Opsi B, money-path): a WHITELIST bluechip
+      // pair OR a two-sided PAPER curated-base pair is exempt from the memecoin
+      // [minBinStep,maxBinStep] range (SOL-USDC bin_step=1, cbBTC-SOL/LST-SOL bin_step=2/4).
+      // A sane absolute bound still applies inside the exempt lane (fail-closed:
+      // 0/negative/non-integer/over-ceiling refused). Non-whitelist / flag OFF / lane
+      // inactive → memecoin range, byte-for-byte unchanged. Whitelist is NON-NEGOTIABLE.
+      //
+      // CRITICAL (cbBTC-SOL 2026-07-18): the exemption verdict is the AUTHORITATIVE
+      // `poolThresholds.isDeepExempt` resolved by validateDeployPoolThresholds against the
+      // on-chain `detail` legs — NOT a re-derivation from `args`, which omits base_mint on
+      // most Orion→agent deploy calls and made this gate fail-closed to the memecoin range
+      // while the sibling on-chain check already passed the pool as deep-exempt.
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
-      if (isBluechipBinStepExempt(args) || isTwoSidedPaperExempt(args)) {
-        const sanity = bluechipBinStepSanityReject(
-          args.bin_step != null ? Number(args.bin_step) : null,
-        );
-        if (sanity) {
-          return { pass: false, reason: sanity };
-        }
-      } else if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
-        return {
-          pass: false,
-          reason: `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].`,
-        };
+      const binStepReject = deployBinStepGateReason(args, poolThresholds.isDeepExempt, minStep, maxStep);
+      if (binStepReject) {
+        return { pass: false, reason: binStepReject };
       }
 
       const deployAmountY = Number(args.amount_y ?? args.amount_sol ?? 0);
@@ -1543,12 +1594,14 @@ async function runSafetyChecks(name, args) {
       const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
       const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
       const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
-      const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
-      if (args.volatility != null && (!Number.isFinite(requestedVolatility) || requestedVolatility <= 0)) {
-        return {
-          pass: false,
-          reason: `volatility ${args.volatility} is invalid. Refusing deploy because the volatility feed is unusable.`,
-        };
+      // LLM-supplied volatility validity, per lane. Memecoin = >0 floor; deep-exempt =
+      // stable ~0 is GOOD (vol CEILING already ran in validateDeployPoolThresholds), only
+      // garbage/negative refused. Authoritative verdict threaded from poolThresholds — same
+      // fix class as the binStep gate. Memecoin path byte-for-byte unchanged. See
+      // deployVolatilityGateReason.
+      const volReject = deployVolatilityGateReason(args, poolThresholds.isDeepExempt);
+      if (volReject) {
+        return { pass: false, reason: volReject };
       }
       if (
         args.downside_pct == null &&
