@@ -92,8 +92,9 @@ console.log("\n— 2. THE FIX: paper gate PASSES the deep LST-SOL pool —");
 
 console.log("\n— 3. STRUCTURE STILL BITES (deep-TVL / mcap / vol-ceiling kept) —");
 {
-  check("thin fake-bluechip (tvl 5k) → rejected below bluechipMinTvl",
-    twoSidedPaperBluechipGateReason(jitoSolDeep({ tvl: 5_000 }), S) === "two_sided_paper tvl 5000 below bluechipMinTvl 200000");
+  // S carries no twoSidedPaperMinTvl → the paper tvl floor falls back to bluechipMinTvl (200k).
+  check("thin fake-bluechip (tvl 5k) → rejected below the paper tvl floor (fallback = bluechipMinTvl)",
+    twoSidedPaperBluechipGateReason(jitoSolDeep({ tvl: 5_000 }), S) === "two_sided_paper tvl 5000 below paper tvl floor 200000");
   check("small-cap base (mcap 1M) → rejected below bluechipMinMcap",
     twoSidedPaperBluechipGateReason(jitoSolDeep({ token_x: { mint: JITOSOL, market_cap: 1_000_000 } }), S) === "two_sided_paper mcap 1000000 below bluechipMinMcap 50000000");
   check("wild-vol de-peg (vol 3.0) → rejected above bluechipMaxVolatility",

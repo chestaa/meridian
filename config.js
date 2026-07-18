@@ -491,6 +491,31 @@ export const config = {
     // never runs in live/flag-off). Set 0 to disable a floor.
     twoSidedPaperMinVolume:      u.twoSidedPaperMinVolume      ?? 500,  // abs 24h volume floor — primary "alive" bar (drops $0-vol zombies, keeps 3/22 live)
     twoSidedPaperMinFeeTvlRatio: u.twoSidedPaperMinFeeTvlRatio ?? 0,    // fee/TVL floor — OFF by default (available for Draco soak-tuning; 0.0005 keeps the 3 live, 0.03 income bar zeroes the funnel)
+    // ─── Two-sided PAPER TVL floor (Cassiopeia — S2 paper-lane blocker #4) ───────
+    // PAPER-ONLY override of the DEEP-liquidity floor for the two-sided paper gate.
+    // bluechipMinTvl (200k) is INSTITUTIONAL depth for a live single-side income deploy
+    // (0.5 SOL, wants a deep book so it never moves price / gets sandwiched). A two-sided
+    // PAPER position is capped at ~0.2 SOL (~$30) — <0.1% of even a $30k pool — so depth
+    // is NOT a real risk for a paper MEASUREMENT; the floor's only job here is rejecting
+    // dust/fake pools whose fee data would be non-representative. The deepest genuine
+    // cbBTC-SOL pools live at $63k-$99k TVL — the 200k institutional floor dropped every
+    // one of them BEFORE the mint/base-leg gate. This floor OVERRIDES bluechipMinTvl ONLY
+    // inside twoSidedPaperBluechipGateReason (which never runs in live/flag-off), so the
+    // live/income bluechipMinTvl is byte-UNTOUCHED. FAIL-CLOSED: floor active + missing
+    // TVL → reject (anti-pattern #2). Unset (null/0) → falls back to bluechipMinTvl (the
+    // STRICTER floor — fail-safe). Set 0 to disable and inherit bluechipMinTvl.
+    twoSidedPaperMinTvl:         u.twoSidedPaperMinTvl         ?? 25_000, // paper-lane deep-liquidity floor (admits $63k-$99k cbBTC-SOL; rejects <$25k dust)
+    // ─── Two-sided PAPER activity window (Cassiopeia — S2 paper-lane blocker #5) ──
+    // The window (timeframe) the two-sided paper SUPPLEMENT fetches its metrics at. The
+    // live screening timeframe is 1h (right for volatile memecoins), but a low-FREQUENCY
+    // bluechip pair (cbBTC-SOL trades ~11 swaps/hr, clumped) legitimately reads volume=0 /
+    // fee-TVL=0 / vol=0 in most 1h windows even though it does ~$46k / 268 swaps over 24h.
+    // At 1h the activity floor wrongly killed it as a zombie AND the judge saw a "dead"
+    // pool. A 24h window reflects the pool's REAL economic activity — and STILL cleanly
+    // drops the genuinely-dead $0-over-24h pools (better discrimination than 1h). Used
+    // ONLY by fetchTwoSidedPaperSupplement (a hard no-op in live/flag-off), so live
+    // discovery is byte-UNTOUCHED. Unset → falls back to the screening timeframe.
+    twoSidedPaperTimeframe:      u.twoSidedPaperTimeframe      ?? "24h", // low-freq bluechip pairs read empty at 1h; 24h = real activity
     // Opsi-1/B (single-side SOL) deployability guard: a bluechip pool is deployable only
     // if wSOL is its tokenY (QUOTE) leg — the side SOL can be deposited on-chain. Default
     // true → pools with wSOL on the BASE side (SOL-USDC, SOL-mSOL → on-chain 0x1) AND
@@ -1249,6 +1274,8 @@ export function reloadScreeningThresholds() {
     if (fresh.bluechipBroadMcapCeil  != null) s.bluechipBroadMcapCeil  = fresh.bluechipBroadMcapCeil;
     if (fresh.twoSidedPaperMinVolume      != null) s.twoSidedPaperMinVolume      = fresh.twoSidedPaperMinVolume;
     if (fresh.twoSidedPaperMinFeeTvlRatio != null) s.twoSidedPaperMinFeeTvlRatio = fresh.twoSidedPaperMinFeeTvlRatio;
+    if (fresh.twoSidedPaperMinTvl         != null) s.twoSidedPaperMinTvl         = fresh.twoSidedPaperMinTvl;
+    if (fresh.twoSidedPaperTimeframe      != null) s.twoSidedPaperTimeframe      = fresh.twoSidedPaperTimeframe;
     if (fresh.requireBluechipWsolLeg !== undefined) s.requireBluechipWsolLeg = fresh.requireBluechipWsolLeg;
     if (fresh.bluechipOnlyMode       !== undefined) s.bluechipOnlyMode       = fresh.bluechipOnlyMode;
     if (fresh.bluechipMaxBinStep     != null) s.bluechipMaxBinStep     = fresh.bluechipMaxBinStep;

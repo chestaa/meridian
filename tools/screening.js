@@ -1508,14 +1508,28 @@ export function twoSidedPaperBluechipGateReason(pool, s) {
   const mcap = strictNumeric(pool?.token_x?.market_cap ?? pool?.mcap ?? pool?.market_cap);
   const volatility = strictNumeric(pool?.volatility);
 
-  const minTvl = numeric(s?.bluechipMinTvl);
+  // DEEP-liquidity floor — PAPER-ONLY override (S2 blocker #4). bluechipMinTvl ($200k)
+  // is institutional depth for a live 0.5-SOL single-side income deploy; a ~0.2-SOL
+  // (~$30) two-sided PAPER position is <0.1% of even a $30k pool, so depth is not a real
+  // risk for a paper MEASUREMENT — the deepest genuine cbBTC-SOL pools ($63k-$99k TVL)
+  // were all dropped by the 200k floor BEFORE the base-leg gate. twoSidedPaperMinTvl
+  // (default $25k) OVERRIDES bluechipMinTvl HERE ONLY. This gate runs exclusively for
+  // isTwoSidedPaperCandidate pools (paper lane active) → the live/income bluechipMinTvl is
+  // byte-UNTOUCHED. FAIL-SAFE: unset/0 twoSidedPaperMinTvl → fall back to bluechipMinTvl
+  // (the STRICTER floor — never silently loosen if the paper key is cleared).
+  const paperMinTvl = numeric(s?.twoSidedPaperMinTvl);
+  const minTvl = (paperMinTvl != null && paperMinTvl > 0)
+    ? paperMinTvl
+    : numeric(s?.bluechipMinTvl);
   const minMcap = numeric(s?.bluechipMinMcap);
   const maxVola = numeric(s?.bluechipMaxVolatility);
 
   // DEEP-liquidity floor (structure) — KEPT. Deep pools pass; thin ones rejected.
+  // minTvl is the paper override (twoSidedPaperMinTvl) or, unset, the fallback
+  // bluechipMinTvl — so the message names the effective floor generically.
   if (minTvl != null && minTvl > 0) {
     if (tvl == null) return "two_sided_paper_tvl_unknown";
-    if (tvl < minTvl) return `two_sided_paper tvl ${tvl} below bluechipMinTvl ${minTvl}`;
+    if (tvl < minTvl) return `two_sided_paper tvl ${tvl} below paper tvl floor ${minTvl}`;
   }
   // Large-cap confirmation (structure) — KEPT.
   if (minMcap != null && minMcap > 0) {
@@ -2549,12 +2563,23 @@ export async function fetchTwoSidedPaperSupplement(s) {
 
   const filters = buildTwoSidedPaperSupplementFilters(s);
   const pageSize = numeric(s.broadDiscoveryPageSize) ?? 1000;
+  // ACTIVITY WINDOW (S2 blocker #5): fetch at twoSidedPaperTimeframe (default 24h), NOT
+  // the live screening timeframe (1h). A low-FREQUENCY bluechip pair (cbBTC-SOL: ~11
+  // clumped swaps/hr) legitimately reads volume=0 / fee-TVL=0 / vol=0 in most 1h windows
+  // even though it does ~$46k / 268 swaps over 24h — at 1h the activity floor killed it
+  // as a zombie AND the judge saw a "dead" pool. A 24h window gives the merged pool REAL
+  // activity metrics (volume/fee/vol survive downstream — the later vol-refetch passes
+  // touch ONLY volatility, and native-detail enrich back-fills volume only when null, so
+  // a present 24h volume is never clobbered). Fall back to the screening timeframe if the
+  // key is unset. Own cache key (timeframe is part of the key) → no collision with the 1h
+  // main fetch. Hard no-op in live/flag-off (this fn already returned [] above).
+  const supplementTimeframe = s.twoSidedPaperTimeframe || s.timeframe;
   let data;
   try {
     data = await fetchPoolDiscoveryPage({
       page_size: pageSize,
       filters,
-      timeframe: s.timeframe,
+      timeframe: supplementTimeframe,
       category: s.category,
       sort_by: "tvl:desc", // deep pools FIRST — surfaces low-fee/TVL deep LST-SOL pools
     });
@@ -3276,6 +3301,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         // for stablecoins/LSTs (a stablecoin's "top holders" are protocols/CEXes by
         // design). Flag OFF → never reached as bluechip. Audit still surfaced above.
         if (isBluechipPool(p, eff)) return true;
+        // Two-sided PAPER candidate (Cassiopeia — S2 defense-in-depth): DECOUPLE the paper
+        // lane from bluechipModeEnabled. With that master flag OFF, isBluechipPool is false,
+        // so a two-sided paper cbBTC/LST-SOL pool would wrongly hit this memecoin gate. The
+        // held base leg's bot/top10 is re-enforced downstream (fail-closed) by
+        // twoSidedBaseLegGateReason regardless — so exempt here and let that be the single
+        // enforcement point. INERT in live/flag-off (isTsp false); redundant while
+        // bluechipModeEnabled is on (isBluechipPool already exempts) → zero change today.
+        if (isTwoSidedPaperCandidate(p, config, process.env.DRY_RUN)) return true;
 
         if (botGateActive) {
           if (botPct == null) {
@@ -3460,6 +3493,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         // freeze authorities are protocol-controlled by design → rug/mint/freeze gates
         // are irrelevant. Flag OFF → never reached as bluechip.
         if (isBluechipPool(p, eff)) return true;
+        // Two-sided PAPER candidate (Cassiopeia — S2 defense-in-depth): decouple from
+        // bluechipModeEnabled. This memecoin rug gate has NO mint/freeze exemption, so with
+        // the master flag OFF a cbBTC/LST base leg (LIVE mint authority by design/custody)
+        // dies here on `mint_authority_not_renounced` BEFORE reaching twoSidedBaseLegGateReason,
+        // where the curated LST/institutional exemption + rug-flag/liquidity-removal
+        // enforcement actually live. Exempt here → base-leg gate is the single, correct
+        // enforcement point. INERT in live/flag-off; redundant while bluechipModeEnabled on.
+        if (isTwoSidedPaperCandidate(p, config, process.env.DRY_RUN)) return true;
         const reason = rugGateRejectReason(p, eff);
         if (reason) {
           log("screening", `Rug gate: dropped ${p.name} — ${reason}`);
@@ -3482,6 +3523,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         // Bluechip exempt (Cassiopeia — Wave 2): no "dev" to have sold. Flag OFF →
         // never reached as bluechip.
         if (isBluechipPool(p, eff)) return true;
+        // Two-sided PAPER candidate (Cassiopeia — S2 defense-in-depth): decouple from
+        // bluechipModeEnabled — dev_sold_all is re-enforced downstream on the held base
+        // leg by twoSidedBaseLegGateReason. INERT in live/flag-off; redundant while on.
+        if (isTwoSidedPaperCandidate(p, config, process.env.DRY_RUN)) return true;
         if (devSoldAllShouldReject(p, eff)) {
           const reason = eff.devSoldAllRequiresHighConcentration === false
             ? "dev_sold_all"

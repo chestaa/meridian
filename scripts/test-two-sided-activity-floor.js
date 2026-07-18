@@ -138,9 +138,11 @@ console.log("\n— 5. fee/TVL floor: OFF by default, gates fail-closed when enab
 console.log("\n— 6. COMPOSITION: structure gates bite BEFORE the activity floor —");
 {
   // A thin fake-bluechip pool with $0 vol is rejected on TVL (structure) first, NOT on
-  // the activity floor — structure/stability precedence is preserved.
-  check("thin pool ($5k TVL) → rejected on bluechipMinTvl first",
-    twoSidedPaperBluechipGateReason(jitoSolDead({ tvl: 5_000 }), S) === "two_sided_paper tvl 5000 below bluechipMinTvl 200000");
+  // the activity floor — structure/stability precedence is preserved. S carries no
+  // twoSidedPaperMinTvl → the floor falls back to bluechipMinTvl (200k), and the reject
+  // message names the effective paper tvl floor generically.
+  check("thin pool ($5k TVL) → rejected on the paper tvl floor first (fallback = bluechipMinTvl)",
+    twoSidedPaperBluechipGateReason(jitoSolDead({ tvl: 5_000 }), S) === "two_sided_paper tvl 5000 below paper tvl floor 200000");
   check("small-cap base → rejected on bluechipMinMcap first",
     twoSidedPaperBluechipGateReason(jitoSolDead({ token_x: { mint: JITOSOL, market_cap: 1_000_000 } }), S)
       === "two_sided_paper mcap 1000000 below bluechipMinMcap 50000000");
