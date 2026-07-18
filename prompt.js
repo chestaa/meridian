@@ -150,7 +150,14 @@ WHAT A GOOD BLUECHIP LOOKS LIKE (these are GREEN flags, not concerns):
   apply. Bluechip IL is far smaller, so a lower fee yield is justified. Treat
   fee/TVL ${bcMinFeeTvl}–0.10 as solid, not "low".
 - DEEP TVL (>= $${bcMinTvl.toLocaleString("en-US")}) — depth IS the edge here: a tight
-  active range around the peg captures steady fees with minimal directional risk.
+  active range around the peg captures steady fees with minimal directional risk. There
+  is NO maximum-TVL cap for a bluechip — the memecoin max-TVL ceiling (e.g. $150K) does
+  NOT apply. Multi-million-dollar TVL is EXPECTED and GOOD; never skip a bluechip for
+  "TVL too high" or "above the max-TVL cap".
+- MCAP — a bluechip base leg (SOL/USDC/USDT/cbBTC/staked-SOL) has a market cap in the
+  BILLIONS. The memecoin mcap band (150k-10M) does NOT apply: a large base-asset mcap
+  CONFIRMS a genuine large-cap and is a GREEN flag, never a skip reason. There is NO
+  maximum mcap for a bluechip.
 
 BLUECHIP DECISION FRAMEWORK — ENTER when ALL hold:
   1. Pool is a whitelisted both-legs bluechip pair.
@@ -160,9 +167,11 @@ BLUECHIP DECISION FRAMEWORK — ENTER when ALL hold:
      (it means the "stable" pair is de-pegging / book is thin) → then SKIP. Vola
      at/below ${bcMaxVola} (including ~0) is fine.
 DO NOT apply memecoin reasons to a bluechip: do NOT skip for small bin_step, low
-volatility, "low" fee/TVL, missing narrative, no smart wallets, top10/bundlers, or
-"no hype". Those are memecoin risk signals and are IRRELEVANT to a stable bluechip
-income position. The minTokenFeesSol global-fee floor also does NOT gate bluechips.
+volatility, "low" fee/TVL, HIGH TVL / "above the max-TVL cap" / "TVL too high", a
+billions-size mcap / "outside the mcap band", low or missing organic score, missing
+narrative, no smart wallets, top10/bundlers, or "no hype". Those are memecoin risk
+signals and are IRRELEVANT to a stable bluechip income position. The minTokenFeesSol
+global-fee floor also does NOT gate bluechips.
 
 BINS_BELOW for bluechip: a bluechip may use a WIDE range up to ${bcMaxBinsBelow} bins below
 (wide = the whole point — fewer rebalances, steady fee capture across a stable band).

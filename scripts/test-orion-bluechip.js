@@ -80,6 +80,11 @@ await judgeCandidates([solUsdc], { portfolio: { sol: 2.5 }, positions: { total_p
 check("OFF: system prompt has NO bluechip block", !/BLUECHIP INCOME-ENGINE MODE IS ON/.test(sysOf(0)));
 check("OFF: system prompt keeps memecoin bins range [35,69]", /\[35,69\]/.test(sysOf(0)));
 check("OFF: candidate.is_bluechip is false (flag off)", userOf(0).candidate.is_bluechip === false);
+// Prompt-bleed guard: the max-TVL / mcap-band EXEMPTION must NOT leak into the
+// memecoin lane — memecoins DO respect the TVL band + mcap band (base SYSTEM_PROMPT).
+check("OFF: NO max-TVL-cap exemption in memecoin prompt", !/NO maximum-TVL cap for a bluechip/.test(sysOf(0)));
+check("OFF: NO $150K-does-not-apply exemption in memecoin prompt", !/\$150K/.test(sysOf(0)));
+check("OFF: memecoin base prompt still lists TVL band + mcap band as criteria", /TVL band/.test(sysOf(0)) && /mcap band/.test(sysOf(0)));
 
 // ── Scenario B: bluechip mode ON + SOL-USDC (the soak blocker) ─────────────────
 config.screening.bluechipModeEnabled = true;
@@ -94,8 +99,17 @@ check("ON: prompt tells judge to accept small bin_step", /NEVER skip a bluechip 
 check("ON: prompt says low volatility is GOOD for bluechip", /LOW \/ near-zero volatility is GOOD/.test(sysB));
 check("ON: prompt states bluechip fee/TVL bar 0.03 (not memecoin 0.10)", /income fee\/TVL bar is 0\.03/.test(sysB));
 check("ON: prompt allows wide bins_below up to 250", /up to 250/.test(sysB));
+// Prompt-bleed FIX (the soak blocker): bluechip prompt must EXPLICITLY exempt the
+// $150K max-TVL ceiling AND the memecoin mcap band, so the judge stops refusing
+// the $2.5M SOL-USDC / $2.8M JitoSOL-SOL pools for "TVL/mcap too high".
+check("ON: prompt states NO maximum-TVL cap for bluechip", /NO maximum-TVL cap for a bluechip/.test(sysB));
+check("ON: prompt says the $150K memecoin max-TVL ceiling does NOT apply", /\$150K/.test(sysB) && /do NOT apply/.test(sysB));
+check("ON: prompt exempts bluechip from the memecoin mcap band (150k-10M)", /mcap band \(150k-10M\)/.test(sysB));
+check("ON: prompt says billions-size mcap is a GREEN flag, not a skip", /GREEN flag/.test(sysB));
 check("ON: SOL-USDC candidate is_bluechip=true (mirrors code carve-out)", userOf(0).candidate.is_bluechip === true);
 check("ON: SOL-USDC bin_step=1 still passed through to judge", userOf(0).candidate.metrics.bin_step === 1);
+check("ON: SOL-USDC $2.5M TVL + $40B mcap still passed through (judge sees real size)",
+  userOf(0).candidate.metrics.tvl === 2_500_000 && userOf(0).candidate.metrics.mcap === 40_000_000_000);
 
 // ── Scenario C: bluechip mode ON + a memecoin pool (must stay memecoin lane) ───
 captured = [];
