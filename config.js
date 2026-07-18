@@ -477,6 +477,20 @@ export const config = {
     // (still client-gated by both memecoin maxMcap AND the bluechip band). Default
     // 1e12 = $1T, comfortably above any real bluechip cap. Inert while flag OFF.
     bluechipBroadMcapCeil:  u.bluechipBroadMcapCeil  ?? 1_000_000_000_000,
+    // ─── Two-sided PAPER activity floor (Cassiopeia — S2 paper-lane blocker #2) ───
+    // DISTINCT from the bluechip income floors above. The two-sided PAPER lane drops
+    // the income-engine volume/fee-yield bars (a symmetric near-zero-IL pair need not
+    // clear an income bar) — but that let genuinely DEAD pools (e.g. the deep
+    // JitoSOL-SOL $2.7M TVL / $0 vol / 0 fee/TVL zombie) reach the judge every cycle:
+    // the rational judge rejects a dead pool, so the sleeve burns a judge cycle and
+    // NEVER accrues data. This floor is a MINIMAL "is the pool alive at all" bar (NOT
+    // an income bar) that drops zombies BEFORE the judge. Live-probe calibrated
+    // (2026-07-18): of 22 surfaced candidates, vol>=$500 keeps 3, drops every $0-vol
+    // pool incl. the deep JitoSOL-SOL zombie. FAIL-CLOSED: floor active + missing data
+    // → reject. PAPER-lane only (composed inside twoSidedPaperBluechipGateReason, which
+    // never runs in live/flag-off). Set 0 to disable a floor.
+    twoSidedPaperMinVolume:      u.twoSidedPaperMinVolume      ?? 500,  // abs 24h volume floor — primary "alive" bar (drops $0-vol zombies, keeps 3/22 live)
+    twoSidedPaperMinFeeTvlRatio: u.twoSidedPaperMinFeeTvlRatio ?? 0,    // fee/TVL floor — OFF by default (available for Draco soak-tuning; 0.0005 keeps the 3 live, 0.03 income bar zeroes the funnel)
     // Opsi-1/B (single-side SOL) deployability guard: a bluechip pool is deployable only
     // if wSOL is its tokenY (QUOTE) leg — the side SOL can be deposited on-chain. Default
     // true → pools with wSOL on the BASE side (SOL-USDC, SOL-mSOL → on-chain 0x1) AND
@@ -1233,6 +1247,8 @@ export function reloadScreeningThresholds() {
     if (fresh.bluechipMinMcap        != null) s.bluechipMinMcap        = fresh.bluechipMinMcap;
     if (fresh.bluechipMaxVolatility  != null) s.bluechipMaxVolatility  = fresh.bluechipMaxVolatility;
     if (fresh.bluechipBroadMcapCeil  != null) s.bluechipBroadMcapCeil  = fresh.bluechipBroadMcapCeil;
+    if (fresh.twoSidedPaperMinVolume      != null) s.twoSidedPaperMinVolume      = fresh.twoSidedPaperMinVolume;
+    if (fresh.twoSidedPaperMinFeeTvlRatio != null) s.twoSidedPaperMinFeeTvlRatio = fresh.twoSidedPaperMinFeeTvlRatio;
     if (fresh.requireBluechipWsolLeg !== undefined) s.requireBluechipWsolLeg = fresh.requireBluechipWsolLeg;
     if (fresh.bluechipOnlyMode       !== undefined) s.bluechipOnlyMode       = fresh.bluechipOnlyMode;
     if (fresh.bluechipMaxBinStep     != null) s.bluechipMaxBinStep     = fresh.bluechipMaxBinStep;

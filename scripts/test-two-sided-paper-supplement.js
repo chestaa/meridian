@@ -42,6 +42,7 @@ const WSOL = "So11111111111111111111111111111111111111112";
 const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const JITOSOL = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
 const MSOL = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So";
+const BSOL = "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"; // LST-SOL surfacing base, but NOT mint/freeze-exempt (Option A excludes it)
 const DEGEN = "Deg3nMemeCoinAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 // Effective thresholds mirroring live defaults for the supplement.
@@ -136,12 +137,15 @@ console.log("\n— 3. BASE-LEG SAFETY still bites on a surfaced pool —");
   installFetchSpy();
   laneOn();
   // A surfaced LST-SOL pool whose HELD base leg has a live mint authority. Surfacing
-  // finds it (mechanism is safety-agnostic); base-leg safety must reject it.
-  const badLst = rawPool("PoolBadJito", JITOSOL, WSOL, "JitoSOL-SOL(bad)");
+  // finds it (mechanism is safety-agnostic); base-leg safety must reject it. Use bSOL:
+  // it IS a surfacing candidate but is DELIBERATELY excluded from the mint/freeze-exempt
+  // set (Option A only exempts JitoSOL/mSOL/jupSOL), so its live mint authority still
+  // bites — proving surfacing never weakens safety even inside the LST family.
+  const badLst = rawPool("PoolBadBsol", BSOL, WSOL, "bSOL-SOL(bad)");
   pageToReturn = [badLst];
   clearDiscoveryCache();
   const surfaced = await fetchTwoSidedPaperSupplement(S);
-  check("mechanism surfaces the pool (safety-agnostic)", surfaced.some((p) => p.pool_address === "PoolBadJito"));
+  check("mechanism surfaces the pool (safety-agnostic)", surfaced.some((p) => p.pool_address === "PoolBadBsol"));
   // Now attach a bad audit and run the base-leg safety gate (as the funnel does downstream).
   const enriched = { ...badLst, audit: { mint_disabled: false, freeze_disabled: true, top_holders_pct: 20, bot_holders_pct: 5 }, is_rugpull: false };
   check("base-leg gate REJECTS live mint authority → mint_authority_not_renounced",

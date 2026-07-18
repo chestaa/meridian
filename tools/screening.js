@@ -1465,6 +1465,80 @@ export function twoSidedPaperBluechipGateReason(pool, s) {
   // DROPPED for the paper lane: bluechipMinVolume + bluechipMinFeeTvlRatio (income-engine
   // yield bars — irrelevant to a symmetric-payoff pair with near-zero IL that we are only
   // PAPER-validating). Base-leg safety is enforced downstream (twoSidedBaseLegGateReason).
+  //
+  // BUT re-add a MINIMAL activity floor (S2 blocker #2): dropping the income yield bars
+  // let genuinely DEAD pools through to the judge (the deep JitoSOL-SOL $2.7M-TVL/$0-vol
+  // zombie ranks #1 by TVL and the rational judge rejects it EVERY cycle → the sleeve
+  // burns a judge cycle and never accrues data). This is NOT an income bar — it is the
+  // "is the pool trading at all" bar. Composed here so the single isTsp routing point
+  // enforces it BEFORE any enrichment + the judge. See twoSidedPaperActivityFloorReason.
+  const activity = twoSidedPaperActivityFloorReason(pool, s);
+  if (activity) return activity;
+  return null;
+}
+
+/**
+ * Two-sided PAPER-lane ACTIVITY floor (Cassiopeia — S2 paper-lane blocker #2). PURE +
+ * unit-tested + FAIL-CLOSED. Returns a reject reason string, or null if the pool clears
+ * (or both floors are disabled).
+ *
+ * WHY (the exact blocker this fixes): twoSidedPaperBluechipGateReason correctly DROPS the
+ * income-engine yield bars (bluechipMinVolume 50k / bluechipMinFeeTvlRatio 0.03) — a
+ * symmetric near-zero-IL pair need not clear an income bar. But dropping them ENTIRELY let
+ * genuinely DEAD pools reach the judge: live probe (2026-07-18) showed the deepest surfaced
+ * candidate, JitoSOL-SOL at $2.7M TVL, has $0 24h volume and 0.0000 fee/TVL, yet ranks #1
+ * by TVL (the supplement sorts tvl:desc) and earns the LST-SOL rank bonus → it is the
+ * "best-pick" the judge evaluates and rejects EVERY cycle. Time-to-data is infinite: the
+ * sleeve never deploys anything because the funnel points at a corpse.
+ *
+ * WHAT THIS IS (and is NOT): a MINIMAL "is the pool trading at all" floor, deliberately far
+ * BELOW the income bar. It exists to stop wasting judge cycles on dead pools (Lyra cost)
+ * and to let a pool through ONLY if it shows real churn (so a paper deploy would actually
+ * accrue measurable fee data). It is NOT a yield/income bar and NOT a profitability test.
+ *   - `twoSidedPaperMinVolume` (default $500) — absolute 24h volume. Live-calibrated: drops
+ *     every $0-vol zombie (incl. the deep JitoSOL-SOL), keeps the 3 pools with actual churn.
+ *   - `twoSidedPaperMinFeeTvlRatio` (default 0 = OFF) — fee/TVL floor, available for soak
+ *     tuning. NOT defaulted on (the volume floor alone maximizes the anti-dormancy margin;
+ *     the old 0.03 income bar would zero the funnel — 0/22 survive).
+ * Each floor fires only when its config value > 0, so either can be independently disabled.
+ *
+ * FAIL-CLOSED (anti-pattern #2): a floor that is ACTIVE (value > 0) with MISSING data →
+ * reject with a `two_sided_paper_*_unknown` reason, NEVER default a dead/unknown pool into
+ * the judge set. Reads pool.volume | pool.volume_window and pool.fee_active_tvl_ratio
+ * (present on BOTH the raw discovery shape and the enriched condensed shape).
+ *
+ * SAFETY IS NOT RELAXED here (as with the surfacing gate): base-leg rug/mint/freeze/bot/
+ * top10 on the HELD token-X leg is enforced SEPARATELY and downstream by
+ * twoSidedBaseLegGateReason. This gate only governs the activity/liveness bound.
+ *
+ * Caller must only invoke this on isTwoSidedPaperCandidate() === true pools (it is composed
+ * inside twoSidedPaperBluechipGateReason, which is ALWAYS false in live / flag-off → this
+ * fn never runs on the live single-side funnel).
+ *
+ * @param {object} pool - raw or condensed pool
+ * @param {object} s - effective screening thresholds (twoSidedPaperMin* keys)
+ * @returns {string|null}
+ */
+export function twoSidedPaperActivityFloorReason(pool, s) {
+  const minVol = numeric(s?.twoSidedPaperMinVolume);
+  const minFeeTvl = numeric(s?.twoSidedPaperMinFeeTvlRatio);
+
+  // Absolute 24h volume floor — the primary "is the pool trading at all" bar.
+  if (minVol != null && minVol > 0) {
+    const volume = strictNumeric(pool?.volume ?? pool?.volume_window);
+    if (volume == null) return "two_sided_paper_volume_unknown";
+    if (volume < minVol) {
+      return `two_sided_paper volume ${volume} below twoSidedPaperMinVolume ${minVol}`;
+    }
+  }
+  // fee/TVL floor — optional secondary activity bar (OFF by default).
+  if (minFeeTvl != null && minFeeTvl > 0) {
+    const feeTvl = strictNumeric(pool?.fee_active_tvl_ratio);
+    if (feeTvl == null) return "two_sided_paper_fee_tvl_unknown";
+    if (feeTvl < minFeeTvl) {
+      return `two_sided_paper fee/TVL ${feeTvl} below twoSidedPaperMinFeeTvlRatio ${minFeeTvl}`;
+    }
+  }
   return null;
 }
 
