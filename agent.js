@@ -226,6 +226,80 @@ function next400Fallback(currentModel, attemptedFallbacks) {
   return null;
 }
 
+// Orion malformed tool-call serialization fix (2026-07-19) — VPS 2026-07-18/19 incident.
+// A degraded provider (deepseek-v4-flash / stepfun step-3.7-flash under 502/429 load)
+// can emit a tool_call whose function.arguments is EMPTY (""), MISSING (null/undefined),
+// or a non-object JSON primitive ("null", "[...]", "\"x\""). The old repair guard
+// `if (tc.function?.arguments)` SKIPPED the empty/missing case entirely (falsy guard),
+// so the malformed assistant message was pushed VERBATIM into `messages`. On the NEXT
+// request OpenRouter rejects the whole payload with a REQUEST-side 400:
+//   "Assistant tool call function.arguments must be a JSON object"
+// That 400 is NOT model-transient — every fallback-ladder rung (mimo → deepseek-v4-pro
+// → stepfun) re-sends the SAME poisoned history and 400s again, so the ladder exhausts
+// and the cycle throws ("API returned no choices" → CRON_ERROR). This is the reported
+// "both primary AND fallback failed" symptom: the poison is in the shared payload, not
+// the model.
+//
+// normalizeToolCallArgs runs on EVERY tool_call BEFORE the assistant message is pushed,
+// GUARANTEEING arguments is always a valid JSON-OBJECT string (worst case "{}").
+// Returns { normalized, recoverable }:
+//   normalized  — always a valid JSON-object string.
+//   recoverable — false when the original couldn't be recovered to real args
+//                 (empty/missing/unrepairable/non-object). Callers record these in
+//                 invalidToolArgErrors so the tool is BLOCKED (clean error tool-result)
+//                 instead of executed with a bogus {} — while STILL keeping the pushed
+//                 assistant message API-valid so history never poisons the next request.
+export function normalizeToolCallArgs(rawArgs) {
+  // Missing / empty → API-valid empty object, but flagged as not-real-args.
+  if (rawArgs == null || (typeof rawArgs === "string" && rawArgs.trim() === "")) {
+    return { normalized: "{}", recoverable: false };
+  }
+  const asString = typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs);
+  let parsed;
+  try {
+    parsed = JSON.parse(asString);
+  } catch {
+    try {
+      parsed = JSON.parse(jsonrepair(asString));
+    } catch {
+      return { normalized: "{}", recoverable: false };
+    }
+  }
+  // Tool args MUST be a plain object. Arrays / primitives / null parse as valid JSON
+  // but OpenRouter still rejects them ("must be a JSON object"), AND executeTool would
+  // receive a non-object → coerce to {} and block.
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { normalized: "{}", recoverable: false };
+  }
+  return { normalized: JSON.stringify(parsed), recoverable: true };
+}
+
+// Defense-in-depth for the exact reported REQUEST-side 400. If a poisoned assistant
+// tool_call ever reaches the wire from a path we didn't normalize (SDK mutation, an
+// externally-injected sessionHistory message), switching MODELS can't fix a poisoned
+// PAYLOAD — the fix is to sanitize the message history and retry the SAME model once.
+export function isMalformedToolCallRequestError(error) {
+  const message = String(error?.message || error?.error?.message || error || "");
+  return /tool[_ ]?call/i.test(message) && /arguments/i.test(message) && /json object/i.test(message);
+}
+
+// Idempotent in-place normalizer over an existing messages array — re-applies
+// normalizeToolCallArgs to every assistant tool_call. Returns the count of args
+// actually changed (0 = already clean, so a sanitize-retry would be pointless).
+export function sanitizeMessagesToolArgs(messages) {
+  let fixed = 0;
+  for (const m of messages) {
+    if (m?.role !== "assistant" || !Array.isArray(m.tool_calls)) continue;
+    for (const tc of m.tool_calls) {
+      if (!tc?.function) continue;
+      const before = tc.function.arguments;
+      const { normalized } = normalizeToolCallArgs(before);
+      if (normalized !== before) { tc.function.arguments = normalized; fixed += 1; }
+    }
+  }
+  return fixed;
+}
+
 // Vega+Lyra fix #2 — extract Orion ENTER verdicts from the screener goal text so the
 // agentLoop can both (a) force tool_choice and (b) detect a stall when ENTER existed
 // but no deploy_position fired. Returns array of { pool, confidence } parsed from
@@ -304,6 +378,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       // Orion deeper fix — track which fallback models we've already tried for 400 errors
       // this step. Combined with FALLBACK_LADDER_400 to give provider-diverse retries.
       const attempted400Fallbacks = new Set();
+      // Orion (2026-07-19) — one-shot guard: sanitize+retry the SAME model at most
+      // once per step on a malformed-tool-call REQUEST 400 (switching models can't
+      // fix a poisoned payload). If sanitation changes nothing, we fall through to
+      // the model ladder / throw — bounded, no infinite retry.
+      let toolArgsSanitized = false;
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
       let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
@@ -345,6 +424,18 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           if (toolChoice === "required" && isToolChoiceRequiredError(error)) {
             toolChoice = "auto";
             log("agent", "Provider rejected tool_choice=required — retrying with tool_choice=auto");
+            attempt -= 1;
+            continue;
+          }
+          // Orion (2026-07-19) — malformed tool-call REQUEST 400. A prior assistant
+          // message carries a tool_call whose arguments isn't a JSON-object string.
+          // Model-switching can't fix a poisoned PAYLOAD: sanitize the history and
+          // retry the SAME model ONCE before walking the model ladder. Checked BEFORE
+          // is400Error (this is a subset of 400 that the ladder would waste rungs on).
+          if (isMalformedToolCallRequestError(error) && !toolArgsSanitized) {
+            toolArgsSanitized = true;
+            const fixed = sanitizeMessagesToolArgs(messages);
+            log("agent", `[LLM_TOOLARG_SANITIZE] malformed tool-call request 400 — sanitized ${fixed} assistant tool-call arg(s), retrying model=${usedModel}`);
             attempt -= 1;
             continue;
           }
@@ -396,23 +487,23 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         usage: response.usage || {},
       });
       const invalidToolArgErrors = new Map();
-      // Keep tool-call history API-valid, but never execute unrecoverable args.
+      // Orion (2026-07-19) — normalize EVERY tool_call's arguments to a valid
+      // JSON-object string BEFORE pushing, so the assistant message can never
+      // poison the next request (the "must be a JSON object" 400). Empty/missing
+      // /non-object args become "{}" AND are flagged unrecoverable → the tool is
+      // blocked below (never executed with bogus {}), while history stays API-valid.
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
-          if (tc.function?.arguments) {
-            try {
-              JSON.parse(tc.function.arguments);
-            } catch {
-              try {
-                tc.function.arguments = JSON.stringify(JSON.parse(jsonrepair(tc.function.arguments)));
-                log("warn", `Repaired malformed JSON args for ${tc.function.name}`);
-              } catch {
-                tc.function.arguments = "{}";
-                const error = `Invalid tool arguments for ${tc.function.name}`;
-                invalidToolArgErrors.set(tc.id, error);
-                log("error", `${error}: could not repair JSON`);
-              }
-            }
+          if (!tc.function) continue;
+          const { normalized, recoverable } = normalizeToolCallArgs(tc.function.arguments);
+          if (normalized !== tc.function.arguments) {
+            tc.function.arguments = normalized;
+            if (recoverable) log("warn", `Repaired malformed JSON args for ${tc.function.name}`);
+          }
+          if (!recoverable) {
+            const error = `Invalid tool arguments for ${tc.function.name}`;
+            invalidToolArgErrors.set(tc.id, error);
+            log("error", `${error}: empty/malformed/non-object args normalized to {} (blocked, not executed)`);
           }
         }
       }
@@ -604,3 +695,5 @@ export function __setCreateForTests(fakeCreate) {
 
 // Exposed for unit testing — not part of the public agent API.
 export { is400Error, parseOrionEnterVerdicts, next400Fallback, FALLBACK_LADDER_400, getToolsForRole, SCREENER_TOOLS };
+// normalizeToolCallArgs / isMalformedToolCallRequestError / sanitizeMessagesToolArgs
+// are already exported inline above (malformed tool-call serialization hardening).
