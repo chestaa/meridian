@@ -1,10 +1,10 @@
 {
-  "ts": "2026-07-20T04:28:28Z",
+  "ts": "2026-07-20T05:28:31Z",
   "status": "ok",
   "newest_tier1_file": "2026-07-20.jsonl",
-  "newest_tier1_age_sec": 3087,
+  "newest_tier1_age_sec": 6690,
   "newest_tier2_file": "2026-07-20.jsonl",
-  "newest_tier2_age_sec": 65,
+  "newest_tier2_age_sec": 63,
   "newest_tier1_rows": 3000,
   "watchlist_size": 1,
   "api_reachable": false,
