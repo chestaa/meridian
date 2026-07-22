@@ -1,5 +1,5 @@
 {
-  "ts": "2026-07-22T01:19:54Z",
+  "ts": "2026-07-22T02:19:57Z",
   "status": "degraded",
   "newest_tier1_file": "none",
   "newest_tier1_age_sec": -1,
@@ -12,5 +12,5 @@
   "tier1_stale_threshold_sec": 7200,
   "tier2_stale_threshold_sec": 2700,
   "reasons": [],
-  "notes": ["no_tier1_capture_file_at_all_upstream_degraded_nonpaging_dur_0s","tier2_watchlist_empty_skip_stale_check"]
+  "notes": ["no_tier1_capture_file_at_all_upstream_degraded_nonpaging_dur_3602s","tier2_watchlist_empty_skip_stale_check"]
 }
