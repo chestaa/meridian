@@ -91,3 +91,4 @@ status-snapshot.json
 
 # Lyra journal runtime ledger (local state, not source)
 journal.jsonl
+same-token-cooldown-shadow.jsonl

@@ -12,6 +12,12 @@ import { config } from "./config.js";
 const POOL_MEMORY_FILE = "./pool-memory.json";
 const MAX_NOTE_LENGTH = 280;
 
+// Cassiopeia — same-token loss re-deploy cooldown shadow-log (JSON-lines).
+// One record per event; Lyra reads this to judge whether the would-block set
+// skews loser or winner before any "enforce" flip. Overridable for test isolation.
+const SAME_TOKEN_COOLDOWN_SHADOW_FILE =
+  process.env.MERIDIAN_SAME_TOKEN_COOLDOWN_SHADOW_FILE || "./same-token-cooldown-shadow.jsonl";
+
 function sanitizeStoredNote(text, maxLen = MAX_NOTE_LENGTH) {
   if (text == null) return null;
   const cleaned = String(text)
@@ -76,6 +82,228 @@ function setBaseMintCooldown(db, baseMint, hours, reason) {
     }
   }
   return cooldownUntil;
+}
+
+// ─── Same-token loss re-deploy cooldown (Cassiopeia — shadow-first) ──────────
+//
+// Cross-token revenge-deploy INSTRUMENTATION, thin-edge, SHADOW-FIRST. This is
+// NOT a "POB fix". Lyra census: block-set (18 distinct tokens, −0.0665 SOL) passes
+// her threshold but BLUNTLY (41% of revenge re-deploys WIN, net edge only +0.066
+// SOL / 145 trades). So: build the instrument + shadow-observe first; the "enforce"
+// flip is a LATER Bro gate once shadow data confirms the block-set condong loser.
+//
+// FAIL-SAFE is INVERSE to the rug gates: this is a funnel-PAUSING action, so an
+// "unknown" (missing pnl / missing base_mint) must NOT fabricate a cooldown — we
+// only ever pause on a POSITIVELY-measured qualifying loss. Mirrors the
+// market-regime NEUTRAL-on-missing posture.
+
+/** Normalize a close-reason for matching: lowercase, [-_] → space, collapse ws. */
+export function normalizeCloseReason(text) {
+  return String(text ?? "")
+    .toLowerCase()
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * True if `reason` matches any configured loss-trigger reason (normalized substring).
+ * Empty/missing reason → false (fail-safe inverse: unknown reason never arms).
+ */
+export function sameTokenLossReasonMatches(reason, reasonList) {
+  const norm = normalizeCloseReason(reason);
+  if (!norm) return false;
+  const list = Array.isArray(reasonList) && reasonList.length > 0
+    ? reasonList
+    : ["stop loss", "give_back_protect"];
+  return list.some((r) => {
+    const rn = normalizeCloseReason(r);
+    return rn.length > 0 && norm.includes(rn);
+  });
+}
+
+/**
+ * Realized loss/gain figure for a closed deploy, preferring the TRUE SOL delta.
+ * Preference: realized_sol_delta (SOL) → pnl_usd (USD) → pnl_pct (%).
+ * Returns { value, unit } or null when NO finite figure exists (fail-safe inverse
+ * — a missing pnl must never fabricate a cooldown).
+ */
+export function sameTokenLossFigure(deploy) {
+  if (!deploy || typeof deploy !== "object") return null;
+  // strictFinite — null/undefined/"" must NOT coerce to 0 (Number(null)===0 would
+  // fabricate a breakeven and defeat the fail-safe-inverse posture).
+  const strictFinite = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const sol = strictFinite(deploy.realized_sol_delta);
+  if (sol !== null) return { value: sol, unit: "SOL" };
+  const usd = strictFinite(deploy.pnl_usd);
+  if (usd !== null) return { value: usd, unit: "USD" };
+  const pct = strictFinite(deploy.pnl_pct);
+  if (pct !== null) return { value: pct, unit: "%" };
+  return null;
+}
+
+/**
+ * Does this closing deploy qualify as a loss-trigger (i.e. arm the cooldown)?
+ * Requires: close_reason ∈ list AND a finite pnl figure AND that figure < 0.
+ * Winner/breakeven (figure >= 0) → false (winner-exempt).
+ * No finite figure / no base reason → false (fail-safe inverse).
+ */
+export function sameTokenLossQualifiesTrigger(deploy, cfg) {
+  if (!sameTokenLossReasonMatches(deploy?.close_reason, cfg?.sameTokenLossCooldownReasons)) return false;
+  const fig = sameTokenLossFigure(deploy);
+  if (!fig) return false;       // fail-safe inverse: unknown pnl → no cooldown
+  return fig.value < 0;         // winner-exempt: >= 0 never arms
+}
+
+/**
+ * Find the most-recent PRIOR qualifying loss of the same base_mint (CROSS-POOL) that
+ * closed within `sameTokenLossCooldownHours` before this re-deploy OPENED. Returns the
+ * matched context (for shadow-log outcome records) or null. This is the keying lubang
+ * the census surfaced: we key per BASE_MINT, not per pool.
+ */
+export function findPriorLossForRedeploy(db, baseMint, redeployDeployedAtMs, cfg) {
+  if (!baseMint || !Number.isFinite(redeployDeployedAtMs)) return null;
+  const hours = Number(cfg?.sameTokenLossCooldownHours ?? 6);
+  if (!Number.isFinite(hours) || hours <= 0) return null;
+  const windowMs = hours * 60 * 60 * 1000;
+  let best = null;
+  for (const entry of Object.values(db || {})) {
+    if (entry?.base_mint !== baseMint) continue;
+    for (const d of entry.deploys || []) {
+      if (!sameTokenLossQualifiesTrigger(d, cfg)) continue;
+      const closedMs = Date.parse(d.closed_at);
+      if (!Number.isFinite(closedMs)) continue;
+      if (closedMs >= redeployDeployedAtMs) continue;   // must PRECEDE the re-deploy open
+      const gapMs = redeployDeployedAtMs - closedMs;
+      if (gapMs > windowMs) continue;                    // outside cooldown window
+      if (!best || closedMs > best._closedMs) {
+        best = {
+          _closedMs: closedMs,
+          gapHours: Math.round((gapMs / 3_600_000) * 100) / 100,
+          priorLoss: sameTokenLossFigure(d),
+          priorReason: d.close_reason || null,
+          priorPool: entry?.name || null,
+        };
+      }
+    }
+  }
+  return best;
+}
+
+function appendSameTokenCooldownShadowLog(record) {
+  try {
+    fs.appendFileSync(SAME_TOKEN_COOLDOWN_SHADOW_FILE, JSON.stringify(record) + "\n");
+  } catch (e) {
+    log("pool-memory", `same-token cooldown shadow-log write failed: ${e?.message || e}`);
+  }
+}
+
+/**
+ * Same-token loss re-deploy cooldown — instrumentation + shadow/enforce.
+ * Called from recordPoolDeploy AFTER the current deploy is pushed, BEFORE save().
+ * Mutates `db` (shadow markers always; the SHARED base_mint cooldown only in enforce).
+ * Writes shadow-log records (outcome + armed) in BOTH shadow and enforce modes.
+ * Returns a structured result for tests/telemetry.
+ *
+ * MODES: "off" → no-op. "shadow" (default) → NEVER touches base_mint_cooldown_until
+ * (funnel byte-unchanged) — only markers + logs. "enforce" → reuses setBaseMintCooldown
+ * so the EXISTING screening gate (isBaseMintOnCooldown) rejects the token. No new gate.
+ */
+export function applySameTokenLossCooldown({ db, poolAddress, deployData, cfg, now = Date.now() }) {
+  const mode = String(cfg?.sameTokenLossCooldownMode || "shadow").toLowerCase();
+  const result = { mode, armed: false, wouldBlock: false, redeployObserved: false, reason: null };
+  if (mode === "off") return result;
+
+  const entry = db?.[poolAddress];
+  if (!entry) return result;
+  const baseMint = deployData?.base_mint || entry?.base_mint || null;
+  const hours = Number(cfg?.sameTokenLossCooldownHours ?? 6);
+
+  // (1) OUTCOME OBSERVATION — was THIS closing deploy itself a revenge re-deploy
+  // (opened within the cooldown window of a prior qualifying loss of the same token)?
+  // If so, record its realized outcome so Lyra can judge whether the would-block set
+  // skews loser or winner. FAIL-SAFE INVERSE: missing base_mint / open-time → skip.
+  const openMs = Date.parse(deployData?.deployed_at);
+  if (baseMint && Number.isFinite(openMs) && Number.isFinite(hours) && hours > 0) {
+    const prior = findPriorLossForRedeploy(db, baseMint, openMs, cfg);
+    if (prior) {
+      result.redeployObserved = true;
+      const fig = sameTokenLossFigure(deployData);
+      const outcome = fig ? (fig.value >= 0 ? "win" : "loss") : "unknown";
+      appendSameTokenCooldownShadowLog({
+        kind: "redeploy_outcome",
+        mode,
+        ts: new Date(now).toISOString(),
+        base_mint: baseMint,
+        pool: poolAddress,
+        pool_name: entry?.name || null,
+        gap_hours: prior.gapHours,
+        cooldown_hours: hours,
+        prior_loss: prior.priorLoss,          // {value, unit} | null
+        prior_reason: prior.priorReason,
+        prior_pool: prior.priorPool,
+        redeploy_close_reason: deployData?.close_reason || null,
+        redeploy_result: outcome,             // "win" | "loss" | "unknown"
+        redeploy_pnl: fig,                    // {value, unit} | null
+      });
+      log("pool-memory",
+        `[same-token-cooldown/${mode}] revenge re-deploy OUTCOME for ${baseMint.slice(0, 8)}: ${outcome} ` +
+        `(${fig ? fig.value.toFixed(4) + " " + fig.unit : "unknown"}), gap ${prior.gapHours}h from prior loss`);
+    }
+  }
+
+  // (2) ARMING — does THIS close arm the cooldown for FUTURE re-deploys?
+  if (baseMint && Number.isFinite(hours) && hours > 0 && sameTokenLossQualifiesTrigger(deployData, cfg)) {
+    const fig = sameTokenLossFigure(deployData);
+    const armReason = `same-token loss cooldown (${deployData.close_reason})`;
+    const cooldownUntil = new Date(now + hours * 3_600_000).toISOString();
+    result.reason = armReason;
+
+    // Shadow markers (both modes) — fields the screening gate NEVER reads, so shadow
+    // mode leaves base_mint_cooldown_until (and thus the funnel) byte-for-byte unchanged.
+    entry.same_token_loss_shadow_until = cooldownUntil;
+    entry.same_token_loss_figure = fig || null;
+    entry.same_token_loss_prior_sol = fig && fig.unit === "SOL" ? fig.value : null;
+    entry.same_token_loss_reason = deployData.close_reason || null;
+    entry.same_token_loss_armed_at = new Date(now).toISOString();
+    entry.same_token_loss_mode = mode;
+
+    if (mode === "enforce") {
+      // REUSE the existing base_mint cooldown field → the existing screening gate
+      // (isBaseMintOnCooldown) rejects it. No new gate, no new plumbing.
+      setBaseMintCooldown(db, baseMint, hours, armReason);
+      result.armed = true;
+      log("pool-memory",
+        `[same-token-cooldown/enforce] base_mint ${baseMint.slice(0, 8)} BLOCKED until ${cooldownUntil} ` +
+        `(prior loss ${fig ? fig.value.toFixed(4) + " " + fig.unit : "unknown"}, reason ${deployData.close_reason})`);
+    } else {
+      // shadow — WOULD-BLOCK log only; NO real cooldown set (funnel untouched).
+      result.wouldBlock = true;
+      log("pool-memory",
+        `[same-token-cooldown/shadow] WOULD-BLOCK base_mint ${baseMint.slice(0, 8)} ` +
+        `(prior loss ${fig ? fig.value.toFixed(4) + " " + fig.unit : "unknown"}, window ${hours}h, reason ${deployData.close_reason})`);
+    }
+
+    appendSameTokenCooldownShadowLog({
+      kind: "armed",
+      mode,
+      ts: new Date(now).toISOString(),
+      base_mint: baseMint,
+      pool: poolAddress,
+      pool_name: entry?.name || null,
+      cooldown_hours: hours,
+      cooldown_until: cooldownUntil,
+      close_reason: deployData.close_reason || null,
+      prior_loss: fig,                        // {value, unit} | null
+      enforced: mode === "enforce",
+    });
+  }
+
+  return result;
 }
 
 export function setPoolAndTokenCooldown({ poolAddress, baseMint = null, hours = 12, reason = "manual cooldown" }) {
@@ -199,6 +427,9 @@ export function recordPoolDeploy(poolAddress, deployData) {
     closed_at: deployData.closed_at || new Date().toISOString(),
     pnl_pct: deployData.pnl_pct ?? null,
     pnl_usd: deployData.pnl_usd ?? null,
+    // Cassiopeia — persist the TRUE realized SOL delta so cross-pool prior-loss scans
+    // (findPriorLossForRedeploy) can classify historical losses in real SOL terms.
+    realized_sol_delta: deployData.realized_sol_delta ?? null,
     fees_earned_usd: deployData.fees_earned_usd ?? null,
     fees_earned_sol: deployData.fees_earned_sol ?? null,
     fee_earned_pct: deployData.fee_earned_pct ?? null,
@@ -282,6 +513,28 @@ export function recordPoolDeploy(poolAddress, deployData) {
         }
       }
     }
+  }
+
+  // Cassiopeia — same-token loss re-deploy cooldown (instrumentation + shadow/enforce).
+  // Runs on EVERY close; mode-gated internally. Shadow (default) never touches the
+  // funnel; enforce reuses the existing base_mint cooldown gate. Mutates db in place.
+  try {
+    applySameTokenLossCooldown({
+      db,
+      poolAddress,
+      deployData: {
+        base_mint: deployData.base_mint || entry.base_mint || null,
+        deployed_at: deployData.deployed_at || null,
+        close_reason: deployData.close_reason || null,
+        realized_sol_delta: deployData.realized_sol_delta ?? null,
+        pnl_usd: deployData.pnl_usd ?? null,
+        pnl_pct: deployData.pnl_pct ?? null,
+      },
+      cfg: config.management,
+    });
+  } catch (e) {
+    // Instrumentation must never break the close/record path.
+    log("pool-memory", `same-token loss cooldown eval failed: ${e?.message || e}`);
   }
 
   save(db);

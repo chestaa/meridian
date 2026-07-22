@@ -226,6 +226,11 @@ export async function recordPerformance(perf) {
       closed_at: entry.recorded_at,
       pnl_pct: entry.pnl_pct,
       pnl_usd: entry.pnl_usd,
+      // Cassiopeia — forward the TRUE realized SOL delta (net of IL+slippage+gas)
+      // so the same-token-loss cooldown logs a real "-Y SOL" figure, not a USD proxy.
+      // Optional plumbing: absent on legacy/paper records → cooldown falls back to
+      // pnl_usd then pnl_pct sign (still fail-safe-inverse if none is finite).
+      realized_sol_delta: entry.realized_sol_delta ?? perf.realized_sol_delta ?? null,
       range_efficiency: entry.range_efficiency,
       minutes_held: perf.minutes_held,
       fees_earned_usd: perf.fees_earned_usd,

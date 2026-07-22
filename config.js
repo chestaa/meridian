@@ -562,6 +562,36 @@ export const config = {
     repeatDeployCooldownHours: u.repeatDeployCooldownHours ?? 12,
     repeatDeployCooldownScope: u.repeatDeployCooldownScope ?? "token", // pool | token | both
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
+    // ─── Same-token loss re-deploy cooldown (Cassiopeia — cross-token revenge-deploy
+    // instrumentation, thin-edge, SHADOW-FIRST). NOT a "POB fix". Lyra census: the
+    // block-set (18 distinct tokens, −0.0665 SOL) PASSES her threshold but only
+    // BLUNTLY — 41% of revenge re-deploys WIN and net edge is a thin +0.066 SOL over
+    // 145 trades. So we build the instrument + shadow-observe FIRST; enable ("enforce")
+    // is a LATER Bro gate once shadow data confirms the block-set skews loser.
+    //
+    // MODE (default "shadow" == observe-only == funnel byte-unchanged live):
+    //   "off"     → fully disabled, no marker, no log.
+    //   "shadow"  → NEVER rejects. Logs a would-block line + writes an armed/outcome
+    //               record to same-token-cooldown-shadow.jsonl for Lyra to evaluate
+    //               whether the block-set condong loser or winner. Does NOT touch the
+    //               base_mint_cooldown_until field the screening gate reads.
+    //   "enforce" → arms the EXISTING base_mint cooldown (reuses isBaseMintOnCooldown
+    //               in screening.js — no new gate) so the token is actually blocked.
+    //
+    // TRIGGER: a single close with realized pnl/pnl_pct < 0 AND close_reason ∈ the
+    // configured reason list. Keyed per BASE_MINT (cross-pool — a loss in pool A blocks
+    // a revenge re-deploy of the same token in pool B).
+    // WINNER-EXEMPT: profit/breakeven closes never arm (Lyra: +0.036 SOL winners must
+    // not be blocked).
+    // FAIL-SAFE INVERSE (unlike the rug gates): missing pnl OR missing base_mint →
+    // NO cooldown. This is a funnel-PAUSING action, so "unknown" must NOT fabricate a
+    // freeze (mirrors the market-regime NEUTRAL-on-missing posture). We only ever pause
+    // on a positively-measured qualifying loss.
+    sameTokenLossCooldownMode: (["off", "shadow", "enforce"].includes(String(u.sameTokenLossCooldownMode || "").toLowerCase()) ? String(u.sameTokenLossCooldownMode).toLowerCase() : "shadow"),
+    sameTokenLossCooldownHours: u.sameTokenLossCooldownHours ?? 6,
+    sameTokenLossCooldownReasons: Array.isArray(u.sameTokenLossCooldownReasons) && u.sameTokenLossCooldownReasons.length > 0
+      ? u.sameTokenLossCooldownReasons.map(String)
+      : ["stop loss", "give_back_protect"],
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
