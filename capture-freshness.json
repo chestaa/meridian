@@ -1,6 +1,6 @@
 {
-  "ts": "2026-07-22T00:40:28Z",
-  "status": "stale",
+  "ts": "2026-07-22T01:19:54Z",
+  "status": "degraded",
   "newest_tier1_file": "none",
   "newest_tier1_age_sec": -1,
   "newest_tier2_file": "none",
@@ -8,8 +8,9 @@
   "newest_tier1_rows": 0,
   "watchlist_size": 0,
   "api_reachable": false,
+  "upstream_degraded": true,
   "tier1_stale_threshold_sec": 7200,
   "tier2_stale_threshold_sec": 2700,
-  "reasons": ["no_tier1_capture_file_at_all"],
-  "notes": ["tier2_watchlist_empty_skip_stale_check"]
+  "reasons": [],
+  "notes": ["no_tier1_capture_file_at_all_upstream_degraded_nonpaging_dur_0s","tier2_watchlist_empty_skip_stale_check"]
 }
