@@ -1,16 +1,16 @@
 {
-  "ts": "2026-07-24T06:21:20Z",
+  "ts": "2026-07-24T07:21:21Z",
   "status": "ok",
   "newest_tier1_file": "2026-07-24.jsonl",
   "newest_tier1_age_sec": 2478,
   "newest_tier2_file": "2026-07-24.jsonl",
-  "newest_tier2_age_sec": 2499,
-  "newest_tier1_rows": 6000,
-  "watchlist_size": 0,
+  "newest_tier2_age_sec": 684,
+  "newest_tier1_rows": 7000,
+  "watchlist_size": 2,
   "api_reachable": false,
   "upstream_degraded": false,
   "tier1_stale_threshold_sec": 7200,
   "tier2_stale_threshold_sec": 2700,
   "reasons": [],
-  "notes": ["tier2_watchlist_empty_skip_stale_check"]
+  "notes": []
 }
