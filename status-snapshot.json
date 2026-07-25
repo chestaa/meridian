@@ -1,5 +1,5 @@
 {
-  "ts": "2026-07-25T00:32:38.300Z",
+  "ts": "2026-07-25T00:37:40.335Z",
   "wallet": {
     "pubkey": "DgA9MZ…1Hiu",
     "sol_free": 0.588883,
@@ -12,9 +12,9 @@
     "closed_24h_count": 5,
     "closed_24h_pnl_sum_sol": -0.00794,
     "closed_24h_realized_sol_sum": -0.004766,
-    "closed_7d_count": 27,
-    "closed_7d_pnl_sum_sol": -0.01496,
-    "closed_7d_realized_sol_sum": -0.018259,
+    "closed_7d_count": 26,
+    "closed_7d_pnl_sum_sol": -0.01498,
+    "closed_7d_realized_sol_sum": -0.018244,
     "win_rate_24h": 0.2,
     "win_rate_7d": 0.19
   },
