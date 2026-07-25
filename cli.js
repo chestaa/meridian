@@ -571,7 +571,17 @@ switch (subcommand) {
     if (!result) {
       out({ evolved: false, reason: `Need at least 5 closed positions (have ${perfData.length})` });
     } else {
-      out({ evolved: Object.keys(result.changes).length > 0, changes: result.changes, rationale: result.rationale });
+      // PROPOSE-ONLY is the default (Lyra guard): report the queued proposals
+      // explicitly so "evolved: false" can't read as "engine found nothing".
+      out({
+        evolved: Object.keys(result.changes).length > 0,
+        mode: result.applied ? "auto-apply" : "propose-only",
+        changes: result.changes,
+        rationale: result.rationale,
+        proposals: result.proposals || [],
+        proposal_file: result.proposal_file || null,
+        note: result.applied ? undefined : "Nothing applied. Proposals await Bro's decision (LOOSEN of a risk gate also needs Cassiopeia review).",
+      });
     }
     break;
   }

@@ -109,15 +109,22 @@ console.log("\n[buildLessonsSection]");
   assert("returns non-null", text != null);
   assert("uses plain header 'Apa yang Dipelajari Bot'", text.includes("Apa yang Dipelajari Bot"));
   assert("states live close count (1) in plain language", text.includes("<b>1</b> posisi sungguhan"));
-  assert("mentions tightened standards (minOrganic evolved)", text.includes("memperketat"));
+  // HONESTY (Lyra propose-only): the section used to claim the bot "memperketat
+  // standar ... sendiri". Threshold evolution is now PROPOSE-ONLY, so the copy
+  // states the current standard as a FACT and names who decides.
+  assert("states current standard is stricter than base (fact, not self-agency)",
+    text.includes("lebih ketat dari setelan dasar"));
+  assert("does NOT claim the bot tightened standards by itself", !/memperketat/.test(text));
+  assert("states propose-only mode plainly", text.includes("TIDAK mengubah standar sendiri"));
   assert("includes last evolution timestamp", text.includes("2026-05-15"));
-  assert("clarifies date = last AUTO standard change (not last activity)", text.includes("Standar terakhir berubah otomatis"));
+  assert("labels the old auto-change as legacy mode", /mode lama sebelum propose-only/.test(text));
   assert("shows positions evaluated since (4−1=3)", text.includes("3 posisi dievaluasi sejak itu"));
   assert("reassures stale date is normal, not a dead engine", /normal, bukan berhenti/.test(text));
 
   // No _positionsAtEvolution → falls back to non-counted reassurance, never errors
   const noCount = buildLessonsSection(mockLessonsState, { ...mockUserConfig, _positionsAtEvolution: undefined });
-  assert("graceful when _positionsAtEvolution missing", noCount.includes("Standar terakhir berubah otomatis") && noCount.includes("tetap evaluasi"));
+  assert("graceful when _positionsAtEvolution missing",
+    noCount.includes("Belum ada usulan baru") && noCount.includes("tetap evaluasi"));
 
   assert("NO raw bin_step jargon", !/bin_step/.test(text));
   assert("NO raw fee_tvl_ratio jargon", !/fee_tvl_ratio/.test(text));

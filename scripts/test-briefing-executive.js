@@ -97,7 +97,14 @@ console.log("\n[REQ 3: plain-language lessons]");
   assert("NO bin_step jargon", !/bin_step/.test(plain));
   assert("NO fee_tvl_ratio jargon", !/fee_tvl_ratio/.test(plain));
   assert("NO raw volatility= jargon", !/volatility=/.test(plain));
-  assert("says bot avoids the pattern", plain.includes("menghindari"));
+  // HONESTY FIX (Lyra): the old text claimed "bot sekarang menghindari pola ini".
+  // FALSE — a derived lesson only ever entered the LLM prompt; it never created a
+  // filter. The claim is now REMOVED and replaced with the true enforcement state.
+  assert("does NOT claim the bot avoids the pattern (false claim removed)", !plain.includes("menghindari"));
+  assert("states honestly that it is only AI context, not a block",
+    /bahan pertimbangan AI/.test(plain));
+  assert("does NOT claim an automatic block when no gate is configured",
+    !/otomatis ditolak/.test(plain));
 
   const goodLesson = {
     rule: 'PREFER: SPCX-SOL-type pools (volatility=1.5589) with strategy="spot" — PnL +11.57%.',
@@ -106,7 +113,8 @@ console.log("\n[REQ 3: plain-language lessons]");
   };
   const goodPlain = lessonToPlain(goodLesson);
   assert("PREFER lesson → 'menguntungkan'", /cenderung menguntungkan/.test(goodPlain));
-  assert("good lesson → bot prioritises pattern", goodPlain.includes("memprioritaskan"));
+  assert("good lesson does NOT claim the bot prioritises the pattern (false claim removed)",
+    !goodPlain.includes("memprioritaskan"));
   assert("'tenang' volatility for vol<2", goodPlain.includes("tenang"));
 
   const evolved = lessonToPlain({ rule: "[AUTO-EVOLVED @ 5 positions] minFeeActiveTvlRatio=0.06 — raised floor" });
@@ -123,7 +131,117 @@ console.log("\n[REQ 3: plain-language lessons]");
   assert("section has plain header", section.includes("Apa yang Dipelajari Bot"));
   assert("section: zero jargon (bin_step/volatility=/fee_tvl_ratio)",
     !/bin_step|volatility=|fee_tvl_ratio/.test(section));
-  assert("section flags tightened standards plainly", section.includes("memperketat"));
+  assert("section states current standard is stricter than base (fact, no agency claim)",
+    section.includes("lebih ketat dari setelan dasar"));
+  assert("section does NOT claim the bot tightened standards by itself",
+    !/memperketat standar pemilihan pool sendiri/.test(section));
+  assert("section states propose-only mode plainly",
+    /TIDAK mengubah standar sendiri/.test(section));
+}
+
+// ── REQ 4 (Lyra): dimension-aware bucket lessons + propose-only honesty ──────
+console.log("\n[REQ 4: dimension-aware bucket lessons]");
+{
+  const entryBucket = {
+    id: "bucket:entry_direction=entry_down|volatility=vol[0,2.5)",
+    bucketKey: "entry_direction=entry_down|volatility=vol[0,2.5)",
+    sourceType: "bucket_aggregate", outcome: "bad",
+    rule: "EV-BUCKET vol[0,2.5) × entry_down — n=14, EV -0.0190 SOL/trade, net -0.2660 SOL, W1/L9/N4 (WR 7.1%), SIGNAL t=-3.2 → AVOID",
+    dims: { entry_direction: "entry_down", volatility: "vol[0,2.5)" },
+    dimension: "entry_direction×volatility",
+    n: 14, ev_sol: -0.019, net_sol: -0.266, wins: 1, losses: 9, neutral: 4,
+    verdict: "SIGNAL", material: true, micro_ev: false, confidence: 0.8,
+    created_at: "2026-07-20T00:00:00Z",
+  };
+  const exitBucket = {
+    id: "bucket:exit_class=STOP_LOSS", bucketKey: "exit_class=STOP_LOSS",
+    sourceType: "bucket_aggregate", outcome: "bad",
+    rule: "EV-BUCKET STOP_LOSS — n=25, EV -0.0164 SOL/trade, net -0.4108 SOL, W0/L23/N2 (WR 0%), SIGNAL t=-11.56 → AVOID",
+    dims: { exit_class: "STOP_LOSS" }, dimension: "exit_class",
+    n: 25, ev_sol: -0.0164, net_sol: -0.4108, wins: 0, losses: 23, neutral: 2,
+    verdict: "SIGNAL", material: true, micro_ev: false, confidence: 0.8,
+    created_at: "2026-07-21T00:00:00Z",
+  };
+  const regimeBucket = {
+    id: "bucket:regime=regime_flat", bucketKey: "regime=regime_flat",
+    sourceType: "bucket_aggregate", outcome: "neutral",
+    rule: "EV-BUCKET regime_flat — n=63, EV -0.0012 SOL/trade, net -0.0763 SOL, NOISE t=-1.52 → WATCH (not significant yet)",
+    dims: { regime: "regime_flat" }, dimension: "regime",
+    n: 63, ev_sol: -0.0012, net_sol: -0.0763, wins: 4, losses: 10, neutral: 49,
+    verdict: "NOISE", material: false, micro_ev: true, confidence: 0.4,
+    created_at: "2026-07-22T00:00:00Z",
+  };
+
+  // (a) The OLD renderer collapsed EVERY lesson into fee+volatility words. An
+  //     entry-direction finding must now be reported as an ENTRY finding.
+  const entryPlain = lessonToPlain(entryBucket, { directionGateEnabled: false, minVolatility: 0 });
+  assert("renders entry_direction dimension (not collapsed to fee/vol)",
+    /masuk saat harga token sedang turun/i.test(entryPlain));
+  assert("renders the volatility dimension too", entryPlain.includes("pergerakan harga tenang"));
+  assert("carries n", entryPlain.includes("14 posisi"));
+  assert("carries realized-SOL EV per position", entryPlain.includes("-0.0190 SOL per posisi"));
+  assert("carries the net SOL total", entryPlain.includes("-0.2660 SOL"));
+  assert("SIGNAL + material → states the pattern is consistent",
+    entryPlain.includes("polanya konsisten, bukan kebetulan"));
+  assert("direction gate OFF → says so honestly (no fake filter claim)",
+    entryPlain.includes("direction gate OFF"));
+  assert("no false 'bot menghindari' claim on bucket rows", !entryPlain.includes("menghindari"));
+
+  const entryPlainGateOn = lessonToPlain(entryBucket, { directionGateEnabled: true });
+  assert("direction gate ON → reports the real enforcement",
+    entryPlainGateOn.includes("direction gate) sedang AKTIF"));
+
+  // (b) Volatility enforcement is only claimed when the live floor really covers
+  //     the whole bucket.
+  const volCovered = lessonToPlain(entryBucket, { minVolatility: 3.0 });
+  assert("floor above bucket ceiling → honest 'sudah otomatis ditolak'",
+    volCovered.includes("otomatis ditolak") && volCovered.includes("minVolatility 3"));
+  const volPartial = lessonToPlain(entryBucket, { minVolatility: 1.5 });
+  assert("floor inside the bucket → says only SOME pools are filtered",
+    volPartial.includes("sebagian pool di rentang ini masih lolos"));
+
+  // (c) Exit-side patterns are NOT entry filters — must be stated.
+  const exitPlain = lessonToPlain(exitBucket, {});
+  assert("exit_class rendered in plain words", /ditutup kena batas rugi/i.test(exitPlain));
+  assert("exit pattern honestly labelled as not-an-entry-filter",
+    exitPlain.includes("bukan filter saat memilih pool"));
+
+  // (d) NOISE/micro must not read as a rule.
+  const regimePlain = lessonToPlain(regimeBucket, {});
+  assert("regime dimension rendered", /pasar SOL datar/i.test(regimePlain));
+  assert("NOISE verdict reported as unproven", regimePlain.includes("belum bisa dipastikan"));
+
+  // (e) Section-level: bucket rows rank ahead of legacy prose, and the
+  //     propose-only queue is surfaced as "menunggu keputusan Bro".
+  const section = buildLessonsSection(
+    { performance: Array.from({ length: 25 }, () => ({ source: "live", pnl_usd: -1, recorded_at: recentIso })),
+      lessons: [regimeBucket, exitBucket, entryBucket, { rule: "FAILED: old prose", outcome: "bad", confidence: 0.99, context: "X, volatility=3, fee_tvl_ratio=0.5" }] },
+    { minOrganic: 72, minFeeActiveTvlRatio: 0.10, directionGateEnabled: true },
+    { auto_apply: false, pending: [
+      { key: "minFeeActiveTvlRatio", current: 0.1, proposed: 0.12, direction: "TIGHTEN", applied: false },
+      { key: "minVolatility", current: 3.0, proposed: 2.5, direction: "LOOSEN", applied: false, requires_bro_approval: true },
+    ] },
+  );
+  const idxExit = section.toLowerCase().indexOf("ditutup kena batas rugi");
+  const idxRegime = section.toLowerCase().indexOf("pasar sol datar");
+  assert("section surfaces the material bucket row first (biggest money moved)",
+    idxExit >= 0 && idxRegime >= 0 && idxExit < idxRegime);
+  assert("section states bot does NOT change its own standards",
+    section.includes("TIDAK mengubah standar sendiri"));
+  assert("section lists pending proposals with counts", section.includes("Usulan menunggu keputusan"));
+  assert("section renders a TIGHTEN proposal", section.includes("minFeeActiveTvlRatio</b>: 0.1 → 0.12"));
+  assert("LOOSEN proposal flagged as requiring Bro + Cassiopeia",
+    /minVolatility<\/b>: 3 → 2\.5 \(⚠️ LEBIH LONGGAR — wajib persetujuan Bro \+ review Cassiopeia\)/.test(section));
+  assert("section keeps zero raw jargon", !/bin_step|volatility=|fee_tvl_ratio/.test(section));
+
+  // (f) auto-apply ON is reported differently (no propose-only claim).
+  const sectionAuto = buildLessonsSection(
+    { performance: [{ source: "live", pnl_usd: 1, recorded_at: recentIso }], lessons: [exitBucket] },
+    { learning: { evolveAutoApply: true }, _lastEvolved: "2026-07-01T00:00:00Z" },
+    { auto_apply: true, pending: [] },
+  );
+  assert("auto-apply ON → reports that mode honestly",
+    sectionAuto.includes("BOLEH mengubah standar sendiri"));
 }
 
 console.log(`\n${pass} passed · ${fail} failed`);

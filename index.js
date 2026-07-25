@@ -2884,7 +2884,15 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
         const fs = await import("fs");
         const lessonsData = JSON.parse(fs.default.readFileSync("./lessons.json", "utf8"));
         const result = evolveThresholds(lessonsData.performance, config);
-        if (!result || Object.keys(result.changes).length === 0) {
+        if (result?.queued && result.proposals?.length) {
+          // PROPOSE-ONLY (default): saying "no changes needed" here would be FALSE.
+          console.log("\nPROPOSE-ONLY mode (learning.evolveAutoApply=false) — nothing applied:");
+          for (const p of result.proposals) {
+            console.log(`  ${p.key}: ${p.current} → ${p.proposed} [${p.direction}]${p.requires_bro_approval ? " — REQUIRES BRO APPROVAL + Cassiopeia review" : p.requires_cassiopeia_review ? " — Cassiopeia review" : ""}`);
+            console.log(`    ${p.rationale}`);
+          }
+          console.log(`\nQueued to ${result.proposal_file}. Apply manually after review.\n`);
+        } else if (!result || Object.keys(result.changes).length === 0) {
           console.log("\nNo threshold changes needed — current settings already match performance data.\n");
         } else {
           reloadScreeningThresholds();

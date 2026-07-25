@@ -18,6 +18,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const USER_CONFIG_PATH = path.join(ROOT, "user-config.json");
 const LESSONS_FILE = path.join(ROOT, "lessons.json");
+const PROPOSALS_FILE = path.join(ROOT, "threshold-proposals.json");
 
 // ── Backup state ──────────────────────────────────────────────
 const userConfigBackup = fs.existsSync(USER_CONFIG_PATH)
@@ -26,6 +27,18 @@ const userConfigBackup = fs.existsSync(USER_CONFIG_PATH)
 const lessonsBackup = fs.existsSync(LESSONS_FILE)
   ? fs.readFileSync(LESSONS_FILE, "utf8")
   : null;
+const proposalsBackup = fs.existsSync(PROPOSALS_FILE)
+  ? fs.readFileSync(PROPOSALS_FILE, "utf8")
+  : null;
+
+// Lyra bucket-aggregate engine: tests 7/8 below assert the LEGACY per-trade
+// prose derivation, so this file pins learning.bucketLessonsEnabled=false.
+// The bucket-mode equivalents (same outcome, expressed as bucket rows) live in
+// scripts/test-bucket-learning.js. evolveAutoApply stays at its shipped default
+// (false = propose-only), which test 9 now asserts.
+fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify({
+  learning: { bucketLessonsEnabled: false, evolveAutoApply: false },
+}, null, 2));
 
 // Reset lessons.json so cadence math (% 5) starts clean from this test
 fs.writeFileSync(LESSONS_FILE, JSON.stringify({ lessons: [], performance: [] }, null, 2));
@@ -404,7 +417,7 @@ try {
       { source: "live", pnl_pct: +2,  realized_sol_delta: -0.02, fee_tvl_ratio: 0.04, organic_score: 52 },
       { source: "live", pnl_pct: +1,  realized_sol_delta: -0.03, fee_tvl_ratio: 0.03, organic_score: 55 },
     ];
-    const result = evolveThresholds(perfData, cfg);
+    const result = evolveThresholds(perfData, cfg, { notify: false });
     assert(
       "evolveThresholds returned a result on 5 real records",
       result !== null,
@@ -413,15 +426,28 @@ try {
     // Under fee-inclusive pnl_pct all 5 look like winners (all >0) → no losers,
     // no signal to raise floors. Under realized-SOL the last 2 are losers with
     // low fee_tvl/organic → floors should rise. Prove realized drove it.
+    // NOTE (Lyra propose-only guard): the engine now PROPOSES instead of
+    // applying, so the evidence lands in result.proposals and `changes` stays
+    // empty. Nothing may be written to the live config.
     assert(
-      "realized-SOL classification produced threshold changes (fee-inclusive would not)",
-      result && result.changes && Object.keys(result.changes).length > 0,
+      "realized-SOL classification produced threshold PROPOSALS (fee-inclusive would not)",
+      result && Array.isArray(result.proposals) && result.proposals.length > 0,
+      `proposals: ${JSON.stringify(result?.proposals?.map((p) => p.key))}`,
+    );
+    assert(
+      "propose-only: changes stays EMPTY (nothing auto-applied)",
+      result && Object.keys(result.changes).length === 0,
       `changes: ${JSON.stringify(result?.changes)}`,
+    );
+    assert(
+      "propose-only: live config object NOT mutated",
+      cfg.screening.minFeeActiveTvlRatio === 0.05 && cfg.screening.minOrganic === 60,
+      `got: ${JSON.stringify(cfg.screening)}`,
     );
 
     // Control: same records but with paper source → excluded → no evolution.
     const paperData = perfData.map((p) => ({ ...p, source: "paper" }));
-    const paperResult = evolveThresholds(paperData, { screening: { minFeeActiveTvlRatio: 0.05, minOrganic: 60 } });
+    const paperResult = evolveThresholds(paperData, { screening: { minFeeActiveTvlRatio: 0.05, minOrganic: 60 } }, { notify: false });
     assert(
       "all-paper dataset yields no evolution (paper excluded)",
       paperResult === null,
@@ -440,6 +466,11 @@ try {
     if (fs.existsSync(LESSONS_FILE)) fs.unlinkSync(LESSONS_FILE);
   } else {
     fs.writeFileSync(LESSONS_FILE, lessonsBackup);
+  }
+  if (proposalsBackup === null) {
+    if (fs.existsSync(PROPOSALS_FILE)) fs.unlinkSync(PROPOSALS_FILE);
+  } else {
+    fs.writeFileSync(PROPOSALS_FILE, proposalsBackup);
   }
   // Restore flag default
   config.internalAgents.paperFeedsLessons = true;

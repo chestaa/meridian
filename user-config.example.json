@@ -101,5 +101,19 @@
   "telegramChatId": "",
   "hiveMindUrl": "",
   "hiveMindApiKey": "",
-  "hiveMindPullMode": "auto"
+  "hiveMindPullMode": "auto",
+
+  "learning": {
+    "bucketLessonsEnabled": true,
+    "bucketLessonMinN": 3,
+    "bucketLessonCap": 12,
+    "lessonTotalCap": 60,
+    "bucketSignalMinN": 10,
+    "bucketNoiseT": 2,
+    "evolveAutoApply": false,
+    "evolveWindowN": 40,
+    "evolveWinnerPercentile": 20,
+    "evolveLoserPercentile": 80,
+    "bucketProposalsEnabled": true
+  }
 }

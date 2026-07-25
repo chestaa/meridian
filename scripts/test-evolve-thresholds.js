@@ -19,6 +19,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const USER_CONFIG_PATH = path.join(ROOT, "user-config.json");
 const LESSONS_FILE = path.join(ROOT, "lessons.json");
+const PROPOSALS_FILE = path.join(ROOT, "threshold-proposals.json");
 
 let passed = 0;
 let failed = 0;
@@ -40,6 +41,9 @@ const userConfigBackup = fs.existsSync(USER_CONFIG_PATH)
 const lessonsBackup = fs.existsSync(LESSONS_FILE)
   ? fs.readFileSync(LESSONS_FILE, "utf8")
   : null;
+const proposalsBackup = fs.existsSync(PROPOSALS_FILE)
+  ? fs.readFileSync(PROPOSALS_FILE, "utf8")
+  : null;
 
 // Snapshot of live config screening values we'll mutate
 const snapshotScreening = { ...config.screening };
@@ -55,6 +59,11 @@ function restore() {
   } else {
     fs.writeFileSync(LESSONS_FILE, lessonsBackup);
   }
+  if (proposalsBackup === null) {
+    if (fs.existsSync(PROPOSALS_FILE)) fs.unlinkSync(PROPOSALS_FILE);
+  } else {
+    fs.writeFileSync(PROPOSALS_FILE, proposalsBackup);
+  }
   Object.assign(config.screening, snapshotScreening);
 }
 
@@ -62,6 +71,12 @@ try {
   // Ensure baseline floors so test is deterministic regardless of evolved state
   config.screening.minFeeActiveTvlRatio = 0.05;
   config.screening.minOrganic = 60;
+
+  // Lyra propose-only guard: auto-apply is OFF by default now, so this legacy
+  // AUTO-APPLY regression must opt in explicitly (the switch only Bro flips).
+  // The propose-only default is asserted separately at the end of this file and
+  // in scripts/test-bucket-learning.js.
+  fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify({ learning: { evolveAutoApply: true } }, null, 2));
 
   // Synthetic perf records:
   //   - 5 winners: high fee_tvl (~0.10), high organic (~80), all profitable
@@ -174,6 +189,35 @@ try {
     `got: ${written._positionsAtEvolution}`
   );
 
+  // ── 12. PROPOSE-ONLY default: identical data writes NO threshold ──
+  // Same winners/losers, but with the shipped default (evolveAutoApply=false):
+  // nothing may reach user-config.json or the live config object.
+  {
+    fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify({ learning: { evolveAutoApply: false } }, null, 2));
+    if (fs.existsSync(PROPOSALS_FILE)) fs.unlinkSync(PROPOSALS_FILE);
+    const isolated = { screening: { minFeeActiveTvlRatio: 0.05, minOrganic: 60 } };
+    const proposeOnly = evolveThresholds(perfData, isolated, { notify: false });
+    assert(
+      "propose-only default: changes EMPTY (nothing applied)",
+      proposeOnly && Object.keys(proposeOnly.changes).length === 0,
+      `got: ${JSON.stringify(proposeOnly?.changes)}`
+    );
+    assert(
+      "propose-only default: proposals still computed",
+      proposeOnly && Array.isArray(proposeOnly.proposals) && proposeOnly.proposals.length > 0
+    );
+    const uc = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
+    assert(
+      "propose-only default: user-config.json has NO threshold keys",
+      !("minFeeActiveTvlRatio" in uc) && !("minOrganic" in uc) && !("_lastEvolved" in uc),
+      `keys: ${Object.keys(uc).join(",")}`
+    );
+    assert(
+      "propose-only default: live config object untouched",
+      isolated.screening.minFeeActiveTvlRatio === 0.05 && isolated.screening.minOrganic === 60
+    );
+    assert("propose-only default: proposal queue file written", fs.existsSync(PROPOSALS_FILE));
+  }
 } finally {
   restore();
 }

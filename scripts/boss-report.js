@@ -454,23 +454,150 @@ export function buildTradeSection(liveRecords, paperTrades, openCount = 0, windo
   return lines.join("\n");
 }
 
+// ─── Plain-Indonesian dimension vocabulary (Lyra bucket-aggregate lessons) ────
+// Bucket keys are self-describing strings produced by lessons.js
+// (VOLATILITY_BUCKETS / FEE_TVL_BUCKETS / ENTRY_DIRECTION_BUCKETS /
+// REGIME_BUCKETS / EXIT_CLASSES). Parsed locally so this report script stays
+// import-free of the learning engine.
+const DIM_WORDS = Object.freeze({
+  "vol[0,2.5)":   "pergerakan harga tenang (di bawah 2.5)",
+  "vol[2.5,3.5)": "pergerakan harga sedang (2.5–3.5)",
+  "vol[3.5,4.5)": "pergerakan harga cukup tinggi (3.5–4.5)",
+  "vol4.5+":      "pergerakan harga tinggi (4.5+)",
+  "fee[0,0.1)":   "fee rendah (di bawah 0.1)",
+  "fee[0.1,0.2)": "fee sedang (0.1–0.2)",
+  "fee[0.2,0.4)": "fee bagus (0.2–0.4)",
+  "fee0.4+":      "fee sangat tinggi (0.4+)",
+  entry_down: "masuk saat harga token sedang turun",
+  entry_flat: "masuk saat harga token datar",
+  entry_up:   "masuk saat harga token naik",
+  entry_pump: "masuk saat harga token sedang melonjak (pump)",
+  regime_down: "pasar SOL sedang turun",
+  regime_flat: "pasar SOL datar",
+  regime_up:   "pasar SOL sedang naik",
+  STOP_LOSS:      "ditutup kena batas rugi (stop-loss)",
+  TRAILING_TP:    "ditutup untuk mengunci profit",
+  OOR_UP_HARVEST: "ditutup karena harga keluar ke atas lalu dipanen",
+  OOR_DOWN:       "ditutup karena harga keluar ke bawah",
+  OOR_TIMEOUT:    "ditutup karena kelamaan di luar range",
+  LOW_YIELD:      "ditutup karena fee-nya terlalu kecil",
+  PUMP_ABOVE:     "ditutup karena harga melonjak di atas range",
+  MANUAL:         "ditutup manual oleh operator",
+  UNKNOWN:        "alasan penutupan tidak tercatat",
+});
+
+/** Upper edge of a "vol[a,b)" / "vol4.5+" style bucket key, else null. */
+function bucketUpperEdge(key) {
+  if (typeof key !== "string") return null;
+  const range = key.match(/^[a-z/]+\[[\d.]+,([\d.]+)\)$/i);
+  if (range) return parseFloat(range[1]);
+  const open = key.match(/^[a-z/]+([\d.]+)\+$/i);
+  if (open) return Infinity;
+  return null;
+}
+
+/**
+ * HONEST enforcement sentence for a bucket pattern.
+ *
+ * This replaces the old claim "bot sekarang menghindari pola ini" — which was
+ * FALSE: a derived lesson only ever entered the LLM prompt, it never created a
+ * filter. Here we state what is actually true, per dimension, from live config:
+ *   - a real gate exists AND covers the whole bucket → say it is auto-rejected
+ *   - a real gate exists but only partly covers it   → say so, with the value
+ *   - exit-side pattern                              → not an entry filter at all
+ *   - otherwise                                      → prompt context only
+ * @param {Object} dims       - lesson.dims
+ * @param {Object} userConfig - live user-config.json
+ * @returns {string}
+ */
+export function enforcementNote(dims, userConfig = {}) {
+  const d = dims && typeof dims === "object" ? dims : {};
+  const notes = [];
+
+  if (d.volatility) {
+    const floor = Number(userConfig.minVolatility);
+    const edge = bucketUpperEdge(d.volatility);
+    if (Number.isFinite(floor) && floor > 0 && Number.isFinite(edge) && floor >= edge) {
+      notes.push(`pool serentang ini sudah otomatis ditolak (batas minVolatility ${floor})`);
+    } else if (Number.isFinite(floor) && floor > 0) {
+      notes.push(`batas minVolatility sekarang ${floor} — sebagian pool di rentang ini masih lolos`);
+    }
+  }
+  if (d.fee_tvl) {
+    const floor = Number(userConfig.minFeeActiveTvlRatio);
+    const edge = bucketUpperEdge(d.fee_tvl);
+    if (Number.isFinite(floor) && floor > 0 && Number.isFinite(edge) && floor >= edge) {
+      notes.push(`pool serentang ini sudah otomatis ditolak (batas fee/TVL ${floor})`);
+    } else if (Number.isFinite(floor) && floor > 0) {
+      notes.push(`batas fee/TVL sekarang ${floor}`);
+    }
+  }
+  if (d.entry_direction) {
+    notes.push(userConfig.directionGateEnabled === true
+      ? "filter arah harga saat masuk (direction gate) sedang AKTIF"
+      : "belum ada filter otomatis untuk arah harga saat masuk (direction gate OFF)");
+  }
+  if (d.regime) {
+    notes.push(userConfig.marketRegimeGateEnabled === false
+      ? "filter kondisi pasar (market regime) sedang OFF"
+      : `filter kondisi pasar aktif hanya saat SOL turun ≥ ${Math.abs(Number(userConfig.regimeDowntrendThresholdPct) || 5)}%`);
+  }
+  if (d.exit_class) {
+    notes.push("ini pola SAAT KELUAR (exit), bukan filter saat memilih pool");
+  }
+
+  if (notes.length === 0) {
+    return "Belum ada blokir otomatis untuk pola ini — baru jadi bahan pertimbangan AI saat menilai pool.";
+  }
+  return `Status penegakan: ${notes.join("; ")}. Selain itu pola ini hanya masuk bahan pertimbangan AI, bukan blokir otomatis.`;
+}
+
 /**
  * Convert one raw lesson record into a plain-Indonesian insight sentence an
  * investor understands — no bin_step / volatility / fee_tvl_ratio jargon.
- * Reads structured fields (outcome, pnl_pct, context) so it degrades safely
- * when the rule text shape changes.
+ *
+ * Handles BOTH shapes:
+ *   - bucket-aggregate rows (sourceType "bucket_aggregate"): renders the REAL
+ *     dimensions (entry direction, market regime, exit reason, vol, fee) plus n
+ *     and realized-SOL EV. The old renderer collapsed every lesson into the same
+ *     two traits (fee + volatility), so an entry-direction or exit-reason finding
+ *     was reported as if it were a fee/volatility finding.
+ *   - legacy prose lessons: unchanged parsing, but with the honest enforcement
+ *     sentence instead of the false "bot sekarang menghindari pola ini".
  * @param {Object} lesson
+ * @param {Object} [userConfig] - live user-config.json (drives enforcement text)
  * @returns {string|null}
  */
-export function lessonToPlain(lesson) {
+export function lessonToPlain(lesson, userConfig = {}) {
   if (!lesson || !lesson.rule) return null;
   const rule = String(lesson.rule);
 
   // Auto-evolved threshold lessons → describe the self-tuning behaviour plainly.
   if (/AUTO-EVOLVED/i.test(rule)) {
-    return "Bot menyesuaikan sendiri standar pemilihan pool agar lebih ketat, berdasarkan hasil posisi sebelumnya.";
+    return "Bot pernah menyesuaikan sendiri standar pemilihan pool berdasarkan hasil posisi sebelumnya (mode lama).";
   }
 
+  // ── Bucket-aggregate row (dimension-aware) ───────────────────────────────
+  if (lesson.sourceType === "bucket_aggregate" && lesson.dims && typeof lesson.dims === "object") {
+    const traits = Object.keys(lesson.dims).sort()
+      .map((k) => DIM_WORDS[lesson.dims[k]] || String(lesson.dims[k]))
+      .filter(Boolean);
+    const traitStr = traits.length ? traits.join(" + ") : "pola tertentu";
+    const n = Number(lesson.n);
+    const ev = Number(lesson.ev_sol);
+    const net = Number(lesson.net_sol);
+    const evStr = Number.isFinite(ev) ? `${ev >= 0 ? "+" : ""}${ev.toFixed(4)} SOL per posisi` : "hasil belum terhitung";
+    const netStr = Number.isFinite(net) ? ` (total ${net >= 0 ? "+" : ""}${net.toFixed(4)} SOL)` : "";
+    const strength = lesson.verdict === "SIGNAL"
+      ? (lesson.micro_ev ? "polanya konsisten tapi nilainya kecil" : "polanya konsisten, bukan kebetulan")
+      : lesson.verdict === "NOISE"
+        ? "belum bisa dipastikan, masih bisa kebetulan"
+        : "data masih sedikit, belum cukup untuk kesimpulan";
+    const head = `${cap(traitStr)} — ${Number.isFinite(n) ? n : "?"} posisi, rata-rata ${evStr}${netStr}; ${strength}.`;
+    return `${head} ${enforcementNote(lesson.dims, userConfig)}`;
+  }
+
+  // ── Legacy prose lesson ──────────────────────────────────────────────────
   // Pull numbers from the structured context string (more reliable than the rule prose).
   const ctx = String(lesson.context || rule);
   const num = (re) => { const m = ctx.match(re); return m ? parseFloat(m[1]) : null; };
@@ -481,28 +608,37 @@ export function lessonToPlain(lesson) {
   const volWord = vol == null ? null : (vol < 2 ? "tenang" : vol < 4 ? "sedang" : "tinggi");
   const feeWord = feeTvl == null ? null : (feeTvl < 0.1 ? "rendah (di bawah 0.1)" : feeTvl < 0.2 ? "sedang" : "bagus");
 
-  const good = lesson.outcome === "good" || /^PREFER|^WORKED/i.test(rule);
-  const bad  = lesson.outcome === "poor" || lesson.outcome === "bad" || /^FAILED/i.test(rule);
+  const good = lesson.outcome === "good" || /^(\[×\d+ obs\]\s*)?(PREFER|WORKED)/i.test(rule);
+  const bad  = lesson.outcome === "poor" || lesson.outcome === "bad" || /^(\[×\d+ obs\]\s*)?FAILED/i.test(rule);
 
   const traits = [];
   if (feeWord) traits.push(`fee ${feeWord}`);
   if (volWord) traits.push(`pergerakan harga ${volWord}`);
   const traitStr = traits.length ? `pool dengan ${traits.join(" + ")}` : "pola pool tertentu";
   const pnlStr = pnlPct != null ? ` (hasil ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%)` : "";
+  const obs = Number(lesson.merged_count) > 1 ? ` [${lesson.merged_count} kejadian serupa]` : "";
+  // HONEST enforcement — the old text claimed the bot "menghindari"/"memprioritaskan"
+  // these patterns. It does not: a derived lesson only enters the AI prompt.
+  const enforcement = enforcementNote({
+    volatility: vol == null ? null : (vol < 2.5 ? "vol[0,2.5)" : vol < 3.5 ? "vol[2.5,3.5)" : vol < 4.5 ? "vol[3.5,4.5)" : "vol4.5+"),
+    fee_tvl: feeTvl == null ? null : (feeTvl < 0.1 ? "fee[0,0.1)" : feeTvl < 0.2 ? "fee[0.1,0.2)" : feeTvl < 0.4 ? "fee[0.2,0.4)" : "fee0.4+"),
+  }, userConfig);
 
-  if (good) return `${cap(traitStr)} cenderung menguntungkan${pnlStr} — bot memprioritaskan pola ini.`;
-  if (bad)  return `${cap(traitStr)} cenderung merugi${pnlStr} — bot sekarang menghindari pola ini.`;
-  return `${cap(traitStr)}${pnlStr}.`;
+  if (good) return `${cap(traitStr)} cenderung menguntungkan${pnlStr}${obs}. ${enforcement}`;
+  if (bad)  return `${cap(traitStr)} cenderung merugi${pnlStr}${obs}. ${enforcement}`;
+  return `${cap(traitStr)}${pnlStr}${obs}. ${enforcement}`;
 }
 
 function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
 /**
- * Lessons Engine State — performance records + evolved thresholds + top lessons.
- * @param {Object} lessonsState - normalized { lessons:[], performance:[], _lastEvolved?, _config? }
+ * Lessons Engine State — performance records + threshold status + top lessons.
+ * @param {Object} lessonsState   - normalized { lessons:[], performance:[] }
+ * @param {Object} userConfig     - live user-config.json
+ * @param {Object} [proposalsState] - threshold-proposals.json (propose-only queue)
  * @returns {string|null}
  */
-export function buildLessonsSection(lessonsState, userConfig = {}) {
+export function buildLessonsSection(lessonsState, userConfig = {}, proposalsState = null) {
   if (!lessonsState || (!Array.isArray(lessonsState.performance) && !Array.isArray(lessonsState.lessons))) {
     return null;
   }
@@ -520,11 +656,18 @@ export function buildLessonsSection(lessonsState, userConfig = {}) {
   const posAtEvolution = Number.isFinite(userConfig._positionsAtEvolution) ? userConfig._positionsAtEvolution : null;
   const evaluatedSince = (posAtEvolution !== null) ? Math.max(0, perf.length - posAtEvolution) : null;
 
-  // Top 3 lessons by confidence desc, tie-break recency. Skip auto-evolved
-  // bookkeeping entries here — those are summarised in one line below.
+  // Top 3 lessons — bucket-aggregate rows FIRST (they carry n + realized-SOL EV,
+  // i.e. actual evidence), then legacy prose by confidence. Auto-evolved
+  // bookkeeping entries are summarised separately below.
   const ranked = [...lessons]
     .filter(l => l && l.rule && !/AUTO-EVOLVED/i.test(String(l.rule)))
     .sort((a, b) => {
+      // 1. material bucket rows (statistically real AND economically non-trivial)
+      const mat = (x) => (x.sourceType === "bucket_aggregate" && x.material ? 2 : x.sourceType === "bucket_aggregate" ? 1 : 0);
+      if (mat(b) !== mat(a)) return mat(b) - mat(a);
+      // 2. within bucket rows: money moved
+      const money = (x) => Math.abs(Number(x.net_sol) || 0);
+      if (money(b) !== money(a)) return money(b) - money(a);
       const ca = a.confidence ?? 0;
       const cb = b.confidence ?? 0;
       if (cb !== ca) return cb - ca;
@@ -537,22 +680,45 @@ export function buildLessonsSection(lessonsState, userConfig = {}) {
     `Bot belajar dari <b>${liveCount}</b> posisi sungguhan yang sudah ditutup.`,
   ];
   if (tightened) {
-    lines.push(`Bot sudah memperketat standar pemilihan pool sendiri agar lebih selektif.`);
+    // FACT, not agency: the current standard differs from the base default.
+    // (Who changed it — Bro manually or the old auto-apply path — is stated below.)
+    lines.push(`Standar pemilihan pool saat ini lebih ketat dari setelan dasar (fee/TVL min ${minFeeRatio}, organic min ${minOrganic}).`);
   }
-  if (lastEvolved) {
-    const dateStr = lastEvolved.slice(0, 16).replace("T", " ");
-    if (evaluatedSince !== null && evaluatedSince > 0) {
-      // Make explicit: date = last AUTO threshold change, not last activity.
-      // Engine keeps evaluating; it just hasn't seen data significant enough to move a standard.
-      lines.push(`<i>Standar terakhir berubah otomatis: ${dateStr} · ${evaluatedSince} posisi dievaluasi sejak itu (data belum cukup beda buat geser standar — ini normal, bukan berhenti).</i>`);
+
+  // ── Threshold-change honesty block ──────────────────────────────────────
+  // The learning loop is PROPOSE-ONLY (Lyra guard): it never rewrites its own
+  // risk gates. Say that plainly instead of implying self-tuning.
+  const autoApply = userConfig?.learning?.evolveAutoApply === true || userConfig?.evolveAutoApply === true;
+  const pending = Array.isArray(proposalsState?.pending) ? proposalsState.pending.filter(p => !p.applied) : [];
+  if (autoApply) {
+    lines.push(`<i>Mode: bot BOLEH mengubah standar sendiri (auto-apply ON).</i>`);
+    if (lastEvolved) {
+      const dateStr = lastEvolved.slice(0, 16).replace("T", " ");
+      lines.push(`<i>Standar terakhir berubah otomatis: ${dateStr}${evaluatedSince !== null && evaluatedSince > 0 ? ` · ${evaluatedSince} posisi dievaluasi sejak itu` : ""}.</i>`);
+    }
+  } else {
+    lines.push(`<i>Bot TIDAK mengubah standar sendiri — hanya mengusulkan, keputusan tetap di Bro (mode usulan / propose-only).</i>`);
+    if (pending.length > 0) {
+      lines.push(`Usulan menunggu keputusan (<b>${pending.length}</b>):`);
+      for (const p of pending.slice(0, 3)) {
+        const tag = p.direction === "LOOSEN" ? "⚠️ LEBIH LONGGAR — wajib persetujuan Bro + review Cassiopeia" : "lebih ketat";
+        lines.push(`• <b>${p.key}</b>: ${p.current} → ${p.proposed} (${tag})`);
+      }
+    } else if (lastEvolved) {
+      const dateStr = lastEvolved.slice(0, 16).replace("T", " ");
+      const since = (evaluatedSince !== null && evaluatedSince > 0)
+        ? ` · ${evaluatedSince} posisi dievaluasi sejak itu (data belum cukup beda buat mengusulkan perubahan — ini normal, bukan berhenti)`
+        : ` (bot tetap evaluasi tiap posisi ditutup)`;
+      lines.push(`<i>Belum ada usulan baru. Standar terakhir pernah berubah otomatis ${dateStr}${since}, mode lama sebelum propose-only.</i>`);
     } else {
-      lines.push(`<i>Standar terakhir berubah otomatis: ${dateStr} (bot tetap evaluasi tiap posisi ditutup; standar baru bergeser kalau data win/loss cukup beda).</i>`);
+      lines.push(`<i>Belum ada usulan perubahan standar.</i>`);
     }
   }
+
   if (ranked.length > 0) {
     lines.push(`Pelajaran utama:`);
     for (const l of ranked) {
-      const plain = lessonToPlain(l);
+      const plain = lessonToPlain(l, userConfig);
       if (plain) lines.push(`• ${plain}`);
     }
   }
@@ -956,7 +1122,10 @@ async function runBossReport() {
   // ─── NEW sections (lessons, drawdown, orion rejections) ─────────
   const lessonsState = readJson("lessons.json");
   const userConfig   = readJson("user-config.json") || {};
-  const lessonsSection = buildLessonsSection(lessonsState, userConfig);
+  // Propose-only threshold queue (Lyra) — nothing in here is applied; the report
+  // shows it as "menunggu keputusan Bro".
+  const proposalsState = readJson("threshold-proposals.json");
+  const lessonsSection = buildLessonsSection(lessonsState, userConfig, proposalsState);
 
   const drawdownSection = buildDrawdownSection(tradeArr);
 

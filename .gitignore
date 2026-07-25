@@ -89,6 +89,9 @@ status-snapshot.json
 .agent-bundle/
 *.zip
 
+# Lyra propose-only threshold queue (runtime state — proposals awaiting Bro)
+threshold-proposals.json
+
 # Lyra journal runtime ledger (local state, not source)
 journal.jsonl
 same-token-cooldown-shadow.jsonl
